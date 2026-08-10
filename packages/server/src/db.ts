@@ -31,6 +31,8 @@ export interface VersionRow {
   byte_size: number;
   file_count: number;
   note: string | null;
+  /** Set once this version's objects have been removed from S3. */
+  pruned_at?: number | null;
 }
 
 export function hashApiKey(token: string): string {
@@ -81,6 +83,27 @@ function migrate(db: DatabaseSync): void {
     CREATE INDEX IF NOT EXISTS idx_sites_owner ON sites(owner_key_id);
     CREATE INDEX IF NOT EXISTS idx_versions_site ON site_versions(site_id);
   `);
+
+  addColumn(db, "site_versions", "pruned_at", "INTEGER");
+
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_sites_expires ON sites(expires_at)
+       WHERE expires_at IS NOT NULL;`,
+  );
+}
+
+/** ALTER TABLE ADD COLUMN is not idempotent in SQLite, so check first. */
+function addColumn(
+  db: DatabaseSync,
+  table: string,
+  column: string,
+  ddl: string,
+): void {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as unknown as {
+    name: string;
+  }[];
+  if (cols.some((c) => c.name === column)) return;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
 }
 
 export function createApiKeyRecord(
@@ -111,6 +134,27 @@ export function findApiKeyByToken(db: DatabaseSync, token: string): ApiKeyRow | 
   const b = Buffer.from(key_hash, "utf8");
   if (a.length !== b.length || !timingSafeEqual(a, b)) return null;
   return row;
+}
+
+export function listApiKeys(db: DatabaseSync): ApiKeyRow[] {
+  return db
+    .prepare(
+      `SELECT id, name, key_hash, created_at, revoked_at
+       FROM api_keys ORDER BY created_at DESC`,
+    )
+    .all() as unknown as ApiKeyRow[];
+}
+
+/** Revoke a key by id. Returns false if it was unknown or already revoked. */
+export function revokeApiKey(
+  db: DatabaseSync,
+  id: string,
+  now = Date.now(),
+): boolean {
+  const result = db
+    .prepare(`UPDATE api_keys SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`)
+    .run(now, id);
+  return (result.changes ?? 0) > 0;
 }
 
 export function insertSite(
@@ -206,6 +250,67 @@ export function getSiteBySlug(db: DatabaseSync, slug: string): SiteRow | null {
     )
     .get(slug) as SiteRow | undefined;
   return row ?? null;
+}
+
+/** Look up by site id first, then by vanity slug. */
+export function getSiteByIdOrSlug(db: DatabaseSync, value: string): SiteRow | null {
+  return getSite(db, value) ?? getSiteBySlug(db, value);
+}
+
+export function updateSiteSlug(
+  db: DatabaseSync,
+  siteId: string,
+  slug: string | null,
+): void {
+  db.prepare(`UPDATE sites SET slug = ? WHERE id = ?`).run(slug, siteId);
+}
+
+export function listExpiredSites(db: DatabaseSync, now = Date.now()): SiteRow[] {
+  return db
+    .prepare(
+      `SELECT id, owner_key_id, slug, title, visibility, current_version_id,
+              created_at, updated_at, expires_at, byte_size, file_count
+       FROM sites WHERE expires_at IS NOT NULL AND expires_at <= ?`,
+    )
+    .all(now) as unknown as SiteRow[];
+}
+
+/**
+ * Versions whose objects can be dropped: everything older than the newest
+ * `keep` versions that has not been pruned already.
+ *
+ * Ordered by rowid rather than created_at because two publishes can land in
+ * the same millisecond, and the site's live version is excluded outright so a
+ * tie can never take out the version currently being served.
+ */
+export function listPrunableVersions(
+  db: DatabaseSync,
+  siteId: string,
+  keep: number,
+): VersionRow[] {
+  return db
+    .prepare(
+      `SELECT id, site_id, created_at, byte_size, file_count, note, pruned_at
+       FROM site_versions
+       WHERE site_id = ?
+         AND pruned_at IS NULL
+         AND id IS NOT (SELECT current_version_id FROM sites WHERE id = ?)
+         AND rowid NOT IN (
+           SELECT rowid FROM site_versions
+           WHERE site_id = ? AND pruned_at IS NULL
+           ORDER BY rowid DESC LIMIT ?
+         )
+       ORDER BY rowid DESC`,
+    )
+    .all(siteId, siteId, siteId, keep) as unknown as VersionRow[];
+}
+
+export function markVersionPruned(
+  db: DatabaseSync,
+  versionId: string,
+  now = Date.now(),
+): void {
+  db.prepare(`UPDATE site_versions SET pruned_at = ? WHERE id = ?`).run(now, versionId);
 }
 
 export function listSitesForKey(db: DatabaseSync, ownerKeyId: string): SiteRow[] {

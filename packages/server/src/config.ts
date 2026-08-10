@@ -19,32 +19,33 @@ export interface Config {
   maxFileCount: number;
   defaultTtl: string | null;
   adminToken: string | null;
-}
-
-function env(name: string, fallback?: string): string | undefined {
-  const v = process.env[name];
-  if (v === undefined || v === "") return fallback;
-  return v;
-}
-
-function envBool(name: string, fallback: boolean): boolean {
-  const v = env(name);
-  if (v === undefined) return fallback;
-  return v === "1" || v.toLowerCase() === "true" || v.toLowerCase() === "yes";
-}
-
-function envInt(name: string, fallback: number): number {
-  const v = env(name);
-  if (v === undefined) return fallback;
-  const n = Number(v);
-  if (!Number.isFinite(n)) throw new Error(`${name} must be a number`);
-  return n;
+  /** How many versions of a site keep their objects in S3. */
+  versionRetention: number;
+  /** How often to sweep expired sites, in ms. 0 disables the sweeper. */
+  reapIntervalMs: number;
 }
 
 export function loadConfig(envSource: NodeJS.ProcessEnv = process.env): Config {
-  // Allow tests to pass a custom env object by temporarily assigning — we read process.env
-  // but call sites can set process.env before invoking.
-  void envSource;
+  const env = (name: string, fallback?: string): string | undefined => {
+    const v = envSource[name];
+    if (v === undefined || v === "") return fallback;
+    return v;
+  };
+
+  const envBool = (name: string, fallback: boolean): boolean => {
+    const v = env(name);
+    if (v === undefined) return fallback;
+    return v === "1" || v.toLowerCase() === "true" || v.toLowerCase() === "yes";
+  };
+
+  const envInt = (name: string, fallback: number): number => {
+    const v = env(name);
+    if (v === undefined) return fallback;
+    const n = Number(v);
+    if (!Number.isFinite(n)) throw new Error(`${name} must be a number`);
+    return n;
+  };
+
   const dataDir = path.resolve(env("SHAREPLAN_DATA_DIR", "./data")!);
   mkdirSync(dataDir, { recursive: true });
 
@@ -79,5 +80,7 @@ export function loadConfig(envSource: NodeJS.ProcessEnv = process.env): Config {
     maxFileCount: envInt("SHAREPLAN_MAX_FILE_COUNT", 200),
     defaultTtl: env("SHAREPLAN_DEFAULT_TTL") ?? null,
     adminToken: env("SHAREPLAN_ADMIN_TOKEN") ?? null,
+    versionRetention: Math.max(1, envInt("SHAREPLAN_VERSION_RETENTION", 2)),
+    reapIntervalMs: Math.max(0, envInt("SHAREPLAN_REAP_INTERVAL_SEC", 300)) * 1000,
   };
 }
