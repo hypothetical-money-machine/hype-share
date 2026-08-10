@@ -2,7 +2,17 @@
 import { Command } from "commander";
 import { statSync } from "node:fs";
 import { loadCliConfig, requireConfig, saveCliConfig } from "./config.js";
-import { ApiError, createKey, createSite, deleteSite, getSite, listSites, updateSite } from "./api.js";
+import {
+  ApiError,
+  createKey,
+  createSite,
+  deleteSite,
+  getSite,
+  listKeys,
+  listSites,
+  revokeKey,
+  updateSite,
+} from "./api.js";
 import { collectDirectory, collectSingleFile } from "./bundle.js";
 import type { CreateSiteRequest, Visibility } from "@shareplan/core";
 
@@ -151,6 +161,42 @@ program
       console.log(key.token);
       console.error(`id=${key.id} name=${key.name}`);
       console.error("Save this token; it will not be shown again.");
+    } catch (e) {
+      fail(e);
+    }
+  });
+
+program
+  .command("list-keys")
+  .description("List API keys (requires admin token)")
+  .requiredOption("--url <url>", "shareplan base URL")
+  .requiredOption("--admin-token <token>", "admin token")
+  .action(async (opts: { url: string; adminToken: string }) => {
+    try {
+      const { keys } = await listKeys(opts.url, opts.adminToken);
+      if (keys.length === 0) {
+        console.log("(no keys)");
+        return;
+      }
+      for (const k of keys) {
+        const state = k.revokedAt ? `revoked ${k.revokedAt}` : "active";
+        console.log(`${k.id}  ${k.name}  ${state}`);
+      }
+    } catch (e) {
+      fail(e);
+    }
+  });
+
+program
+  .command("revoke-key")
+  .description("Revoke an API key by id (requires admin token)")
+  .argument("<id>", "key id")
+  .requiredOption("--url <url>", "shareplan base URL")
+  .requiredOption("--admin-token <token>", "admin token")
+  .action(async (id: string, opts: { url: string; adminToken: string }) => {
+    try {
+      await revokeKey(opts.url, opts.adminToken, id);
+      console.log(`revoked ${id}`);
     } catch (e) {
       fail(e);
     }

@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import type { SiteFileInput } from "@shareplan/core";
 
@@ -41,10 +41,6 @@ export function collectDirectory(dir: string): SiteFileInput[] {
       if (ent.isDirectory()) {
         walk(abs, rel);
       } else if (ent.isFile()) {
-        const st = statSync(abs);
-        if (st.size === 0 && !rel.endsWith(".html")) {
-          // allow empty files but still include
-        }
         const buf = readFileSync(abs);
         const posixRel = rel.split(path.sep).join("/");
         if (isProbablyText(posixRel, buf)) {
