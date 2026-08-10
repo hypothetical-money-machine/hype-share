@@ -1,0 +1,29 @@
+{
+  "name": "hype-shareplan",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Small S3-backed microsite host for agents and humans.",
+  "license": "MIT",
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "npm run build -w @shareplan/core && npm run build -w @shareplan/server && npm run build -w @shareplan/cli",
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "dev": "npm run dev --workspace @shareplan/server",
+    "start": "npm run start --workspace @shareplan/server",
+    "cli": "npm run start --workspace @shareplan/cli --"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
+  }
+}
