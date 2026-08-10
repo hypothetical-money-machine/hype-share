@@ -1,9 +1,9 @@
 import Fastify, {
+  type FastifyBaseLogger,
   type FastifyInstance,
   type FastifyReply,
   type FastifyRequest,
 } from "fastify";
-import multipart from "@fastify/multipart";
 import type { DatabaseSync } from "node:sqlite";
 import type { S3Client } from "@aws-sdk/client-s3";
 import { z } from "zod";
@@ -24,17 +24,30 @@ import {
   createApiKeyRecord,
   deleteSite,
   getSite,
+  getSiteByIdOrSlug,
+  getSiteBySlug,
   insertSite,
   insertVersion,
   isExpired,
+  listApiKeys,
+  listPrunableVersions,
   listSitesForKey,
+  markVersionPruned,
+  revokeApiKey,
+  updateSiteSlug,
   updateSiteVersion,
   type ApiKeyRow,
   type SiteRow,
 } from "./db.js";
 import { AuthError, requireAdmin, requireApiKey } from "./auth.js";
+import { HttpError } from "./errors.js";
 import { FileError, ensureIndexHtml, prepareFiles } from "./files.js";
-import { deleteSiteObjects, getObject, putSiteFiles } from "./storage.js";
+import {
+  deleteSiteObjects,
+  deleteVersionObjects,
+  getObject,
+  putSiteFiles,
+} from "./storage.js";
 
 const fileInputSchema = z.object({
   path: z.string().min(1),
@@ -68,23 +81,25 @@ export interface AppDeps {
   config: Config;
   db: DatabaseSync;
   s3: S3Client;
+  /** Fastify options passthrough, mainly so tests can silence the logger. */
+  logger?: boolean;
+}
+
+/** AppDeps plus the app logger, so helpers can report background failures. */
+interface Ctx extends AppDeps {
+  log: FastifyBaseLogger;
 }
 
 export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   const app = Fastify({
-    logger: true,
+    logger: deps.logger ?? true,
     bodyLimit: deps.config.maxSiteBytes + 1_048_576,
   });
 
-  await app.register(multipart, {
-    limits: {
-      fileSize: deps.config.maxSiteBytes,
-      files: deps.config.maxFileCount,
-    },
-  });
+  const ctx: Ctx = { ...deps, log: app.log };
 
   app.setErrorHandler((err, _req, reply) => {
-    if (err instanceof AuthError) {
+    if (err instanceof AuthError || err instanceof HttpError) {
       return reply.status(err.statusCode).send({
         error: { code: err.code, message: err.message },
       });
@@ -184,11 +199,33 @@ Response includes \`url\` like \`${deps.config.publicBaseUrl}/s/<id>/\`.
     });
   });
 
+  app.get("/api/v1/admin/keys", async (req, reply) => {
+    requireAdmin(deps.config.adminToken, req);
+    const keys = listApiKeys(deps.db).map((k) => ({
+      id: k.id,
+      name: k.name,
+      createdAt: new Date(k.created_at).toISOString(),
+      revokedAt: k.revoked_at ? new Date(k.revoked_at).toISOString() : null,
+    }));
+    return reply.send({ keys });
+  });
+
+  app.delete("/api/v1/admin/keys/:id", async (req, reply) => {
+    requireAdmin(deps.config.adminToken, req);
+    const { id } = req.params as { id: string };
+    if (!revokeApiKey(deps.db, id)) {
+      return reply.status(404).send({
+        error: { code: "not_found", message: "key not found or already revoked" },
+      });
+    }
+    return reply.status(204).send();
+  });
+
   // --- Sites API ---
   app.post("/api/v1/sites", async (req, reply) => {
     const key = requireApiKey(deps.db, req);
     const body = createSiteSchema.parse(req.body);
-    const site = await publishNewSite(deps, key, body);
+    const site = await publishNewSite(ctx, key, body);
     return reply.status(201).send(site);
   });
 
@@ -202,7 +239,7 @@ Response includes \`url\` like \`${deps.config.publicBaseUrl}/s/<id>/\`.
         error: { code: "not_found", message: "site not found" },
       });
     }
-    const site = await publishVersion(deps, existing, body);
+    const site = await publishVersion(ctx, existing, body);
     return reply.send(site);
   });
 
@@ -239,53 +276,54 @@ Response includes \`url\` like \`${deps.config.publicBaseUrl}/s/<id>/\`.
     return reply.status(204).send();
   });
 
-  // --- Public serve ---
+  // --- Public serve --- (:id accepts a site id or a vanity slug)
   app.get("/s/:id", async (req, reply) => {
     const { id } = req.params as { id: string };
-    return reply.redirect(`/s/${id}/`, 302);
+    return reply.redirect(`/s/${encodeURIComponent(id)}/`, 302);
   });
 
   app.get("/s/:id/*", async (req, reply) => {
     const { id } = req.params as { id: string };
     const wildcard = (req.params as { "*": string })["*"] ?? "";
-    return serveSitePath(deps, req, reply, id, wildcard);
+    return serveSitePath(ctx, req, reply, id, wildcard);
   });
 
   // Fastify may not match trailing slash path with splat alone in all versions
   app.get("/s/:id/", async (req, reply) => {
     const { id } = req.params as { id: string };
-    return serveSitePath(deps, req, reply, id, "");
+    return serveSitePath(ctx, req, reply, id, "");
   });
 
   return app;
 }
 
 async function publishNewSite(
-  deps: AppDeps,
+  ctx: Ctx,
   key: ApiKeyRow,
   body: z.infer<typeof createSiteSchema>,
 ): Promise<SiteResponse> {
-  let files = prepareFiles(body.files, deps.config);
+  let files = prepareFiles(body.files, ctx.config);
   files = ensureIndexHtml(files);
 
   const siteId = createSiteId();
   const versionId = createVersionId();
   const now = Date.now();
   const visibility: Visibility = body.visibility ?? "unlisted";
-  const ttlInput = body.ttl !== undefined ? body.ttl : deps.config.defaultTtl;
-  let expires_at: number | null;
-  try {
-    expires_at = expiresAtFromTtl(ttlInput, now);
-  } catch (e) {
-    throw new FileError("invalid_ttl", e instanceof Error ? e.message : "invalid ttl");
+  const expires_at = resolveTtl(
+    body.ttl !== undefined ? body.ttl : ctx.config.defaultTtl,
+    now,
+  );
+
+  if (body.slug !== undefined) {
+    assertSlugAvailable(ctx, body.slug);
   }
 
   const byte_size = files.reduce((n, f) => n + f.body.byteLength, 0);
   const file_count = files.length;
 
-  await putSiteFiles(deps.s3, deps.config.s3.bucket, siteId, versionId, files);
+  await putSiteFiles(ctx.s3, ctx.config.s3.bucket, siteId, versionId, files);
 
-  insertSite(deps.db, {
+  insertSite(ctx.db, {
     id: siteId,
     owner_key_id: key.id,
     slug: body.slug ?? null,
@@ -295,18 +333,10 @@ async function publishNewSite(
     created_at: now,
     updated_at: now,
     expires_at,
-  });
-  // set sizes via update to keep insert simple
-  updateSiteVersion(deps.db, siteId, {
-    current_version_id: versionId,
-    updated_at: now,
-    expires_at,
     byte_size,
     file_count,
-    title: body.title ?? null,
-    visibility,
   });
-  insertVersion(deps.db, {
+  insertVersion(ctx.db, {
     id: versionId,
     site_id: siteId,
     created_at: now,
@@ -315,53 +345,43 @@ async function publishNewSite(
     note: body.note ?? null,
   });
 
-  const row = getSite(deps.db, siteId)!;
-  return toSiteResponse(deps.config, row);
+  const row = getSite(ctx.db, siteId)!;
+  return toSiteResponse(ctx.config, row);
 }
 
 async function publishVersion(
-  deps: AppDeps,
+  ctx: Ctx,
   existing: SiteRow,
   body: z.infer<typeof updateSiteSchema>,
 ): Promise<SiteResponse> {
-  let files = prepareFiles(body.files, deps.config);
+  let files = prepareFiles(body.files, ctx.config);
   files = ensureIndexHtml(files);
 
   const versionId = createVersionId();
   const now = Date.now();
-  const ttlInput =
-    body.ttl !== undefined ? body.ttl : existing.expires_at
-      ? null // keep existing expiry unless explicitly set
-      : deps.config.defaultTtl;
 
+  // An explicit ttl always wins (including `null` to clear it). Otherwise keep
+  // whatever expiry the site already had, and only fall back to the server
+  // default for a site that has never had one.
   let expires_at = existing.expires_at;
   if (body.ttl !== undefined) {
-    try {
-      expires_at = expiresAtFromTtl(body.ttl, now);
-    } catch (e) {
-      throw new FileError("invalid_ttl", e instanceof Error ? e.message : "invalid ttl");
-    }
-  } else if (ttlInput && !existing.expires_at) {
-    try {
-      expires_at = expiresAtFromTtl(ttlInput, now);
-    } catch {
-      /* keep */
-    }
+    expires_at = resolveTtl(body.ttl, now);
+  } else if (existing.expires_at === null) {
+    expires_at = resolveTtl(ctx.config.defaultTtl, now);
+  }
+
+  if (body.slug !== undefined && body.slug !== existing.slug) {
+    assertSlugAvailable(ctx, body.slug, existing.id);
+    updateSiteSlug(ctx.db, existing.id, body.slug);
   }
 
   const byte_size = files.reduce((n, f) => n + f.body.byteLength, 0);
   const file_count = files.length;
   const visibility = body.visibility ?? existing.visibility;
 
-  await putSiteFiles(
-    deps.s3,
-    deps.config.s3.bucket,
-    existing.id,
-    versionId,
-    files,
-  );
+  await putSiteFiles(ctx.s3, ctx.config.s3.bucket, existing.id, versionId, files);
 
-  updateSiteVersion(deps.db, existing.id, {
+  updateSiteVersion(ctx.db, existing.id, {
     current_version_id: versionId,
     updated_at: now,
     expires_at,
@@ -370,7 +390,7 @@ async function publishVersion(
     title: body.title ?? undefined,
     visibility,
   });
-  insertVersion(deps.db, {
+  insertVersion(ctx.db, {
     id: versionId,
     site_id: existing.id,
     created_at: now,
@@ -379,18 +399,62 @@ async function publishVersion(
     note: body.note ?? null,
   });
 
-  const row = getSite(deps.db, existing.id)!;
-  return toSiteResponse(deps.config, row);
+  await pruneOldVersions(ctx, existing.id);
+
+  const row = getSite(ctx.db, existing.id)!;
+  return toSiteResponse(ctx.config, row);
+}
+
+function resolveTtl(
+  ttl: string | number | null | undefined,
+  now: number,
+): number | null {
+  try {
+    return expiresAtFromTtl(ttl, now);
+  } catch (e) {
+    throw new FileError("invalid_ttl", e instanceof Error ? e.message : "invalid ttl");
+  }
+}
+
+/** Slugs share the `/s/:id/` namespace with site ids, so both must be free. */
+function assertSlugAvailable(ctx: Ctx, slug: string, exceptSiteId?: string): void {
+  const bySlug = getSiteBySlug(ctx.db, slug);
+  if (bySlug && bySlug.id !== exceptSiteId) {
+    throw new HttpError(409, "slug_taken", `slug "${slug}" is already in use`);
+  }
+  if (getSite(ctx.db, slug)) {
+    throw new HttpError(409, "slug_taken", `slug "${slug}" collides with a site id`);
+  }
+}
+
+/**
+ * Drop objects for versions beyond the retention window. The previous version
+ * is kept so a page loaded moments before a republish can still fetch its
+ * assets. Failures are logged, not fatal — the publish itself already landed.
+ */
+async function pruneOldVersions(ctx: Ctx, siteId: string): Promise<void> {
+  const stale = listPrunableVersions(ctx.db, siteId, ctx.config.versionRetention);
+  for (const version of stale) {
+    try {
+      await deleteVersionObjects(ctx.s3, ctx.config.s3.bucket, siteId, version.id);
+      markVersionPruned(ctx.db, version.id);
+    } catch (err) {
+      ctx.log.warn(
+        { err, siteId, versionId: version.id },
+        "failed to prune old version objects",
+      );
+    }
+  }
 }
 
 async function serveSitePath(
-  deps: AppDeps,
+  ctx: Ctx,
   req: FastifyRequest,
   reply: FastifyReply,
-  id: string,
+  idOrSlug: string,
   relPath: string,
 ): Promise<void> {
-  const site = getSite(deps.db, id);
+  const site = getSiteByIdOrSlug(ctx.db, idOrSlug);
   if (!site || !site.current_version_id) {
     await reply.status(404).send({ error: { code: "not_found", message: "site not found" } });
     return;
@@ -402,7 +466,7 @@ async function serveSitePath(
   if (site.visibility === "private") {
     // Require API key of owner for private sites (v1 simple)
     try {
-      const key = requireApiKey(deps.db, req);
+      const key = requireApiKey(ctx.db, req);
       if (key.id !== site.owner_key_id) {
         await reply.status(404).send({ error: { code: "not_found", message: "site not found" } });
         return;
@@ -426,13 +490,13 @@ async function serveSitePath(
     return;
   }
 
-  const key = s3ObjectKey(id, site.current_version_id, path);
-  let obj = await getObject(deps.s3, deps.config.s3.bucket, key);
+  const key = s3ObjectKey(site.id, site.current_version_id, path);
+  let obj = await getObject(ctx.s3, ctx.config.s3.bucket, key);
 
   // Try index.html under directory
   if (!obj && !path.endsWith("index.html")) {
-    const idxKey = s3ObjectKey(id, site.current_version_id, `${path}/index.html`);
-    obj = await getObject(deps.s3, deps.config.s3.bucket, idxKey);
+    const idxKey = s3ObjectKey(site.id, site.current_version_id, `${path}/index.html`);
+    obj = await getObject(ctx.s3, ctx.config.s3.bucket, idxKey);
     if (obj) path = `${path}/index.html`;
   }
 
@@ -445,8 +509,19 @@ async function serveSitePath(
   reply.header("Content-Type", ct);
   reply.header("X-Content-Type-Options", "nosniff");
   reply.header("Referrer-Policy", "no-referrer");
-  reply.header("X-Robots-Tag", "noindex, nofollow, noarchive");
-  reply.header("Cache-Control", "public, max-age=60");
+
+  // Only sites explicitly marked public are indexable; unlisted sites rely on
+  // the id being unguessable, which crawling would defeat.
+  reply.header(
+    "X-Robots-Tag",
+    site.visibility === "public" ? "noarchive" : "noindex, nofollow, noarchive",
+  );
+  reply.header(
+    "Cache-Control",
+    site.visibility === "private"
+      ? "private, no-store"
+      : "public, max-age=60",
+  );
 
   if (isHtmlPath(path) || ct.startsWith("text/html")) {
     // Permissive enough for LLM demo HTML with inline scripts/styles

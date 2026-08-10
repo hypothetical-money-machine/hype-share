@@ -9,7 +9,12 @@ import {
   type S3ClientConfig,
 } from "@aws-sdk/client-s3";
 import type { Config } from "./config.js";
-import { s3ObjectKey, s3SitePrefix, contentTypeForPath } from "@shareplan/core";
+import {
+  s3ObjectKey,
+  s3SitePrefix,
+  s3VersionPrefix,
+  contentTypeForPath,
+} from "@shareplan/core";
 
 export interface StoredFile {
   path: string;
@@ -95,12 +100,30 @@ export async function getObject(
   }
 }
 
-export async function deleteSiteObjects(
+export function deleteSiteObjects(
   client: S3Client,
   bucket: string,
   siteId: string,
-): Promise<void> {
-  const prefix = s3SitePrefix(siteId);
+): Promise<number> {
+  return deletePrefix(client, bucket, s3SitePrefix(siteId));
+}
+
+export function deleteVersionObjects(
+  client: S3Client,
+  bucket: string,
+  siteId: string,
+  versionId: string,
+): Promise<number> {
+  return deletePrefix(client, bucket, s3VersionPrefix(siteId, versionId));
+}
+
+/** Delete every object under a prefix. Returns how many were removed. */
+export async function deletePrefix(
+  client: S3Client,
+  bucket: string,
+  prefix: string,
+): Promise<number> {
+  let deleted = 0;
   let ContinuationToken: string | undefined;
   do {
     const listed = await client.send(
@@ -120,7 +143,9 @@ export async function deleteSiteObjects(
           Delete: { Objects: keys.map((Key) => ({ Key })), Quiet: true },
         }),
       );
+      deleted += keys.length;
     }
     ContinuationToken = listed.IsTruncated ? listed.NextContinuationToken : undefined;
   } while (ContinuationToken);
+  return deleted;
 }
