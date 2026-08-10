@@ -11,8 +11,10 @@ Agent writes index.html  →  shareplan publish  →  https://share.example.com/
 - **API + CLI first** — agents publish with `shareplan publish` or `POST /api/v1/sites`
 - **Any S3-compatible store** — MinIO (dev), Cloudflare R2, Garage, AWS S3
 - **SQLite metadata** — sites, versions, API keys
-- **Versioned publishes** — replace content without breaking mid-upload
-- **TTL / expiry** — optional `7d`-style lifetimes
+- **Versioned publishes** — replace content without breaking mid-upload, with
+  old versions swept from storage automatically
+- **TTL / expiry** — optional `7d`-style lifetimes, reclaimed by a background sweeper
+- **Vanity slugs** — `/s/my-plan/` alongside `/s/xk9f2m/`
 - **Security headers** on served HTML (CSP, nosniff, noindex)
 
 ## Quick start (local)
@@ -61,6 +63,11 @@ shareplan publish ./site --site <id>          # new version
 shareplan ls
 shareplan info <id>
 shareplan rm <id>
+
+# admin (needs the admin token, not an API key)
+shareplan create-key --url <url> --admin-token <tok> --name agent
+shareplan list-keys  --url <url> --admin-token <tok>
+shareplan revoke-key <key-id> --url <url> --admin-token <tok>
 ```
 
 Env overrides: `SHAREPLAN_URL`, `SHAREPLAN_TOKEN`.
@@ -94,6 +101,19 @@ See [`.env.example`](.env.example). Important vars:
 | `SHAREPLAN_S3_FORCE_PATH_STYLE` | `true` for MinIO |
 | `SHAREPLAN_ADMIN_TOKEN` | Mint API keys via `/api/v1/admin/keys` |
 | `SHAREPLAN_MAX_SITE_BYTES` | Default 50 MiB |
+| `SHAREPLAN_VERSION_RETENTION` | Versions kept in storage, default 2 |
+| `SHAREPLAN_REAP_INTERVAL_SEC` | Expired-site sweep, default 300, `0` disables |
+
+### Storage lifecycle
+
+Each publish writes a new version prefix. Once the site points at it, versions
+past the retention window have their objects deleted — the previous version is
+kept by default so a page loaded seconds before a republish can still fetch its
+assets. The version row survives as history either way.
+
+Expired sites return `410` immediately; a background sweeper then deletes their
+objects and rows. Objects go first, so a failed delete retries next sweep rather
+than orphaning files.
 
 ## Security notes
 

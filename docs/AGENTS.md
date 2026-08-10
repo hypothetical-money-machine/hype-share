@@ -83,7 +83,13 @@ Binary files use `contentBase64` instead of `content`.
 | `GET` | `/api/v1/sites` | List yours |
 | `GET` | `/api/v1/sites/:id` | Metadata |
 | `DELETE` | `/api/v1/sites/:id` | Delete |
-| `GET` | `/s/:id/*` | Public serve |
+| `GET` | `/s/:id/*` | Public serve (`:id` also accepts a slug) |
+
+Optional `slug` on create gives a readable URL (`/s/my-plan/`); it must not
+already be taken or look like an existing site id, otherwise you get a `409`.
+
+On `PUT`, omitting `ttl` keeps the current expiry — send `"ttl": null` to make
+a site permanent, or a new value to reset the clock.
 
 ## Example prompt
 
