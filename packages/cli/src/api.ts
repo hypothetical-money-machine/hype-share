@@ -77,12 +77,42 @@ export function deleteSite(cfg: CliConfig, id: string): Promise<void> {
   return request(cfg, "DELETE", `/api/v1/sites/${encodeURIComponent(id)}`);
 }
 
+export interface AdminKeyInfo {
+  id: string;
+  name: string;
+  createdAt: string;
+  revokedAt: string | null;
+}
+
+function adminCfg(baseUrl: string, adminToken: string): CliConfig {
+  return { url: baseUrl.replace(/\/$/, ""), token: adminToken };
+}
+
 export function createKey(
   baseUrl: string,
   adminToken: string,
   name: string,
 ): Promise<{ id: string; name: string; token: string; createdAt: string }> {
-  return request({ url: baseUrl.replace(/\/$/, ""), token: adminToken }, "POST", "/api/v1/admin/keys", {
+  return request(adminCfg(baseUrl, adminToken), "POST", "/api/v1/admin/keys", {
     name,
   });
+}
+
+export function listKeys(
+  baseUrl: string,
+  adminToken: string,
+): Promise<{ keys: AdminKeyInfo[] }> {
+  return request(adminCfg(baseUrl, adminToken), "GET", "/api/v1/admin/keys");
+}
+
+export function revokeKey(
+  baseUrl: string,
+  adminToken: string,
+  id: string,
+): Promise<void> {
+  return request(
+    adminCfg(baseUrl, adminToken),
+    "DELETE",
+    `/api/v1/admin/keys/${encodeURIComponent(id)}`,
+  );
 }
