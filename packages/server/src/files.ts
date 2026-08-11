@@ -42,11 +42,7 @@ export function prepareFiles(
 
     let body: Buffer;
     if (input.contentBase64 !== undefined && input.contentBase64 !== null) {
-      try {
-        body = Buffer.from(input.contentBase64, "base64");
-      } catch {
-        throw new FileError("invalid_base64", `invalid base64 for ${path}`);
-      }
+      body = decodeBase64(input.contentBase64, path);
     } else if (input.content !== undefined && input.content !== null) {
       body = Buffer.from(input.content, "utf8");
     } else {
@@ -101,6 +97,23 @@ export function ensureIndexHtml(files: PreparedFile[]): PreparedFile[] {
     "index_required",
     "site bundles with multiple files require index.html",
   );
+}
+
+/**
+ * Node's base64 decoder never throws: it drops characters outside the alphabet and
+ * truncates, so a corrupt payload would be stored as mangled bytes and reported as a
+ * successful upload. Validate before decoding instead.
+ */
+function decodeBase64(value: string, path: string): Buffer {
+  // Agents routinely line-wrap long base64 inside JSON, and both the standard (+/) and
+  // url-safe (-_) alphabets decode to the same bytes here, so tolerate both rather than
+  // failing payloads that are perfectly recoverable.
+  const unpadded = value.replace(/\s+/g, "").replace(/={1,2}$/, "");
+  // A length of 1 mod 4 carries a lone leftover sextet, which no encoder can emit.
+  if (!/^[A-Za-z0-9+/\-_]*$/.test(unpadded) || unpadded.length % 4 === 1) {
+    throw new FileError("invalid_base64", `invalid base64 for ${path}`);
+  }
+  return Buffer.from(unpadded, "base64");
 }
 
 function escapeHtml(s: string): string {
