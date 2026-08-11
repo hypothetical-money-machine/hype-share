@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { Command } from "commander";
-import { statSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import { loadCliConfig, requireConfig, saveCliConfig } from "./config.js";
 import {
   ApiError,
@@ -14,7 +14,10 @@ import {
   updateSite,
 } from "./api.js";
 import { collectDirectory, collectSingleFile } from "./bundle.js";
-import type { CreateSiteRequest, Visibility } from "@shareplan/core";
+import type { CreateSiteRequest, SiteFileInput, Visibility } from "@shareplan/core";
+
+/** Mirrors the server's visibility enum (createSiteSchema in @shareplan/server). */
+const VISIBILITIES = ["public", "unlisted", "private"] as const satisfies readonly Visibility[];
 
 const program = new Command();
 
@@ -57,17 +60,10 @@ program
   .option("--title <title>", "site title")
   .option("--ttl <ttl>", "expiry (e.g. 7d, 12h)")
   .option("--site <id>", "update existing site id (new version)")
-  .option("--visibility <vis>", "public | unlisted | private", "unlisted")
+  .option("--visibility <vis>", "public | unlisted | private (default: unlisted on create, unchanged on update)")
   .option("--note <note>", "version note")
-  .option("--slug <slug>", "optional vanity slug (create only)")
-  .action(async (pathArg: string, opts: {
-    title?: string;
-    ttl?: string;
-    site?: string;
-    visibility: string;
-    note?: string;
-    slug?: string;
-  }) => {
+  .option("--slug <slug>", "optional vanity slug (renames the site on update)")
+  .action(async (pathArg: string, opts: PublishOptions) => {
     const cfg = requireConfig();
     let st;
     try {
@@ -81,16 +77,8 @@ program
       ? collectDirectory(pathArg)
       : collectSingleFile(pathArg);
 
-    const body: CreateSiteRequest = {
-      files,
-      title: opts.title,
-      ttl: opts.ttl,
-      note: opts.note,
-      visibility: opts.visibility as Visibility,
-      slug: opts.slug,
-    };
-
     try {
+      const body = buildPublishBody(files, opts);
       const site = opts.site
         ? await updateSite(cfg, opts.site, body)
         : await createSite(cfg, body);
@@ -202,6 +190,46 @@ program
     }
   });
 
+export interface PublishOptions {
+  title?: string;
+  ttl?: string;
+  site?: string;
+  visibility?: string;
+  note?: string;
+  slug?: string;
+}
+
+export function buildPublishBody(
+  files: SiteFileInput[],
+  opts: PublishOptions,
+): CreateSiteRequest {
+  const body: CreateSiteRequest = {
+    files,
+    title: opts.title,
+    ttl: opts.ttl,
+    note: opts.note,
+    slug: opts.slug,
+  };
+
+  // Only send a visibility the user actually asked for: the server defaults new sites to
+  // "unlisted" and keeps the existing value on update, so a client-side default would
+  // silently re-scope an already-published site (public -> unlisted, private -> unlisted).
+  if (opts.visibility !== undefined) {
+    if (!isVisibility(opts.visibility)) {
+      throw new Error(
+        `invalid --visibility "${opts.visibility}" (expected ${VISIBILITIES.join(" | ")})`,
+      );
+    }
+    body.visibility = opts.visibility;
+  }
+
+  return body;
+}
+
+function isVisibility(value: string): value is Visibility {
+  return (VISIBILITIES as readonly string[]).includes(value);
+}
+
 function fail(e: unknown): never {
   if (e instanceof ApiError) {
     console.error(`error: ${e.code}: ${e.message}`);
@@ -211,7 +239,24 @@ function fail(e: unknown): never {
   process.exit(1);
 }
 
-program.parseAsync(process.argv).catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+/**
+ * Importing this module (tests) must not consume argv; only the real entrypoint
+ * parses. Both sides are resolved because either can be a symlink: argv[1] is
+ * the bin symlink when installed, and under --preserve-symlinks-main
+ * import.meta.filename is that same unresolved symlink path.
+ */
+export function isCliEntrypoint(entry: string | undefined, moduleFile: string): boolean {
+  if (entry === undefined) return false;
+  try {
+    return realpathSync(entry) === realpathSync(moduleFile);
+  } catch {
+    return false;
+  }
+}
+
+if (isCliEntrypoint(process.argv[1], import.meta.filename)) {
+  program.parseAsync(process.argv).catch((e) => {
+    console.error(e);
+    process.exit(1);
+  });
+}
