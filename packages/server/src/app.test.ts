@@ -92,6 +92,32 @@ const helloSite = (html = "<h1>hello</h1>") => ({
   files: [{ path: "index.html", content: html }],
 });
 
+type Send = (cmd: { constructor: { name: string } }) => Promise<unknown>;
+
+/** Makes every upload fail, so publishes die halfway through. */
+function breakUploads(s3: FakeS3): void {
+  const stub = s3.client as unknown as { send: Send };
+  const original = stub.send;
+  stub.send = (cmd) => {
+    if (cmd.constructor.name === "PutObjectCommand") {
+      return Promise.reject(new Error("s3 unavailable"));
+    }
+    return original(cmd);
+  };
+}
+
+/** Holds uploads open long enough for two publishes to interleave. */
+function slowUploads(s3: FakeS3, ms = 20): void {
+  const stub = s3.client as unknown as { send: Send };
+  const original = stub.send;
+  stub.send = async (cmd) => {
+    if (cmd.constructor.name === "PutObjectCommand") {
+      await new Promise((resolve) => setTimeout(resolve, ms));
+    }
+    return original(cmd);
+  };
+}
+
 describe("auth", () => {
   it("rejects requests without a token", async () => {
     const { app } = await setup();
@@ -172,9 +198,167 @@ describe("publish and serve", () => {
       })
     ).json<{ id: string }>();
 
-    const res = await inject(app, { method: "GET", url: `/s/${site.id}/docs` });
+    const redirect = await inject(app, { method: "GET", url: `/s/${site.id}/docs` });
+    expect(redirect.statusCode).toBe(302);
+
+    const res = await inject(app, {
+      method: "GET",
+      url: redirect.headers.location as string,
+    });
     expect(res.statusCode).toBe(200);
     expect(res.body).toBe("docs");
+  });
+
+  it("redirects a directory hit to its trailing-slash URL", async () => {
+    const { app } = await setup();
+    const site = (
+      await publish(app, {
+        files: [
+          { path: "index.html", content: "root" },
+          { path: "docs/index.html", content: `<link href="./style.css">` },
+          { path: "docs/style.css", content: "body{}" },
+        ],
+      })
+    ).json<{ id: string }>();
+
+    // Serving the index at the slash-less URL would resolve "./style.css"
+    // against /s/:id/ instead of /s/:id/docs/.
+    const res = await inject(app, { method: "GET", url: `/s/${site.id}/docs` });
+    expect(res.statusCode).toBe(302);
+    expect(res.headers.location).toBe(`/s/${site.id}/docs/`);
+    expect(res.body).not.toContain("style.css");
+  });
+
+  it("keeps the slug and query string in the directory redirect", async () => {
+    const { app } = await setup();
+    await publish(app, {
+      slug: "my-plan",
+      files: [
+        { path: "index.html", content: "root" },
+        { path: "docs/index.html", content: "docs" },
+      ],
+    });
+
+    const res = await inject(app, { method: "GET", url: "/s/my-plan/docs?page=2&q=a b" });
+    expect(res.headers.location).toBe("/s/my-plan/docs/?page=2&q=a%20b");
+  });
+
+  it("still 404s a directory that has no index.html", async () => {
+    const { app } = await setup();
+    const site = (
+      await publish(app, {
+        files: [
+          { path: "index.html", content: "root" },
+          { path: "docs/style.css", content: "body{}" },
+        ],
+      })
+    ).json<{ id: string }>();
+
+    const res = await inject(app, { method: "GET", url: `/s/${site.id}/docs` });
+    expect(res.statusCode).toBe(404);
+  });
+
+  it("400s serve paths the sanitizer rejects instead of 500ing", async () => {
+    const { app } = await setup();
+    const site = (await publish(app, helloSite())).json<{ id: string }>();
+
+    const shapes = [
+      "C:foo", // drive letter
+      "%5Cwindows%5Csystem32", // backslashes normalize to an absolute path
+      "a%00b", // null byte
+      "x".repeat(600), // over the 512-char cap
+      "..%2Fsecret", // traversal that survives URL normalization
+    ];
+    for (const shape of shapes) {
+      const res = await inject(app, { method: "GET", url: `/s/${site.id}/${shape}` });
+      expect(res.statusCode, shape).toBe(400);
+      expect(res.json<{ error: { code: string } }>().error.code).toBe("invalid_path");
+    }
+  });
+
+  it("400s paths that only the second sanitizer pass would reject", async () => {
+    const { app } = await setup();
+    const site = (await publish(app, helloSite())).json<{ id: string }>();
+
+    // Sanitizing twice is unavoidable here — the route sanitizes, then hands the
+    // result to s3ObjectKey, which sanitizes again. These shapes used to survive
+    // the first pass and throw on the second, straight into the 500 handler.
+    const shapes = [".%2FC:foo", ".%2F.%2FC:foo", ".%2Fx:y%2Fz", ".%5CC:foo", ".%2FD:"];
+    for (const shape of shapes) {
+      const res = await inject(app, { method: "GET", url: `/s/${site.id}/${shape}` });
+      expect(res.statusCode, shape).toBe(400);
+      expect(res.json<{ error: { code: string } }>().error.code).toBe("invalid_path");
+    }
+  });
+
+  it("400s an uploaded path that only fails on re-sanitize", async () => {
+    const { app } = await setup();
+    // prepareFiles sanitizes, then putSiteFiles sanitizes again on the way to
+    // the S3 key; "./C:foo" cleared the first and threw on the second.
+    const res = await publish(app, {
+      files: [
+        { path: "index.html", content: "<h1>hi</h1>" },
+        { path: "./C:foo", content: "x" },
+      ],
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json<{ error: { code: string } }>().error.code).toBe("invalid_path");
+  });
+
+  it("lands on the index when the directory redirect goes through the sanitizer", async () => {
+    const { app } = await setup();
+    const site = (
+      await publish(app, {
+        files: [
+          { path: "index.html", content: "root" },
+          { path: "docs/index.html", content: "docs" },
+        ],
+      })
+    ).json<{ id: string }>();
+
+    // The redirect target is the raw request URL, so it only round-trips if the
+    // sanitizer normalizes both spellings to the same key.
+    const redirect = await inject(app, { method: "GET", url: `/s/${site.id}/docs%20` });
+    expect(redirect.statusCode).toBe(302);
+    const res = await inject(app, {
+      method: "GET",
+      url: redirect.headers.location as string,
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toBe("docs");
+  });
+
+  it("rejects a non-string contentBase64 before it reaches the decoder", async () => {
+    const { app } = await setup();
+    // prepareFiles trusts the schema for the type, so the schema has to hold it.
+    for (const contentBase64 of [123, null, [], {}, true]) {
+      const res = await publish(app, { files: [{ path: "a.bin", contentBase64 }] });
+      expect(res.statusCode, JSON.stringify(contentBase64)).toBe(400);
+      expect(res.json<{ error: { code: string } }>().error.code).toBe("validation_error");
+    }
+  });
+
+  it("keeps the site's headers on the directory redirect", async () => {
+    const { app } = await setup();
+    const site = (
+      await publish(app, {
+        visibility: "private",
+        files: [
+          { path: "index.html", content: "root" },
+          { path: "docs/index.html", content: "docs" },
+        ],
+      })
+    ).json<{ id: string }>();
+
+    const res = await inject(app, {
+      method: "GET",
+      url: `/s/${site.id}/docs`,
+      headers: auth(),
+    });
+    expect(res.statusCode).toBe(302);
+    expect(res.headers["cache-control"]).toBe("private, no-store");
+    expect(res.headers["x-robots-tag"]).toContain("noindex");
+    expect(res.headers["x-content-type-options"]).toBe("nosniff");
   });
 });
 
@@ -302,6 +486,65 @@ describe("slugs", () => {
     const site = (await publish(app, helloSite())).json<{ id: string }>();
     const res = await publish(app, { ...helloSite(), slug: site.id });
     expect(res.statusCode).toBe(409);
+  });
+
+  it("keeps the old slug when the republish upload fails", async () => {
+    const { app, s3 } = await setup();
+    const site = (
+      await publish(app, { ...helloSite("v1"), slug: "before" })
+    ).json<{ id: string }>();
+
+    breakUploads(s3);
+    const failed = await inject(app, {
+      method: "PUT",
+      url: `/api/v1/sites/${site.id}`,
+      headers: auth(),
+      payload: { ...helloSite("v2"), slug: "after" },
+    });
+    expect(failed.statusCode).toBe(500);
+
+    // The site is still reachable where it was before the failed publish.
+    expect((await inject(app, { method: "GET", url: "/s/before/" })).statusCode).toBe(200);
+    expect((await inject(app, { method: "GET", url: "/s/after/" })).statusCode).toBe(404);
+
+    const row = await inject(app, {
+      method: "GET",
+      url: `/api/v1/sites/${site.id}`,
+      headers: auth(),
+    });
+    expect(row.json<{ slug: string | null }>().slug).toBe("before");
+  });
+
+  it("409s the loser when two republishes race for one slug", async () => {
+    const { app, s3 } = await setup();
+    const rename = async (id: string, body: object) =>
+      inject(app, {
+        method: "PUT",
+        url: `/api/v1/sites/${id}`,
+        headers: auth(),
+        payload: body,
+      });
+
+    const a = (await publish(app, { ...helloSite(), slug: "a" })).json<{ id: string }>();
+    const b = (await publish(app, { ...helloSite(), slug: "b" })).json<{ id: string }>();
+
+    // The slug check and the slug write now straddle the upload await, so both
+    // requests can pass the check before either writes.
+    slowUploads(s3);
+    const before = s3.keysUnder("sites/").length;
+    const results = await Promise.all([
+      rename(a.id, { ...helloSite("a2"), slug: "contested" }),
+      rename(b.id, { ...helloSite("b2"), slug: "contested" }),
+    ]);
+
+    const codes = results.map((r) => r.statusCode).sort();
+    expect(codes).toEqual([200, 409]);
+    const loser = results.find((r) => r.statusCode === 409)!;
+    expect(loser.json<{ error: { code: string } }>().error.code).toBe("slug_taken");
+
+    // Only the winner's new version survives; the loser's upload is cleaned up
+    // rather than stranded where version pruning can never reach it.
+    expect(s3.keysUnder("sites/")).toHaveLength(before + 1);
   });
 });
 
@@ -442,3 +685,86 @@ describe("admin keys", () => {
     expect(res.statusCode).toBe(401);
   });
 });
+
+describe("request limits", () => {
+  it("reports malformed JSON as a 400", async () => {
+    const { app } = await setup();
+    const res = await inject(app, {
+      method: "POST",
+      url: "/api/v1/sites",
+      headers: { ...auth(), "content-type": "application/json" },
+      payload: "{not json",
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json<{ error: { code: string } }>().error.code).toBe("invalid_json");
+  });
+
+  it("reports an oversized body as a 413", async () => {
+    const { app } = await setup({ maxSiteBytes: 1000 });
+    const res = await inject(app, {
+      method: "POST",
+      url: "/api/v1/sites",
+      headers: { ...auth(), "content-type": "application/json" },
+      payload: "x".repeat((app.initialConfig.bodyLimit ?? 0) + 1024),
+    });
+    expect(res.statusCode).toBe(413);
+    expect(res.json<{ error: { code: string } }>().error.code).toBe("payload_too_large");
+  });
+
+  it("reports a content type it cannot parse as a 415", async () => {
+    const { app } = await setup();
+    const res = await inject(app, {
+      method: "POST",
+      url: "/api/v1/sites",
+      headers: { ...auth(), "content-type": "application/xml" },
+      payload: "<files/>",
+    });
+    expect(res.statusCode).toBe(415);
+    expect(res.json<{ error: { code: string } }>().error.code).toBe(
+      "unsupported_media_type",
+    );
+  });
+
+  it("keeps an internal error opaque even when it carries a status code", async () => {
+    const { app } = await setup();
+    // Storage and database clients attach their own statusCode; trusting it
+    // would hand the client an upstream's message verbatim, unlogged.
+    app.get("/test-internal-error", async () => {
+      throw Object.assign(new Error("AccessDenied: bucket policy xyz"), {
+        statusCode: 403,
+        code: "AccessDenied",
+      });
+    });
+
+    const res = await inject(app, { method: "GET", url: "/test-internal-error" });
+    expect(res.statusCode).toBe(500);
+    expect(res.json<{ error: { code: string } }>().error.code).toBe("internal_error");
+    expect(res.body).not.toContain("bucket policy");
+  });
+
+  it("accepts a base64 bundle that fills maxSiteBytes", async () => {
+    // Binary reaches us as base64 — 4 characters per 3 bytes — so a transport
+    // limit sized off the decoded budget rejects sites prepareFiles allows.
+    const maxSiteBytes = 8 * 1024 * 1024;
+    const { app } = await setup({ maxSiteBytes });
+    const res = await publish(app, {
+      files: [
+        { path: "big.bin", contentBase64: Buffer.alloc(maxSiteBytes - 4096, 7).toString("base64") },
+      ],
+    });
+    expect(res.statusCode).toBe(201);
+  });
+
+  it("still enforces maxSiteBytes on decoded bytes", async () => {
+    const { app } = await setup({ maxSiteBytes: 1000 });
+    const res = await publish(app, {
+      files: [
+        { path: "index.html", content: "<h1>hi</h1>" },
+        { path: "big.bin", contentBase64: Buffer.alloc(2000).toString("base64") },
+      ],
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json<{ error: { code: string } }>().error.code).toBe("site_too_large");
+  });
+});
+
