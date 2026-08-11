@@ -1,5 +1,6 @@
 import Fastify, {
   type FastifyBaseLogger,
+  type FastifyError,
   type FastifyInstance,
   type FastifyReply,
   type FastifyRequest,
@@ -15,6 +16,7 @@ import {
   expiresAtFromTtl,
   isHtmlPath,
   s3ObjectKey,
+  sanitizeSitePath,
   type SiteResponse,
   type SiteListItem,
   type Visibility,
@@ -77,6 +79,18 @@ const createKeySchema = z.object({
   name: z.string().min(1).max(100).default("default"),
 });
 
+/**
+ * Fastify's transport errors carry a usable status and a safe message, but
+ * their codes are FST_ERR_*; map the ones a client can actually trigger onto
+ * the snake_case vocabulary the rest of the API returns.
+ */
+const TRANSPORT_ERROR_CODES: Record<string, string> = {
+  FST_ERR_CTP_INVALID_JSON_BODY: "invalid_json",
+  FST_ERR_CTP_EMPTY_JSON_BODY: "invalid_json",
+  FST_ERR_CTP_INVALID_MEDIA_TYPE: "unsupported_media_type",
+  FST_ERR_CTP_BODY_TOO_LARGE: "payload_too_large",
+};
+
 export interface AppDeps {
   config: Config;
   db: DatabaseSync;
@@ -93,12 +107,17 @@ interface Ctx extends AppDeps {
 export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   const app = Fastify({
     logger: deps.logger ?? true,
-    bodyLimit: deps.config.maxSiteBytes + 1_048_576,
+    // maxSiteBytes is enforced on *decoded* bytes in prepareFiles, but binary
+    // files reach us base64-encoded inside JSON — 4 characters per 3 bytes — so
+    // the transport limit has to cover that inflation or it would reject
+    // payloads well under the real limit. The extra MiB covers the JSON
+    // envelope (paths, title, note, quoting).
+    bodyLimit: Math.ceil(deps.config.maxSiteBytes / 3) * 4 + 1_048_576,
   });
 
   const ctx: Ctx = { ...deps, log: app.log };
 
-  app.setErrorHandler((err, _req, reply) => {
+  app.setErrorHandler((err: FastifyError, _req, reply) => {
     if (err instanceof AuthError || err instanceof HttpError) {
       return reply.status(err.statusCode).send({
         error: { code: err.code, message: err.message },
@@ -114,6 +133,25 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
         error: {
           code: "validation_error",
           message: err.issues.map((i) => i.message).join("; "),
+        },
+      });
+    }
+    // Fastify's own errors (malformed JSON, oversized body, ...) already carry
+    // the right client-facing status and a safe message; without this they all
+    // collapse into a misleading 500. Keyed on the FST_ERR_ prefix rather than
+    // on statusCode alone, because an internal failure that happens to carry a
+    // statusCode — an S3 403, say — must stay opaque and logged.
+    if (
+      typeof err.code === "string" &&
+      err.code.startsWith("FST_ERR_") &&
+      typeof err.statusCode === "number" &&
+      err.statusCode >= 400 &&
+      err.statusCode < 500
+    ) {
+      return reply.status(err.statusCode).send({
+        error: {
+          code: TRANSPORT_ERROR_CODES[err.code] ?? "bad_request",
+          message: err.message,
         },
       });
     }
@@ -370,9 +408,12 @@ async function publishVersion(
     expires_at = resolveTtl(ctx.config.defaultTtl, now);
   }
 
-  if (body.slug !== undefined && body.slug !== existing.slug) {
-    assertSlugAvailable(ctx, body.slug, existing.id);
-    updateSiteSlug(ctx.db, existing.id, body.slug);
+  // Checked up front so a taken slug fails before we upload anything, but only
+  // written once the upload lands — a failed publish must not move the slug.
+  const newSlug =
+    body.slug !== undefined && body.slug !== existing.slug ? body.slug : null;
+  if (newSlug !== null) {
+    assertSlugAvailable(ctx, newSlug, existing.id);
   }
 
   const byte_size = files.reduce((n, f) => n + f.body.byteLength, 0);
@@ -381,6 +422,19 @@ async function publishVersion(
 
   await putSiteFiles(ctx.s3, ctx.config.s3.bucket, existing.id, versionId, files);
 
+  if (newSlug !== null) {
+    // Re-checked after the upload, not just before it: another publish can claim
+    // the slug while we await S3, and sites.slug is UNIQUE, so writing blind
+    // would surface the race as a 500 instead of a 409. Nothing awaits between
+    // this check and the writes below, so they land as one step.
+    try {
+      assertSlugAvailable(ctx, newSlug, existing.id);
+    } catch (err) {
+      await discardVersionObjects(ctx, existing.id, versionId);
+      throw err;
+    }
+    updateSiteSlug(ctx.db, existing.id, newSlug);
+  }
   updateSiteVersion(ctx.db, existing.id, {
     current_version_id: versionId,
     updated_at: now,
@@ -428,6 +482,27 @@ function assertSlugAvailable(ctx: Ctx, slug: string, exceptSiteId?: string): voi
 }
 
 /**
+ * Drop the objects of a version that will never be recorded. No site_versions
+ * row means pruning can never reach them, so a publish that dies after its
+ * upload has to clean up after itself. Failing to is logged, not fatal — the
+ * caller is already on its way to reporting a more useful error.
+ */
+async function discardVersionObjects(
+  ctx: Ctx,
+  siteId: string,
+  versionId: string,
+): Promise<void> {
+  try {
+    await deleteVersionObjects(ctx.s3, ctx.config.s3.bucket, siteId, versionId);
+  } catch (err) {
+    ctx.log.warn(
+      { err, siteId, versionId },
+      "failed to discard objects of an abandoned version",
+    );
+  }
+}
+
+/**
  * Drop objects for versions beyond the retention window. The previous version
  * is kept so a page loaded moments before a republish can still fetch its
  * assets. Failures are logged, not fatal — the publish itself already landed.
@@ -445,6 +520,46 @@ async function pruneOldVersions(ctx: Ctx, siteId: string): Promise<void> {
       );
     }
   }
+}
+
+/**
+ * Resolve a requested path with the same sanitizer that builds S3 keys, so
+ * anything the sanitizer rejects (drive letters, backslashes, null bytes,
+ * over-long paths) becomes a 400 instead of a PathError escaping into the
+ * generic 500 handler. Null means "not serviceable". Passing the result to
+ * s3ObjectKey re-sanitizes it, which is safe because sanitizeSitePath is
+ * idempotent by contract.
+ */
+function normalizeServePath(relPath: string): string | null {
+  let path = relPath.replace(/^\/+/, "");
+  if (path === "" || path.endsWith("/")) {
+    path = `${path}index.html`;
+  }
+  try {
+    return sanitizeSitePath(path);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The site's own policy headers, which every response that reveals its content
+ * carries — including the directory redirect, so a private site's no-store does
+ * not go missing on the hop.
+ */
+function setSiteHeaders(reply: FastifyReply, site: SiteRow): void {
+  reply.header("X-Content-Type-Options", "nosniff");
+  reply.header("Referrer-Policy", "no-referrer");
+  // Only sites explicitly marked public are indexable; unlisted sites rely on
+  // the id being unguessable, which crawling would defeat.
+  reply.header(
+    "X-Robots-Tag",
+    site.visibility === "public" ? "noarchive" : "noindex, nofollow, noarchive",
+  );
+  reply.header(
+    "Cache-Control",
+    site.visibility === "private" ? "private, no-store" : "public, max-age=60",
+  );
 }
 
 async function serveSitePath(
@@ -479,25 +594,33 @@ async function serveSitePath(
     }
   }
 
-  let path = (relPath || "index.html").replace(/^\/+/, "");
-  if (path === "" || path.endsWith("/")) {
-    path = `${path}index.html`.replace(/^\/+/, "");
-  }
-
-  // Prevent traversal in serve path
-  if (path.includes("..") || path.startsWith("/")) {
+  const path = normalizeServePath(relPath);
+  if (path === null) {
     await reply.status(400).send({ error: { code: "invalid_path", message: "invalid path" } });
     return;
   }
 
   const key = s3ObjectKey(site.id, site.current_version_id, path);
-  let obj = await getObject(ctx.s3, ctx.config.s3.bucket, key);
+  const obj = await getObject(ctx.s3, ctx.config.s3.bucket, key);
 
-  // Try index.html under directory
+  // A directory hit has to bounce to the trailing-slash URL rather than serve
+  // the index here: at /s/:id/docs the browser resolves "./style.css" against
+  // /s/:id/, one level too high. Redirect off the request URL so vanity slugs
+  // and the query string survive, and keep it temporary — a later version may
+  // publish a real file at this path.
   if (!obj && !path.endsWith("index.html")) {
-    const idxKey = s3ObjectKey(site.id, site.current_version_id, `${path}/index.html`);
-    obj = await getObject(ctx.s3, ctx.config.s3.bucket, idxKey);
-    if (obj) path = `${path}/index.html`;
+    const indexPath = normalizeServePath(`${path}/index.html`);
+    if (indexPath !== null) {
+      const idxKey = s3ObjectKey(site.id, site.current_version_id, indexPath);
+      if (await getObject(ctx.s3, ctx.config.s3.bucket, idxKey)) {
+        const q = req.url.indexOf("?");
+        const target =
+          q === -1 ? `${req.url}/` : `${req.url.slice(0, q)}/${req.url.slice(q)}`;
+        setSiteHeaders(reply, site);
+        await reply.redirect(target, 302);
+        return;
+      }
+    }
   }
 
   if (!obj) {
@@ -507,21 +630,7 @@ async function serveSitePath(
 
   const ct = obj.contentType ?? contentTypeForPath(path);
   reply.header("Content-Type", ct);
-  reply.header("X-Content-Type-Options", "nosniff");
-  reply.header("Referrer-Policy", "no-referrer");
-
-  // Only sites explicitly marked public are indexable; unlisted sites rely on
-  // the id being unguessable, which crawling would defeat.
-  reply.header(
-    "X-Robots-Tag",
-    site.visibility === "public" ? "noarchive" : "noindex, nofollow, noarchive",
-  );
-  reply.header(
-    "Cache-Control",
-    site.visibility === "private"
-      ? "private, no-store"
-      : "public, max-age=60",
-  );
+  setSiteHeaders(reply, site);
 
   if (isHtmlPath(path) || ct.startsWith("text/html")) {
     // Permissive enough for LLM demo HTML with inline scripts/styles
