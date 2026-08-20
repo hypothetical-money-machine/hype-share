@@ -1,0 +1,64 @@
+services:
+  shareplan:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hype-shareplan:local
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8788:8788"
+    environment:
+      SHAREPLAN_HOST: "0.0.0.0"
+      SHAREPLAN_PORT: "8788"
+      SHAREPLAN_PUBLIC_BASE_URL: "${SHAREPLAN_PUBLIC_BASE_URL}"
+      SHAREPLAN_DATA_DIR: "/var/lib/shareplan"
+      SHAREPLAN_S3_ENDPOINT: "http://minio:9000"
+      SHAREPLAN_S3_REGION: "${SHAREPLAN_S3_REGION:-auto}"
+      SHAREPLAN_S3_BUCKET: "${SHAREPLAN_S3_BUCKET:-shareplan}"
+      SHAREPLAN_S3_ACCESS_KEY: "${MINIO_ROOT_USER}"
+      SHAREPLAN_S3_SECRET_KEY: "${MINIO_ROOT_PASSWORD}"
+      SHAREPLAN_S3_FORCE_PATH_STYLE: "true"
+      SHAREPLAN_MAX_SITE_BYTES: "${SHAREPLAN_MAX_SITE_BYTES:-52428800}"
+      SHAREPLAN_MAX_FILE_COUNT: "${SHAREPLAN_MAX_FILE_COUNT:-200}"
+      SHAREPLAN_DEFAULT_TTL: "${SHAREPLAN_DEFAULT_TTL:-}"
+      SHAREPLAN_ADMIN_TOKEN: "${SHAREPLAN_ADMIN_TOKEN}"
+      SHAREPLAN_VERSION_RETENTION: "${SHAREPLAN_VERSION_RETENTION:-2}"
+      SHAREPLAN_REAP_INTERVAL_SEC: "${SHAREPLAN_REAP_INTERVAL_SEC:-300}"
+    volumes:
+      - shareplan-data:/var/lib/shareplan
+    depends_on:
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          fetch('http://127.0.0.1:8788/healthz')
+          .then((r) => r.ok ? process.exit(0) : process.exit(1))
+          .catch(() => process.exit(1))
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: server /data
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD}"
+    volumes:
+      - shareplan-minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  shareplan-data:
+  shareplan-minio-data:
