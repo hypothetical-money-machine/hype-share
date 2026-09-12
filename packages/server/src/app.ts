@@ -182,7 +182,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 <body>
   <h1>shareplan</h1>
   <p>Small S3-backed microsite host for agents and humans.</p>
-  <p>Publish with the CLI or <code>POST /api/v1/sites</code>. Sites live at <code>/s/:id/</code>.</p>
+  <p>Publish with the CLI or <code>POST /api/v1/sites</code>. Sites live at <code>${siteUrlShape(deps.config)}</code>.</p>
   <p><a href="/healthz">healthz</a> · <a href="/docs/agents">agent docs</a></p>
 </body>
 </html>`;
@@ -209,7 +209,7 @@ Content-Type: application/json
 }
 \`\`\`
 
-Response includes \`url\` like \`${deps.config.publicBaseUrl}/s/<id>/\`.
+Response includes \`url\` like \`${siteUrl(deps.config, "<id>")}\`.
 
 ## Update
 \`PUT /api/v1/sites/:id\` with the same body shape (new version).
@@ -315,6 +315,59 @@ Response includes \`url\` like \`${deps.config.publicBaseUrl}/s/<id>/\`.
   });
 
   // --- Public serve --- (:id accepts a site id or a vanity slug)
+  const suffix = deps.config.siteHostSuffix;
+
+  if (suffix !== null) {
+    // Every site gets its own origin: <label>.<suffix>. Requests on a site
+    // host are answered here, before any route handler, so nothing but that
+    // site's content is reachable from it. A route constraint would not do:
+    // find-my-way prefers a static match like /healthz over a constrained
+    // wildcard, so the API would leak through. Only single-label subdomains
+    // count; the apex stays the API host.
+    app.addHook("onRequest", async (req, reply) => {
+      const label = siteLabelFromHost(req.headers.host ?? "", suffix);
+      if (label === null) return;
+      if (req.method !== "GET" && req.method !== "HEAD") {
+        reply.header("Allow", "GET, HEAD");
+        await reply.status(405).send({
+          error: { code: "method_not_allowed", message: "site hosts serve content only" },
+        });
+        return reply;
+      }
+      if (label === "www") {
+        await reply.redirect(deps.config.publicBaseUrl, 302);
+        return reply;
+      }
+      const q = req.url.indexOf("?");
+      const relPath = q === -1 ? req.url : req.url.slice(0, q);
+      await serveSitePath(ctx, req, reply, label, relPath);
+      return reply;
+    });
+
+    // Old-style links keep working, but hop to the isolated origin instead of
+    // being served from the shared one. Temporary redirect: the layout is
+    // config, not a fact about the site.
+    app.get("/s/:id", async (req, reply) => {
+      const { id } = req.params as { id: string };
+      return reply.redirect(siteUrl(deps.config, id.toLowerCase()), 302);
+    });
+    app.get("/s/:id/*", async (req, reply) => {
+      const { id } = req.params as { id: string };
+      const rest = (req.params as { "*": string })["*"] ?? "";
+      const q = req.url.indexOf("?");
+      const query = q === -1 ? "" : req.url.slice(q);
+      return reply.redirect(`${siteUrl(deps.config, id.toLowerCase())}${rest}${query}`, 302);
+    });
+    app.get("/s/:id/", async (req, reply) => {
+      const { id } = req.params as { id: string };
+      const q = req.url.indexOf("?");
+      const query = q === -1 ? "" : req.url.slice(q);
+      return reply.redirect(`${siteUrl(deps.config, id.toLowerCase())}${query}`, 302);
+    });
+
+    return app;
+  }
+
   app.get("/s/:id", async (req, reply) => {
     const { id } = req.params as { id: string };
     return reply.redirect(`/s/${encodeURIComponent(id)}/`, 302);
@@ -334,6 +387,26 @@ Response includes \`url\` like \`${deps.config.publicBaseUrl}/s/<id>/\`.
 
   return app;
 }
+
+/**
+ * Matches `<one-label>.<suffix>` with an optional port, since Fastify's host
+ * constraint sees the raw Host header. The suffix is escaped for the regex.
+ */
+export function siteHostPattern(suffix: string): RegExp {
+  const escaped = suffix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^[a-z0-9-]+\\.${escaped}(:\\d+)?$`, "i");
+}
+
+/** The subdomain label of a site host, lowercased, or null if it is not one. */
+export function siteLabelFromHost(host: string, suffix: string): string | null {
+  const m = siteHostPattern(suffix).exec(host);
+  if (!m) return null;
+  const label = host.toLowerCase().split(":")[0]!.slice(0, -(suffix.length + 1));
+  return label.includes(".") ? null : label;
+}
+
+/** Labels that must stay free so they can never be claimed as a slug. */
+const RESERVED_LABELS = new Set(["www", "api", "admin", "docs", "mail", "static", "cdn"]);
 
 async function publishNewSite(
   ctx: Ctx,
@@ -470,8 +543,20 @@ function resolveTtl(
   }
 }
 
-/** Slugs share the `/s/:id/` namespace with site ids, so both must be free. */
+/**
+ * Slugs share a namespace with site ids, so both must be free. Under hostname
+ * serving the slug is also a DNS label, so it must be lowercase (hostnames are
+ * case-insensitive, and the lookup is exact) and must not be a reserved label.
+ */
 function assertSlugAvailable(ctx: Ctx, slug: string, exceptSiteId?: string): void {
+  if (ctx.config.siteHostSuffix !== null) {
+    if (slug !== slug.toLowerCase()) {
+      throw new HttpError(400, "invalid_slug", "slug must be lowercase to be used as a hostname");
+    }
+    if (RESERVED_LABELS.has(slug)) {
+      throw new HttpError(409, "slug_taken", `slug "${slug}" is reserved`);
+    }
+  }
   const bySlug = getSiteBySlug(ctx.db, slug);
   if (bySlug && bySlug.id !== exceptSiteId) {
     throw new HttpError(409, "slug_taken", `slug "${slug}" is already in use`);
@@ -655,7 +740,18 @@ async function serveSitePath(
 }
 
 function siteUrl(config: Config, id: string): string {
-  return `${config.publicBaseUrl}/s/${id}/`;
+  if (config.siteHostSuffix === null) {
+    return `${config.publicBaseUrl}/s/${id}/`;
+  }
+  // Sites share the API host's scheme; a plain-http deployment behind no TLS
+  // would otherwise hand out https links that do not resolve.
+  const scheme = config.publicBaseUrl.startsWith("http://") ? "http" : "https";
+  return `${scheme}://${id}.${config.siteHostSuffix}/`;
+}
+
+/** How the landing page describes site URLs, without inventing an id. */
+function siteUrlShape(config: Config): string {
+  return config.siteHostSuffix === null ? "/s/:id/" : `https://:id.${config.siteHostSuffix}/`;
 }
 
 function toSiteResponse(config: Config, row: SiteRow): SiteResponse {

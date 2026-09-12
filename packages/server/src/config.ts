@@ -5,6 +5,13 @@ export interface Config {
   host: string;
   port: number;
   publicBaseUrl: string;
+  /**
+   * When set, each site is served from its own origin at `<id>.<suffix>`
+   * (and `<slug>.<suffix>`), so the browser's same-origin policy keeps sites
+   * apart. Path serving under `/s/:id/` then only redirects. Null keeps the
+   * single-origin `/s/:id/` layout.
+   */
+  siteHostSuffix: string | null;
   dataDir: string;
   dbPath: string;
   s3: {
@@ -56,6 +63,8 @@ export function loadConfig(envSource: NodeJS.ProcessEnv = process.env): Config {
     "",
   );
 
+  const siteHostSuffix = normalizeSiteHostSuffix(env("SHAREPLAN_SITE_HOST_SUFFIX"));
+
   const accessKeyId = env("SHAREPLAN_S3_ACCESS_KEY", env("AWS_ACCESS_KEY_ID", "minioadmin"))!;
   const secretAccessKey = env(
     "SHAREPLAN_S3_SECRET_KEY",
@@ -66,6 +75,7 @@ export function loadConfig(envSource: NodeJS.ProcessEnv = process.env): Config {
     host,
     port,
     publicBaseUrl,
+    siteHostSuffix,
     dataDir,
     dbPath: path.join(dataDir, "shareplan.sqlite"),
     s3: {
@@ -83,4 +93,21 @@ export function loadConfig(envSource: NodeJS.ProcessEnv = process.env): Config {
     versionRetention: Math.max(1, envInt("SHAREPLAN_VERSION_RETENTION", 2)),
     reapIntervalMs: Math.max(0, envInt("SHAREPLAN_REAP_INTERVAL_SEC", 300)) * 1000,
   };
+}
+
+/**
+ * A hostname suffix is a bare domain like `share.example.com`: lowercase, no
+ * scheme, no leading dot, no trailing dot or slash. Anything else is a
+ * misconfiguration worth failing on at startup rather than serving 404s.
+ */
+export function normalizeSiteHostSuffix(raw: string | undefined): string | null {
+  if (raw === undefined) return null;
+  const suffix = raw.trim().toLowerCase().replace(/^\.+/, "").replace(/[./]+$/, "");
+  if (suffix === "") return null;
+  if (!/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(suffix)) {
+    throw new Error(
+      `SHAREPLAN_SITE_HOST_SUFFIX must be a bare domain like example.com, got "${raw}"`,
+    );
+  }
+  return suffix;
 }
