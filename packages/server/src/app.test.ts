@@ -887,21 +887,63 @@ describe("hostname serving", () => {
     expect(res.headers.location).toBe("https://api.test");
   });
 
-  it("rejects slugs that cannot be hostnames", async () => {
-    const { app } = await setupHosted();
-    const upper = await publish(app, { ...helloSite(), slug: "MyPlan" });
-    expect(upper.statusCode).toBe(400);
-    expect(upper.json<{ error: { code: string } }>().error.code).toBe("invalid_slug");
+  it("rejects slugs that cannot be hostnames, in either mode", async () => {
+    for (const h of [await setupHosted(), await setup()]) {
+      const upper = await publish(h.app, { ...helloSite(), slug: "MyPlan" });
+      expect(upper.statusCode).toBe(400);
+      expect(upper.json<{ error: { code: string } }>().error.code).toBe("validation_error");
 
-    const reserved = await publish(app, { ...helloSite(), slug: "www" });
-    expect(reserved.statusCode).toBe(409);
-    expect(reserved.json<{ error: { code: string } }>().error.code).toBe("slug_taken");
+      const reserved = await publish(h.app, { ...helloSite(), slug: "www" });
+      expect(reserved.statusCode).toBe(409);
+      expect(reserved.json<{ error: { code: string } }>().error.code).toBe("slug_taken");
+    }
   });
 
-  it("still allows mixed-case slugs under path serving", async () => {
-    const { app } = await setup();
-    const res = await publish(app, { ...helloSite(), slug: "MyPlan" });
-    expect(res.statusCode).toBe(201);
+  it("keeps a legacy mixed-case slug reachable from its lowercase host", async () => {
+    const { app, db } = await setupHosted();
+    const site = (await publish(app, helloSite("legacy"))).json<{ id: string }>();
+    // Stored before slugs were forced lowercase.
+    db.prepare(`UPDATE sites SET slug = ? WHERE id = ?`).run("MyPlan", site.id);
+
+    const served = await inject(app, { method: "GET", url: "/", headers: host("myplan") });
+    expect(served.statusCode).toBe(200);
+    expect(served.body).toBe("legacy");
+
+    const legacyLink = await inject(app, { method: "GET", url: "/s/MyPlan/" });
+    expect(legacyLink.headers.location).toBe(`https://myplan.${SUFFIX}/`);
+
+    // And nobody else can claim the lowercase form out from under it.
+    const clash = await publish(app, { ...helloSite(), slug: "myplan" });
+    expect(clash.statusCode).toBe(409);
+  });
+
+  it("treats a trailing-dot or ported host as the same site host", async () => {
+    const { app, site } = await setupHosted();
+    for (const h of [
+      `${site.id}.${SUFFIX}.`,
+      `${site.id}.${SUFFIX}.:443`,
+      ` ${site.id}.${SUFFIX}:8788 `,
+    ]) {
+      const page = await inject(app, { method: "GET", url: "/", headers: { host: h } });
+      expect(page.statusCode, h).toBe(200);
+      expect(page.body, h).toBe("root");
+      const api = await inject(app, { method: "GET", url: "/healthz", headers: { host: h } });
+      expect(api.statusCode, `${h} must not reach the api`).toBe(404);
+    }
+  });
+
+  it("keeps the query on a bare /s/:id redirect", async () => {
+    const { app, site } = await setupHosted();
+    const res = await inject(app, { method: "GET", url: `/s/${site.id}?q=1&r=2` });
+    expect(res.statusCode).toBe(302);
+    expect(res.headers.location).toBe(`https://${site.id}.${SUFFIX}/?q=1&r=2`);
+  });
+
+  it("describes site urls on the landing page with the api scheme", async () => {
+    const http = await setup({ siteHostSuffix: SUFFIX, publicBaseUrl: "http://localhost:8788" });
+    const page = await inject(http.app, { method: "GET", url: "/" });
+    expect(page.body).toContain(`http://:id.${SUFFIX}/`);
+    expect(page.body).not.toContain(`https://:id.${SUFFIX}/`);
   });
 
   it("uses http site urls when the api base is http", async () => {

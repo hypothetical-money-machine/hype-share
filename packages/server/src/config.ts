@@ -104,7 +104,14 @@ export function normalizeSiteHostSuffix(raw: string | undefined): string | null 
   if (raw === undefined) return null;
   const suffix = raw.trim().toLowerCase().replace(/^\.+/, "").replace(/[./]+$/, "");
   if (suffix === "") return null;
-  if (!/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(suffix)) {
+  const labels = suffix.split(".");
+  // Site hosts add one more label of up to 63 chars plus a dot, so the suffix
+  // has to leave room for that inside the 253-char hostname limit.
+  const ok =
+    labels.length >= 2 &&
+    suffix.length <= 253 - 64 &&
+    labels.every((l) => /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(l));
+  if (!ok) {
     throw new Error(
       `SHAREPLAN_SITE_HOST_SUFFIX must be a bare domain like example.com, got "${raw}"`,
     );

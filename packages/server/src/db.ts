@@ -241,12 +241,17 @@ export function getSite(db: DatabaseSync, id: string): SiteRow | null {
   return row ?? null;
 }
 
+/**
+ * Case-insensitive: a slug is a hostname label under hostname serving, and a
+ * mixed-case slug stored before slugs were forced lowercase must still resolve
+ * from its lowercase hostname. Uniqueness checks go through here too.
+ */
 export function getSiteBySlug(db: DatabaseSync, slug: string): SiteRow | null {
   const row = db
     .prepare(
       `SELECT id, owner_key_id, slug, title, visibility, current_version_id,
               created_at, updated_at, expires_at, byte_size, file_count
-       FROM sites WHERE slug = ?`,
+       FROM sites WHERE slug = ? COLLATE NOCASE`,
     )
     .get(slug) as SiteRow | undefined;
   return row ?? null;
