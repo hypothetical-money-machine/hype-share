@@ -5,7 +5,6 @@ describe("normalizeSiteHostSuffix", () => {
   it("accepts a bare domain and tidies it", () => {
     expect(normalizeSiteHostSuffix("hype-share.com")).toBe("hype-share.com");
     expect(normalizeSiteHostSuffix(" .Hype-Share.COM. ")).toBe("hype-share.com");
-    expect(normalizeSiteHostSuffix("sites.example.org/")).toBe("sites.example.org");
   });
 
   it("treats unset and blank as disabled", () => {
@@ -20,6 +19,7 @@ describe("normalizeSiteHostSuffix", () => {
       "*.hype-share.com",
       "localhost",
       "a b.com",
+      "sites.example.org/",
       "-bad.example",
       "bad-.example",
       "a..b",
