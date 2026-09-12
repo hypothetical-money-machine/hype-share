@@ -44,7 +44,41 @@ export function openDb(dbPath: string): DatabaseSync {
   db.exec("PRAGMA journal_mode = WAL;");
   db.exec("PRAGMA foreign_keys = ON;");
   migrate(db);
+  const cleared = resolveCaseFoldedSlugs(db);
+  if (cleared.length > 0) {
+    console.warn(
+      `cleared ${cleared.length} slug(s) that differed from another only by case: ` +
+        cleared.map((c) => `${c.slug} (site ${c.id})`).join(", "),
+    );
+  }
   return db;
+}
+
+/**
+ * Slugs are matched case-insensitively now, but the UNIQUE column is
+ * case-sensitive, so a database from before that rule may hold both "MyPlan"
+ * and "myplan" on different sites, and the lookup could serve either. The
+ * oldest site keeps its slug; the rest lose theirs (the site itself, and its
+ * id URL, are untouched). Returns what was cleared so the caller can log it.
+ */
+export function resolveCaseFoldedSlugs(db: DatabaseSync): { id: string; slug: string }[] {
+  const losers = db
+    .prepare(
+      `SELECT s.id, s.slug
+       FROM sites s
+       WHERE s.slug IS NOT NULL
+         AND EXISTS (
+           SELECT 1 FROM sites o
+           WHERE o.slug = s.slug COLLATE NOCASE
+             AND o.id <> s.id
+             AND (o.created_at < s.created_at OR (o.created_at = s.created_at AND o.id < s.id))
+         )
+       ORDER BY s.created_at, s.id`,
+    )
+    .all() as { id: string; slug: string }[];
+  const clear = db.prepare(`UPDATE sites SET slug = NULL WHERE id = ?`);
+  for (const row of losers) clear.run(row.id);
+  return losers;
 }
 
 function migrate(db: DatabaseSync): void {
@@ -244,16 +278,20 @@ export function getSite(db: DatabaseSync, id: string): SiteRow | null {
 /**
  * Case-insensitive: a slug is a hostname label under hostname serving, and a
  * mixed-case slug stored before slugs were forced lowercase must still resolve
- * from its lowercase hostname. Uniqueness checks go through here too.
+ * from its lowercase hostname. Uniqueness checks go through here too. An
+ * exact-case match wins, then the oldest site, so the answer is deterministic
+ * even if resolveCaseFoldedSlugs has not run against this database.
  */
 export function getSiteBySlug(db: DatabaseSync, slug: string): SiteRow | null {
   const row = db
     .prepare(
       `SELECT id, owner_key_id, slug, title, visibility, current_version_id,
               created_at, updated_at, expires_at, byte_size, file_count
-       FROM sites WHERE slug = ? COLLATE NOCASE`,
+       FROM sites WHERE slug = ? COLLATE NOCASE
+       ORDER BY (slug = ?) DESC, created_at, id
+       LIMIT 1`,
     )
-    .get(slug) as SiteRow | undefined;
+    .get(slug, slug) as SiteRow | undefined;
   return row ?? null;
 }
 

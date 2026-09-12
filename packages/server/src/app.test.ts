@@ -932,6 +932,34 @@ describe("hostname serving", () => {
     }
   });
 
+  it("refuses legacy ids that could steer the redirect off the suffix", async () => {
+    const { app } = await setupHosted();
+    for (const id of ["evil.example%23", "evil.example", "a%2Fb", "x%3Ay", "%20", "a%2Eb"]) {
+      for (const url of [`/s/${id}`, `/s/${id}/`, `/s/${id}/index.html`]) {
+        const res = await inject(app, { method: "GET", url });
+        expect(res.statusCode, url).toBe(404);
+        expect(res.headers.location, url).toBeUndefined();
+      }
+    }
+  });
+
+  it("serves the older site when legacy slugs differ only by case", async () => {
+    const { app, db } = await setupHosted();
+    const older = (await publish(app, helloSite("older"))).json<{ id: string }>();
+    const newer = (await publish(app, helloSite("newer"))).json<{ id: string }>();
+    db.prepare(`UPDATE sites SET slug = ?, created_at = 1 WHERE id = ?`).run("MyPlan", older.id);
+    db.prepare(`UPDATE sites SET slug = ?, created_at = 2 WHERE id = ?`).run("myplan", newer.id);
+
+    // Exact case wins when it exists, otherwise the oldest site.
+    const exact = await inject(app, { method: "GET", url: "/s/myplan/" });
+    expect(exact.headers.location).toBe(`https://myplan.${SUFFIX}/`);
+    const byHost = await inject(app, { method: "GET", url: "/", headers: host("myplan") });
+    expect(byHost.body).toBe("newer");
+    db.prepare(`UPDATE sites SET slug = ? WHERE id = ?`).run("MYPLAN", newer.id);
+    const oldest = await inject(app, { method: "GET", url: "/", headers: host("myplan") });
+    expect(oldest.body).toBe("older");
+  });
+
   it("keeps the query on a bare /s/:id redirect", async () => {
     const { app, site } = await setupHosted();
     const res = await inject(app, { method: "GET", url: `/s/${site.id}?q=1&r=2` });
