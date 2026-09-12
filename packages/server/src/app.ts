@@ -14,6 +14,8 @@ import {
   createVersionId,
   contentTypeForPath,
   expiresAtFromTtl,
+  HOST_LABEL_RE,
+  isHostLabel,
   isHtmlPath,
   s3ObjectKey,
   sanitizeSitePath,
@@ -59,15 +61,11 @@ const fileInputSchema = z.object({
 
 const createSiteSchema = z.object({
   title: z.string().max(200).optional(),
+  // A slug is a hostname label under hostname serving, so it follows the
+  // label rule in every mode: the rule must not change when a suffix is set.
   slug: z
     .string()
-    .min(1)
-    .max(64)
-    // Lowercase only: a slug doubles as a DNS label under hostname serving, and
-    // hostnames are case-insensitive, so two slugs differing only in case
-    // would collide. Lookups are case-insensitive too, so a mixed-case slug
-    // stored before this rule stays reachable at its lowercase hostname.
-    .regex(/^[a-z0-9][a-z0-9-]*$/, "slug must be lowercase alphanumeric with hyphens")
+    .regex(HOST_LABEL_RE, "slug must be a lowercase hostname label (a-z, 0-9, hyphens)")
     .optional(),
   visibility: z.enum(["public", "unlisted", "private"]).optional(),
   ttl: z.union([z.string(), z.number(), z.null()]).optional(),
@@ -318,7 +316,7 @@ Response includes \`url\` like \`${siteUrl(deps.config, "<id>")}\`.
     return reply.status(204).send();
   });
 
-  // --- Public serve --- (:id accepts a site id or a vanity slug)
+  // --- Public serve ---
   const suffix = deps.config.siteHostSuffix;
 
   if (suffix !== null) {
@@ -338,58 +336,51 @@ Response includes \`url\` like \`${siteUrl(deps.config, "<id>")}\`.
         });
         return reply;
       }
-      if (label === "www") {
+      if (RESERVED_LABELS.has(label)) {
+        // Never a site (slugs cannot claim these), so send www and friends
+        // to the API host rather than 404 them as missing sites.
         await reply.redirect(deps.config.publicBaseUrl, 302);
         return reply;
       }
-      const q = req.url.indexOf("?");
-      const relPath = q === -1 ? req.url : req.url.slice(0, q);
-      await serveSitePath(ctx, req, reply, label, relPath);
+      await serveSitePath(ctx, req, reply, label, splitQuery(req.url).path);
       return reply;
     });
-
-    // Old-style links keep working, but hop to the isolated origin instead of
-    // being served from the shared one. Temporary redirect: the layout is
-    // config, not a fact about the site.
-    // The :id lands in the Location hostname, so it has to be a clean label.
-    // Anything else (a dot, an encoded "#" or "/") would let a crafted link
-    // redirect to a host of the attacker's choosing.
-    const legacyRedirect = async (req: FastifyRequest, reply: FastifyReply, rest = "") => {
-      const label = (req.params as { id: string }).id.toLowerCase();
-      if (!/^[a-z0-9-]+$/.test(label)) {
-        return reply.status(404).send({ error: { code: "not_found", message: "site not found" } });
-      }
-      const q = req.url.indexOf("?");
-      const query = q === -1 ? "" : req.url.slice(q);
-      return reply.redirect(`${siteUrl(deps.config, label)}${rest}${query}`, 302);
-    };
-    app.get("/s/:id", async (req, reply) => legacyRedirect(req, reply));
-    app.get("/s/:id/", async (req, reply) => legacyRedirect(req, reply));
-    app.get("/s/:id/*", async (req, reply) =>
-      legacyRedirect(req, reply, (req.params as { "*": string })["*"] ?? ""),
-    );
-
-    return app;
   }
 
-  app.get("/s/:id", async (req, reply) => {
-    const { id } = req.params as { id: string };
-    return reply.redirect(`/s/${encodeURIComponent(id)}/`, 302);
-  });
-
-  app.get("/s/:id/*", async (req, reply) => {
-    const { id } = req.params as { id: string };
-    const wildcard = (req.params as { "*": string })["*"] ?? "";
-    return serveSitePath(ctx, req, reply, id, wildcard);
-  });
-
-  // Fastify may not match trailing slash path with splat alone in all versions
-  app.get("/s/:id/", async (req, reply) => {
-    const { id } = req.params as { id: string };
-    return serveSitePath(ctx, req, reply, id, "");
-  });
+  // /s/:id/... is the only site URL without a suffix, and a legacy link with
+  // one: it then hops to the site's own origin instead of being served from
+  // the shared one. Temporary redirect, since the layout is config, not a
+  // fact about the site. Three registrations because find-my-way does not
+  // fold the bare, trailing-slash, and splat forms into one route.
+  const legacy = async (req: FastifyRequest, reply: FastifyReply) => {
+    const params = req.params as { id: string; "*"?: string };
+    const rest = params["*"] ?? "";
+    if (suffix === null) {
+      if (!req.url.startsWith(`/s/${params.id}/`)) {
+        return reply.redirect(`/s/${encodeURIComponent(params.id)}/`, 302);
+      }
+      return serveSitePath(ctx, req, reply, params.id, rest);
+    }
+    // The id lands in the Location hostname, so it must be a clean label:
+    // anything else (a dot, an encoded "#" or "/") would let a crafted link
+    // redirect to a host of the attacker's choosing.
+    const label = params.id.toLowerCase();
+    if (!isHostLabel(label)) {
+      return reply.status(404).send({ error: { code: "not_found", message: "site not found" } });
+    }
+    return reply.redirect(`${siteUrl(deps.config, label)}${rest}${splitQuery(req.url).query}`, 302);
+  };
+  app.get("/s/:id", legacy);
+  app.get("/s/:id/", legacy);
+  app.get("/s/:id/*", legacy);
 
   return app;
+}
+
+/** Request URL split at the "?", with the query keeping its "?" (or ""). */
+function splitQuery(url: string): { path: string; query: string } {
+  const q = url.indexOf("?");
+  return q === -1 ? { path: url, query: "" } : { path: url.slice(0, q), query: url.slice(q) };
 }
 
 /**
@@ -403,7 +394,7 @@ export function siteLabelFromHost(host: string, suffix: string): string | null {
   const name = host.trim().toLowerCase().replace(/:\d+$/, "").replace(/\.$/, "");
   if (!name.endsWith(`.${suffix}`)) return null;
   const label = name.slice(0, -(suffix.length + 1));
-  return /^[a-z0-9-]+$/.test(label) ? label : null;
+  return isHostLabel(label) ? label : null;
 }
 
 /** Labels that must stay free so they can never be claimed as a slug. */
@@ -695,11 +686,9 @@ async function serveSitePath(
     if (indexPath !== null) {
       const idxKey = s3ObjectKey(site.id, site.current_version_id, indexPath);
       if (await getObject(ctx.s3, ctx.config.s3.bucket, idxKey)) {
-        const q = req.url.indexOf("?");
-        const target =
-          q === -1 ? `${req.url}/` : `${req.url.slice(0, q)}/${req.url.slice(q)}`;
+        const { path: reqPath, query } = splitQuery(req.url);
         setSiteHeaders(reply, site);
-        await reply.redirect(target, 302);
+        await reply.redirect(`${reqPath}/${query}`, 302);
         return;
       }
     }

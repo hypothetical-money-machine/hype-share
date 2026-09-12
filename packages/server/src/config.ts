@@ -1,5 +1,6 @@
 import { mkdirSync } from "node:fs";
 import path from "node:path";
+import { isHostLabel } from "@shareplan/core";
 
 export interface Config {
   host: string;
@@ -97,20 +98,17 @@ export function loadConfig(envSource: NodeJS.ProcessEnv = process.env): Config {
 
 /**
  * A hostname suffix is a bare domain like `share.example.com`: lowercase, no
- * scheme, no leading dot, no trailing dot or slash. Anything else is a
- * misconfiguration worth failing on at startup rather than serving 404s.
+ * scheme, no leading or trailing dot. Anything else is a misconfiguration
+ * worth failing on at startup rather than serving 404s.
  */
 export function normalizeSiteHostSuffix(raw: string | undefined): string | null {
   if (raw === undefined) return null;
-  const suffix = raw.trim().toLowerCase().replace(/^\.+/, "").replace(/[./]+$/, "");
+  const suffix = raw.trim().toLowerCase().replace(/^\.+/, "").replace(/\.+$/, "");
   if (suffix === "") return null;
   const labels = suffix.split(".");
   // Site hosts add one more label of up to 63 chars plus a dot, so the suffix
   // has to leave room for that inside the 253-char hostname limit.
-  const ok =
-    labels.length >= 2 &&
-    suffix.length <= 253 - 64 &&
-    labels.every((l) => /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(l));
+  const ok = labels.length >= 2 && suffix.length <= 253 - 64 && labels.every(isHostLabel);
   if (!ok) {
     throw new Error(
       `SHAREPLAN_SITE_HOST_SUFFIX must be a bare domain like example.com, got "${raw}"`,

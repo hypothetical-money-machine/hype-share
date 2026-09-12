@@ -880,18 +880,22 @@ describe("hostname serving", () => {
     }
   });
 
-  it("sends www to the api host", async () => {
+  it("sends reserved labels like www to the api host", async () => {
     const { app } = await setupHosted();
-    const res = await inject(app, { method: "GET", url: "/", headers: host("www") });
-    expect(res.statusCode).toBe(302);
-    expect(res.headers.location).toBe("https://api.test");
+    for (const label of ["www", "api", "admin"]) {
+      const res = await inject(app, { method: "GET", url: "/", headers: host(label) });
+      expect(res.statusCode, label).toBe(302);
+      expect(res.headers.location, label).toBe("https://api.test");
+    }
   });
 
   it("rejects slugs that cannot be hostnames, in either mode", async () => {
     for (const h of [await setupHosted(), await setup()]) {
-      const upper = await publish(h.app, { ...helloSite(), slug: "MyPlan" });
-      expect(upper.statusCode).toBe(400);
-      expect(upper.json<{ error: { code: string } }>().error.code).toBe("validation_error");
+      for (const slug of ["MyPlan", "-lead", "trail-", "a".repeat(64)]) {
+        const bad = await publish(h.app, { ...helloSite(), slug });
+        expect(bad.statusCode, slug).toBe(400);
+        expect(bad.json<{ error: { code: string } }>().error.code).toBe("validation_error");
+      }
 
       const reserved = await publish(h.app, { ...helloSite(), slug: "www" });
       expect(reserved.statusCode).toBe(409);
@@ -915,6 +919,10 @@ describe("hostname serving", () => {
     // And nobody else can claim the lowercase form out from under it.
     const clash = await publish(app, { ...helloSite(), slug: "myplan" });
     expect(clash.statusCode).toBe(409);
+    // Not even by writing around the API: the index is case-insensitive.
+    expect(() =>
+      db.prepare(`UPDATE sites SET slug = 'MYPLAN' WHERE id <> ?`).run(site.id),
+    ).toThrow(/UNIQUE/);
   });
 
   it("treats a trailing-dot or ported host as the same site host", async () => {
@@ -941,23 +949,6 @@ describe("hostname serving", () => {
         expect(res.headers.location, url).toBeUndefined();
       }
     }
-  });
-
-  it("serves the older site when legacy slugs differ only by case", async () => {
-    const { app, db } = await setupHosted();
-    const older = (await publish(app, helloSite("older"))).json<{ id: string }>();
-    const newer = (await publish(app, helloSite("newer"))).json<{ id: string }>();
-    db.prepare(`UPDATE sites SET slug = ?, created_at = 1 WHERE id = ?`).run("MyPlan", older.id);
-    db.prepare(`UPDATE sites SET slug = ?, created_at = 2 WHERE id = ?`).run("myplan", newer.id);
-
-    // Exact case wins when it exists, otherwise the oldest site.
-    const exact = await inject(app, { method: "GET", url: "/s/myplan/" });
-    expect(exact.headers.location).toBe(`https://myplan.${SUFFIX}/`);
-    const byHost = await inject(app, { method: "GET", url: "/", headers: host("myplan") });
-    expect(byHost.body).toBe("newer");
-    db.prepare(`UPDATE sites SET slug = ? WHERE id = ?`).run("MYPLAN", newer.id);
-    const oldest = await inject(app, { method: "GET", url: "/", headers: host("myplan") });
-    expect(oldest.body).toBe("older");
   });
 
   it("keeps the query on a bare /s/:id redirect", async () => {

@@ -86,7 +86,8 @@ Binary files use `contentBase64` instead of `content`.
 | `GET` | `https://<id>.<suffix>/*` | Public serve (`<id>` also accepts a slug) |
 
 Optional `slug` on create gives a readable URL (`https://my-plan.<suffix>/`);
-it must be lowercase, must not be a reserved label like `www`, and must not
+it must be a valid hostname label (lowercase letters, digits, inner hyphens, at
+most 63 chars), must not be a reserved label like `www`, and must not
 already be taken or look like an existing site id, otherwise you get a `409`.
 
 Always use the `url` from the response rather than building one: a server
