@@ -63,7 +63,11 @@ const createSiteSchema = z.object({
     .string()
     .min(1)
     .max(64)
-    .regex(/^[a-z0-9][a-z0-9-]*$/i, "slug must be alphanumeric with hyphens")
+    // Lowercase only: a slug doubles as a DNS label under hostname serving, and
+    // hostnames are case-insensitive, so two slugs differing only in case
+    // would collide. Lookups are case-insensitive too, so a mixed-case slug
+    // stored before this rule stays reachable at its lowercase hostname.
+    .regex(/^[a-z0-9][a-z0-9-]*$/, "slug must be lowercase alphanumeric with hyphens")
     .optional(),
   visibility: z.enum(["public", "unlisted", "private"]).optional(),
   ttl: z.union([z.string(), z.number(), z.null()]).optional(),
@@ -349,7 +353,9 @@ Response includes \`url\` like \`${siteUrl(deps.config, "<id>")}\`.
     // config, not a fact about the site.
     app.get("/s/:id", async (req, reply) => {
       const { id } = req.params as { id: string };
-      return reply.redirect(siteUrl(deps.config, id.toLowerCase()), 302);
+      const q = req.url.indexOf("?");
+      const query = q === -1 ? "" : req.url.slice(q);
+      return reply.redirect(`${siteUrl(deps.config, id.toLowerCase())}${query}`, 302);
     });
     app.get("/s/:id/*", async (req, reply) => {
       const { id } = req.params as { id: string };
@@ -389,20 +395,17 @@ Response includes \`url\` like \`${siteUrl(deps.config, "<id>")}\`.
 }
 
 /**
- * Matches `<one-label>.<suffix>` with an optional port, since Fastify's host
- * constraint sees the raw Host header. The suffix is escaped for the regex.
+ * The subdomain label of a site host, lowercased, or null if the host is not
+ * `<one-label>.<suffix>`. Works from the raw Host header, so it drops the
+ * port and a trailing dot first: `site.example.com.:443` is the same host as
+ * `site.example.com`, and treating it as anything else would let a request
+ * on a site's own name reach the API.
  */
-export function siteHostPattern(suffix: string): RegExp {
-  const escaped = suffix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`^[a-z0-9-]+\\.${escaped}(:\\d+)?$`, "i");
-}
-
-/** The subdomain label of a site host, lowercased, or null if it is not one. */
 export function siteLabelFromHost(host: string, suffix: string): string | null {
-  const m = siteHostPattern(suffix).exec(host);
-  if (!m) return null;
-  const label = host.toLowerCase().split(":")[0]!.slice(0, -(suffix.length + 1));
-  return label.includes(".") ? null : label;
+  const name = host.trim().toLowerCase().replace(/:\d+$/, "").replace(/\.$/, "");
+  if (!name.endsWith(`.${suffix}`)) return null;
+  const label = name.slice(0, -(suffix.length + 1));
+  return /^[a-z0-9-]+$/.test(label) ? label : null;
 }
 
 /** Labels that must stay free so they can never be claimed as a slug. */
@@ -544,18 +547,14 @@ function resolveTtl(
 }
 
 /**
- * Slugs share a namespace with site ids, so both must be free. Under hostname
- * serving the slug is also a DNS label, so it must be lowercase (hostnames are
- * case-insensitive, and the lookup is exact) and must not be a reserved label.
+ * Slugs share a namespace with site ids, so both must be free. A slug is also
+ * a DNS label under hostname serving, so reserved labels stay off limits in
+ * every mode: a site claimed as "www" under path serving would break the
+ * moment a suffix was configured.
  */
 function assertSlugAvailable(ctx: Ctx, slug: string, exceptSiteId?: string): void {
-  if (ctx.config.siteHostSuffix !== null) {
-    if (slug !== slug.toLowerCase()) {
-      throw new HttpError(400, "invalid_slug", "slug must be lowercase to be used as a hostname");
-    }
-    if (RESERVED_LABELS.has(slug)) {
-      throw new HttpError(409, "slug_taken", `slug "${slug}" is reserved`);
-    }
+  if (RESERVED_LABELS.has(slug)) {
+    throw new HttpError(409, "slug_taken", `slug "${slug}" is reserved`);
   }
   const bySlug = getSiteBySlug(ctx.db, slug);
   if (bySlug && bySlug.id !== exceptSiteId) {
@@ -739,19 +738,26 @@ async function serveSitePath(
   await reply.send(obj.body);
 }
 
+/**
+ * Sites share the API host's scheme; a plain-http deployment behind no TLS
+ * would otherwise hand out https links that do not resolve.
+ */
+function siteScheme(config: Config): "http" | "https" {
+  return config.publicBaseUrl.startsWith("http://") ? "http" : "https";
+}
+
 function siteUrl(config: Config, id: string): string {
   if (config.siteHostSuffix === null) {
     return `${config.publicBaseUrl}/s/${id}/`;
   }
-  // Sites share the API host's scheme; a plain-http deployment behind no TLS
-  // would otherwise hand out https links that do not resolve.
-  const scheme = config.publicBaseUrl.startsWith("http://") ? "http" : "https";
-  return `${scheme}://${id}.${config.siteHostSuffix}/`;
+  return `${siteScheme(config)}://${id}.${config.siteHostSuffix}/`;
 }
 
 /** How the landing page describes site URLs, without inventing an id. */
 function siteUrlShape(config: Config): string {
-  return config.siteHostSuffix === null ? "/s/:id/" : `https://:id.${config.siteHostSuffix}/`;
+  return config.siteHostSuffix === null
+    ? "/s/:id/"
+    : `${siteScheme(config)}://:id.${config.siteHostSuffix}/`;
 }
 
 function toSiteResponse(config: Config, row: SiteRow): SiteResponse {
