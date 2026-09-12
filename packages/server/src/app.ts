@@ -351,25 +351,23 @@ Response includes \`url\` like \`${siteUrl(deps.config, "<id>")}\`.
     // Old-style links keep working, but hop to the isolated origin instead of
     // being served from the shared one. Temporary redirect: the layout is
     // config, not a fact about the site.
-    app.get("/s/:id", async (req, reply) => {
-      const { id } = req.params as { id: string };
+    // The :id lands in the Location hostname, so it has to be a clean label.
+    // Anything else (a dot, an encoded "#" or "/") would let a crafted link
+    // redirect to a host of the attacker's choosing.
+    const legacyRedirect = async (req: FastifyRequest, reply: FastifyReply, rest = "") => {
+      const label = (req.params as { id: string }).id.toLowerCase();
+      if (!/^[a-z0-9-]+$/.test(label)) {
+        return reply.status(404).send({ error: { code: "not_found", message: "site not found" } });
+      }
       const q = req.url.indexOf("?");
       const query = q === -1 ? "" : req.url.slice(q);
-      return reply.redirect(`${siteUrl(deps.config, id.toLowerCase())}${query}`, 302);
-    });
-    app.get("/s/:id/*", async (req, reply) => {
-      const { id } = req.params as { id: string };
-      const rest = (req.params as { "*": string })["*"] ?? "";
-      const q = req.url.indexOf("?");
-      const query = q === -1 ? "" : req.url.slice(q);
-      return reply.redirect(`${siteUrl(deps.config, id.toLowerCase())}${rest}${query}`, 302);
-    });
-    app.get("/s/:id/", async (req, reply) => {
-      const { id } = req.params as { id: string };
-      const q = req.url.indexOf("?");
-      const query = q === -1 ? "" : req.url.slice(q);
-      return reply.redirect(`${siteUrl(deps.config, id.toLowerCase())}${query}`, 302);
-    });
+      return reply.redirect(`${siteUrl(deps.config, label)}${rest}${query}`, 302);
+    };
+    app.get("/s/:id", async (req, reply) => legacyRedirect(req, reply));
+    app.get("/s/:id/", async (req, reply) => legacyRedirect(req, reply));
+    app.get("/s/:id/*", async (req, reply) =>
+      legacyRedirect(req, reply, (req.params as { "*": string })["*"] ?? ""),
+    );
 
     return app;
   }
