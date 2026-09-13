@@ -268,10 +268,9 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       "shareplan touch <id>",
       "```",
       "",
-      "## Limits (free-- tier)",
-      "- TTL: default 7d, max 30d",
-      "- Slugs: not allowed on free--",
-      "- Visibility: unlisted (public requires free tier)",
+      "## Limits and tiers",
+      "- free-- (registered / hosted): 7d default TTL, 30d max, unlisted, no vanity slugs",
+      "- ops (self-hosted operator key): no TTL maximum cap, permanent hosting (ttl: null) and slugs allowed",
       "- Files: HTML, CSS, JS, JSON, text, markdown, images, fonts (up to 50 MiB, 200 files)",
       "",
     ].join("\n");

@@ -2,34 +2,55 @@
 
 Publish small HTML sites and images. Get a shareable URL.
 
+Agents can publish to the hosted service at [hype-share.com](https://hype-share.com) or to a self-hosted shareplan instance.
+
 ## Setup
 
+### Hosted (hype-share.com)
+
+Register an agent key directly against the hosted service. No operator tokens or human credentials are required:
+
 ```bash
-# Hosted: register an agent key (no admin token needed)
 npx shareplan register --url https://hype-share.com --name claude
-
-# Local dev: register an agent key
-npx shareplan register --url http://127.0.0.1:8788 --name agent
-
-# Local operator: mint a key with the operator token
-npx shareplan create-key --url http://127.0.0.1:8788 --admin-token "$SHAREPLAN_ADMIN_TOKEN"
-npx shareplan login --url http://127.0.0.1:8788 --token sp_...
 ```
 
-Environment variables for agents (skips needing a local config file):
+This issues a `free--` tier API key, saves it to `~/.config/shareplan/config.json`, and returns a `claimUrl` a human can use in a browser to link their account.
+
+To configure an agent environment without writing a local config file:
 
 ```bash
 export SHAREPLAN_URL=https://hype-share.com
 export SHAREPLAN_TOKEN=sp_...
 ```
 
+### Self-hosted (running your own server)
+
+When using a self-hosted or private shareplan server:
+
+- **If open registration is enabled** (`SHAREPLAN_IP_HASH_PEPPER` is configured):
+  ```bash
+  npx shareplan register --url http://127.0.0.1:8788 --name agent
+  ```
+- **If using operator-issued keys** (or open registration is disabled):
+  An operator mints a key using the server's admin token:
+  ```bash
+  npx shareplan create-key --url http://127.0.0.1:8788 --admin-token "$SHAREPLAN_ADMIN_TOKEN" --name agent
+  npx shareplan login --url http://127.0.0.1:8788 --token sp_...
+  ```
+  Keys created with the admin token belong to the `ops` tier: they have no TTL maximum cap, can set `"ttl": null` for permanent hosting, can assign custom vanity slugs, and bypass IP rate limits.
+
+```bash
+export SHAREPLAN_URL=http://127.0.0.1:8788
+export SHAREPLAN_TOKEN=sp_...
+```
+
 ## CLI
 
 ```bash
-# Directory with index.html (+ assets)
+# Publish a directory with index.html (+ assets)
 shareplan publish ./out --title "Q3 plan" --ttl 7d
 
-# Update existing site (new version)
+# Update an existing site (publishes a new version)
 shareplan publish ./out --site a1b2c3
 
 # Single file — wraps a viewer page for images, or a download link for text/data
@@ -53,7 +74,7 @@ All requests that create or modify sites use `Authorization: Bearer sp_...`.
 
 ### Register an agent key
 
-Agents can self-register without credentials:
+Available on `hype-share.com` and self-hosted instances with `SHAREPLAN_IP_HASH_PEPPER` configured. No credentials required:
 
 ```http
 POST /api/v1/register
@@ -135,17 +156,22 @@ Resets `expiresAt` to the tier maximum (30 days from now for `free--`). Sites th
 | `POST` | `/api/v1/register` | Register an agent key (`free--` tier) |
 | `POST` | `/api/v1/sites` | Publish a new site |
 | `PUT` | `/api/v1/sites/:id` | Publish a new version of an existing site |
-| `POST` | `/api/v1/sites/:id/touch` | Reset TTL to the tier maximum |
+| `POST` | `/api/v1/sites/:id/touch` | Reset TTL to the tier maximum (site owner only) |
 | `GET` | `/api/v1/sites` | List sites owned by the authenticated user |
 | `GET` | `/api/v1/sites/:id` | Get site metadata |
 | `DELETE` | `/api/v1/sites/:id` | Delete a site and purge its files |
 | `GET` | `https://<id>.<suffix>/*` | Public serve (`<id>` also accepts a slug) |
 
-Always use the `url` from the response rather than building one: a server without a host suffix serves sites under `/s/:id/` on the API host instead.
+Always use the `url` from the response rather than constructing one:
+- On `hype-share.com`, sites are served at `https://<id>.hype-share.com/`.
+- On self-hosted servers with `SHAREPLAN_SITE_HOST_SUFFIX`, sites are served at `https://<id>.<suffix>/`.
+- On self-hosted servers without a host suffix, sites are served at `http://<host>:<port>/s/<id>/` on the API host.
 
-On `PUT`, omitting `ttl` preserves the current expiry. Only `paid` tier accounts may set `"ttl": null` for permanent hosting.
+On `PUT`, omitting `ttl` preserves the current expiry. Only `paid` or `ops` tier accounts may set `"ttl": null` for permanent hosting.
 
-## Tier limits (`free--`)
+## Limits and account tiers
+
+### Hosted on hype-share.com (`free--` tier)
 
 - **Allowed files**: `html`, `htm`, `css`, `js`, `mjs`, `json`, `map`, `txt`, `md`, `png`, `jpg`, `jpeg`, `gif`, `webp`, `avif`, `svg`, `ico`, `woff`, `woff2`. Uploading other extensions returns `400 file_type_not_allowed`.
 - **File structure**: Multi-file uploads require an `index.html`. Single files wrap automatically.
@@ -154,6 +180,11 @@ On `PUT`, omitting `ttl` preserves the current expiry. Only `paid` tier accounts
 - **Slugs**: Vanity slugs are not allowed on `free--` (requires `free` or higher). Returns `400 slug_not_allowed`.
 - **Visibility**: `unlisted` by default. `public` returns `400 visibility_not_allowed`. `private` sites require owner API key to access.
 - **Rate limits**: 120 publish/touch requests per hour per user and per IP hash. 10 registers per day per IP hash.
+
+### Self-hosted instances
+
+- **Operator keys (`ops` tier)**: No TTL maximum cap, permanent hosting (`"ttl": null`) allowed, vanity slugs allowed, exempt from IP rate limits.
+- **Registered keys (`free--` tier)**: Same default 7d / max 30d TTL rules as hosted, unless custom server limits are configured.
 
 ## Example prompt
 
