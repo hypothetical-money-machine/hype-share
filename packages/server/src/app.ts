@@ -16,6 +16,7 @@ import {
   HOST_LABEL_RE,
   isHostLabel,
   isHtmlPath,
+  RESERVED_HOST_LABELS,
   s3ObjectKey,
   sanitizeSitePath,
   type SiteResponse,
@@ -51,9 +52,12 @@ import { HttpError } from "./errors.js";
 import { hashIp, requestIp } from "./ip.js";
 import { consumeRate, DAY_MS, HOUR_MS } from "./rate-limit.js";
 import {
+  clampStoredExpiry,
   policyFor,
   resolveTierExpiry,
   TtlPolicyError,
+  UnknownTierError,
+  type TierPolicy,
 } from "./tiers.js";
 import { FileError, ensureIndexHtml, prepareFiles } from "./files.js";
 import {
@@ -119,7 +123,9 @@ interface Ctx extends AppDeps {
 export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   const app = Fastify({
     logger: deps.logger ?? true,
-    trustProxy: deps.config.trustForwarded,
+    // One hop: the socket peer, or the address the immediate proxy added.
+    // `true` would trust every X-Forwarded-For entry, including the client's.
+    trustProxy: deps.config.trustForwarded ? 1 : false,
     // maxSiteBytes is enforced on *decoded* bytes in prepareFiles, but binary
     // files reach us base64-encoded inside JSON — 4 characters per 3 bytes — so
     // the transport limit has to cover that inflation or it would reject
@@ -139,6 +145,11 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     if (err instanceof TtlPolicyError) {
       return reply.status(400).send({
         error: { code: err.code, message: err.message },
+      });
+    }
+    if (err instanceof UnknownTierError) {
+      return reply.status(400).send({
+        error: { code: "invalid_tier", message: err.message },
       });
     }
     if (err instanceof FileError) {
@@ -250,7 +261,8 @@ Response includes \`url\` like \`${siteUrl(deps.config, "<id>")}\`.
         "SHAREPLAN_IP_HASH_PEPPER is not set",
       );
     }
-    const ip = requestIp(req, deps.config.trustForwarded);
+    const body = createKeySchema.parse(req.body ?? {});
+    const ip = requestIp(req);
     const ipBucket = `ip:${hashIp(ip, pepper)}`;
     if (
       !consumeRate(
@@ -263,7 +275,6 @@ Response includes \`url\` like \`${siteUrl(deps.config, "<id>")}\`.
     ) {
       throw new HttpError(429, "rate_limited", "too many registrations from this address");
     }
-    const body = createKeySchema.parse(req.body ?? {});
     const claimToken = randomBytes(16).toString("base64url");
     const user = createUser(deps.db, {
       tier: "free--",
@@ -331,6 +342,7 @@ Response includes \`url\` like \`${siteUrl(deps.config, "<id>")}\`.
   app.post("/api/v1/sites", async (req, reply) => {
     const { key, user } = requireAccount(deps.db, req);
     const body = createSiteSchema.parse(req.body);
+    assertTierPublish(user, body);
     consumePublishQuota(ctx, req, user);
     const site = await publishNewSite(ctx, key, user, body);
     return reply.status(201).send(site);
@@ -340,20 +352,20 @@ Response includes \`url\` like \`${siteUrl(deps.config, "<id>")}\`.
     const { key, user } = requireAccount(deps.db, req);
     const { id } = req.params as { id: string };
     const body = updateSiteSchema.parse(req.body);
-    consumePublishQuota(ctx, req, user);
     const existing = getSite(deps.db, id);
     if (!existing || existing.owner_user_id !== user.id) {
       return reply.status(404).send({
         error: { code: "not_found", message: "site not found" },
       });
     }
+    assertTierPublish(user, body);
+    consumePublishQuota(ctx, req, user);
     const site = await publishVersion(ctx, existing, user, body);
     return reply.send(site);
   });
 
   app.post("/api/v1/sites/:id/touch", async (req, reply) => {
     const { user } = requireAccount(deps.db, req);
-    consumePublishQuota(ctx, req, user);
     const { id } = req.params as { id: string };
     const existing = getSite(deps.db, id);
     if (!existing || existing.owner_user_id !== user.id) {
@@ -361,11 +373,17 @@ Response includes \`url\` like \`${siteUrl(deps.config, "<id>")}\`.
         error: { code: "not_found", message: "site not found" },
       });
     }
-    const policy = policyFor(user.tier);
+    if (isExpired(existing)) {
+      throw new HttpError(410, "site_expired", "site expired");
+    }
+    consumePublishQuota(ctx, req, user);
+    const policy = policyForUser(user, ctx.config);
     const now = Date.now();
-    let expiresAt = existing.expires_at;
+    let expiresAt: number | null;
     if (existing.expires_at === null && policy.allowNullTtl) {
       expiresAt = null;
+    } else if (policy.maxTtl === null) {
+      expiresAt = existing.expires_at;
     } else {
       expiresAt = resolveTierExpiry(policy, policy.maxTtl, now, "explicit");
     }
@@ -427,10 +445,11 @@ Response includes \`url\` like \`${siteUrl(deps.config, "<id>")}\`.
         });
         return reply;
       }
-      if (RESERVED_LABELS.has(label)) {
+      if (RESERVED_HOST_LABELS.has(label)) {
         // Never a site (slugs cannot claim these), so send www and friends
         // to the same path on the API host rather than 404 them as missing
-        // sites. req.url always starts with "/", so the base stays in charge.
+        // sites. Fastify gives a path-form url here; Node already 400s
+        // authority-form targets.
         await reply.redirect(`${deps.config.publicBaseUrl}${req.url}`, 302);
         return reply;
       }
@@ -508,11 +527,16 @@ export function siteLabelFromHost(host: string, suffix: string): string | null {
   return isHostLabel(label) ? label : null;
 }
 
-/** Labels that must stay free so they can never be claimed as a slug. */
-const RESERVED_LABELS = new Set(["www", "api", "admin", "docs", "mail", "static", "cdn"]);
+function policyForUser(user: UserRow, config: Config): TierPolicy {
+  const policy = policyFor(user.tier);
+  if (user.tier === "ops" && config.defaultTtl) {
+    return { ...policy, defaultTtl: config.defaultTtl };
+  }
+  return policy;
+}
 
 function consumePublishQuota(ctx: Ctx, req: FastifyRequest, user: UserRow): void {
-  const policy = policyFor(user.tier);
+  const policy = policyForUser(user, ctx.config);
   if (policy.ipPublishLimit) {
     const pepper = ctx.config.ipHashPepper;
     if (!pepper) {
@@ -522,7 +546,7 @@ function consumePublishQuota(ctx: Ctx, req: FastifyRequest, user: UserRow): void
         "SHAREPLAN_IP_HASH_PEPPER is not set",
       );
     }
-    const ip = requestIp(req, ctx.config.trustForwarded);
+    const ip = requestIp(req);
     const ipBucket = `ip:${hashIp(ip, pepper)}`;
     if (!consumeRate(ctx.db, ipBucket, "publish", HOUR_MS, policy.publishPerHour)) {
       throw new HttpError(429, "rate_limited", "too many publishes from this address");
@@ -558,7 +582,7 @@ async function publishNewSite(
   body: z.infer<typeof createSiteSchema>,
 ): Promise<SiteResponse> {
   assertTierPublish(user, body);
-  const policy = policyFor(user.tier);
+  const policy = policyForUser(user, ctx.config);
   let files = prepareFiles(body.files, ctx.config);
   files = ensureIndexHtml(files);
 
@@ -611,7 +635,7 @@ async function publishVersion(
   body: z.infer<typeof updateSiteSchema>,
 ): Promise<SiteResponse> {
   assertTierPublish(user, body);
-  const policy = policyFor(user.tier);
+  const policy = policyForUser(user, ctx.config);
   let files = prepareFiles(body.files, ctx.config);
   files = ensureIndexHtml(files);
 
@@ -619,11 +643,11 @@ async function publishVersion(
   const now = Date.now();
 
   // An explicit ttl always wins (including `null` to clear it, if the tier
-  // allows). Otherwise keep whatever expiry the site already had.
-  let expires_at = existing.expires_at;
-  if (body.ttl !== undefined) {
-    expires_at = resolveTierExpiry(policy, body.ttl, now, "explicit");
-  }
+  // allows). Otherwise keep the stored expiry if this tier still allows it.
+  const expires_at =
+    body.ttl !== undefined
+      ? resolveTierExpiry(policy, body.ttl, now, "explicit")
+      : clampStoredExpiry(policy, existing.expires_at, now);
 
   // Checked up front so a taken slug fails before we upload anything, but only
   // written once the upload lands — a failed publish must not move the slug.
@@ -683,7 +707,7 @@ async function publishVersion(
  * moment a suffix was configured.
  */
 function assertSlugAvailable(ctx: Ctx, slug: string, exceptSiteId?: string): void {
-  if (RESERVED_LABELS.has(slug)) {
+  if (RESERVED_HOST_LABELS.has(slug)) {
     throw new HttpError(409, "slug_taken", `slug "${slug}" is reserved`);
   }
   const bySlug = getSiteBySlug(ctx.db, slug);
@@ -863,6 +887,11 @@ async function serveSitePath(
         "form-action 'self'",
       ].join("; "),
     );
+  } else if (ct.startsWith("image/svg") || path.toLowerCase().endsWith(".svg")) {
+    reply.header(
+      "Content-Security-Policy",
+      "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; sandbox",
+    );
   }
 
   await reply.send(obj.body);
@@ -893,7 +922,7 @@ function siteUrlShape(config: Config): string {
 function toSiteResponse(config: Config, row: SiteRow): SiteResponse {
   return {
     id: row.id,
-    url: siteUrl(config, row.id),
+    url: siteUrl(config, row.slug ?? row.id),
     versionId: row.current_version_id ?? "",
     title: row.title,
     slug: row.slug,
@@ -909,7 +938,7 @@ function toSiteResponse(config: Config, row: SiteRow): SiteResponse {
 function toListItem(config: Config, row: SiteRow): SiteListItem {
   return {
     id: row.id,
-    url: siteUrl(config, row.id),
+    url: siteUrl(config, row.slug ?? row.id),
     title: row.title,
     slug: row.slug,
     visibility: row.visibility,

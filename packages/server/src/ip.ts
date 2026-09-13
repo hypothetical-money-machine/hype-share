@@ -6,7 +6,7 @@ import type { FastifyRequest } from "fastify";
  * IPv4 as-is; IPv6 reduced to the /64 so one home network is one bucket.
  * IPv4-mapped IPv6 (`::ffff:a.b.c.d`) is treated as IPv4.
  */
-export function normalizeIp(raw: string): string {
+export function normalizeIp(raw: string): string | null {
   let ip = raw.trim().toLowerCase();
   const zone = ip.indexOf("%");
   if (zone !== -1) ip = ip.slice(0, zone);
@@ -16,31 +16,21 @@ export function normalizeIp(raw: string): string {
   }
   if (isIP(ip) === 4) return ip;
   if (isIP(ip) === 6) return `${expandIPv6(ip).slice(0, 4).join(":")}::`;
-  return ip;
+  return null;
 }
 
 export function hashIp(ip: string, pepper: string): string {
-  return createHmac("sha256", pepper).update(normalizeIp(ip), "utf8").digest("hex");
+  const normalized = normalizeIp(ip) ?? "invalid";
+  return createHmac("sha256", pepper).update(normalized, "utf8").digest("hex");
 }
 
 /**
- * Socket address by default. `CF-Connecting-IP` / `X-Forwarded-For` only when
- * `trustForwarded` is on; otherwise a client could pick its own bucket.
+ * Fastify's `req.ip`. When `trustForwarded` is on, `trustProxy` is 1 hop so
+ * this is the address the immediate proxy added, not the leftmost
+ * client-supplied `X-Forwarded-For` entry.
  */
-export function requestIp(req: FastifyRequest, trustForwarded: boolean): string {
-  if (trustForwarded) {
-    const cf = headerValue(req.headers["cf-connecting-ip"]);
-    if (cf) return cf;
-    const xff = headerValue(req.headers["x-forwarded-for"]);
-    if (xff) return xff.split(",")[0]!.trim();
-  }
+export function requestIp(req: FastifyRequest): string {
   return req.ip || "0.0.0.0";
-}
-
-function headerValue(value: string | string[] | undefined): string | null {
-  if (typeof value !== "string") return null;
-  const v = value.trim();
-  return v === "" ? null : v;
 }
 
 function expandIPv6(ip: string): string[] {

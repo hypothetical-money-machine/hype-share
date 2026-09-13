@@ -14,6 +14,11 @@ describe("normalizeIp", () => {
     expect(normalizeIp("2001:db8:1:2:3:4:5:6")).toBe("2001:db8:1:2::");
     expect(normalizeIp("2001:db8:1:2::9")).toBe("2001:db8:1:2::");
   });
+
+  it("rejects non-addresses", () => {
+    expect(normalizeIp("not-an-ip-0")).toBeNull();
+    expect(hashIp("not-an-ip-0", "pepper")).toBe(hashIp("invalid", "pepper"));
+  });
 });
 
 describe("hashIp", () => {

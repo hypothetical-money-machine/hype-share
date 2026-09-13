@@ -1,7 +1,7 @@
-import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { isHostLabel } from "@shareplan/core";
+import { hashApiKey } from "./db.js";
 
 export interface Config {
   host: string;
@@ -98,9 +98,7 @@ export function loadConfig(envSource: NodeJS.ProcessEnv = process.env): Config {
     maxSiteBytes: envInt("SHAREPLAN_MAX_SITE_BYTES", 52_428_800),
     maxFileCount: envInt("SHAREPLAN_MAX_FILE_COUNT", 200),
     defaultTtl: env("SHAREPLAN_DEFAULT_TTL") ?? null,
-    adminTokenHash: adminToken
-      ? createHash("sha256").update(adminToken, "utf8").digest("hex")
-      : null,
+    adminTokenHash: adminToken ? hashApiKey(adminToken) : null,
     ipHashPepper: env("SHAREPLAN_IP_HASH_PEPPER") ?? null,
     trustForwarded: envBool("SHAREPLAN_TRUST_FORWARDED", false),
     registerPerDay: Math.max(1, envInt("SHAREPLAN_REGISTER_PER_DAY", 10)),

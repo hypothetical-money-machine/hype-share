@@ -1,4 +1,4 @@
-import { parseTtl } from "@shareplan/core";
+import { expiresAtFromTtl } from "@shareplan/core";
 
 export type Tier = "ops" | "free--" | "free-" | "free" | "unlock" | "paid";
 
@@ -71,31 +71,44 @@ export const TIER_POLICIES: Record<Tier, TierPolicy> = {
   },
 };
 
-const YEAR_MS = 365 * 86_400_000;
-
 export function isTier(value: string): value is Tier {
   return Object.hasOwn(TIER_POLICIES, value);
 }
 
-export function policyFor(tier: Tier): TierPolicy {
-  return TIER_POLICIES[tier];
+export class UnknownTierError extends Error {
+  override readonly name = "UnknownTierError";
+  constructor(readonly tier: string) {
+    super(`unknown tier: ${tier}`);
+  }
 }
 
-/**
- * `parseTtl` has no year unit; the hosted table uses `1y` for free/unlock.
- */
-export function ttlMs(input: string | number | null | undefined): number | null {
-  if (input === "1y") return YEAR_MS;
-  return parseTtl(input);
+export function policyFor(tier: string): TierPolicy {
+  if (!isTier(tier)) throw new UnknownTierError(tier);
+  return TIER_POLICIES[tier];
 }
 
 export function expiresAtFromTierTtl(
   input: string | number | null | undefined,
   now: number,
 ): number | null {
-  const ms = ttlMs(input);
-  if (ms === null) return null;
-  return now + ms;
+  return expiresAtFromTtl(input, now);
+}
+
+/**
+ * On update with no ttl field: keep the stored expiry if this tier still
+ * allows it, otherwise clamp to max (or assign max when null is no longer
+ * allowed).
+ */
+export function clampStoredExpiry(
+  policy: TierPolicy,
+  existing: number | null,
+  now: number,
+): number | null {
+  if (existing === null) {
+    if (policy.allowNullTtl) return null;
+    return clampToMax(policy, expiresAtFromTierTtl(policy.maxTtl ?? policy.defaultTtl, now), now);
+  }
+  return clampToMax(policy, existing, now);
 }
 
 /**

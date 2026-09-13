@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createOpsKey, getSiteBySlug, insertSite, openDb, upgrade } from "./db.js";
+import { createOpsKey, getSite, getSiteBySlug, insertSite, openDb, upgrade } from "./db.js";
 
 type Db = ReturnType<typeof openDb>;
 
@@ -59,9 +59,20 @@ describe("upgrade", () => {
   it("runs once", () => {
     const db = openDb(":memory:");
     expect((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(
-      1,
+      2,
     );
     upgrade(db); // no-op, index already exists
+    db.close();
+  });
+
+  it("clears reserved slugs", () => {
+    const db = openDb(":memory:");
+    const a = createOpsKey(db, { name: "a", token: "sp_a" });
+    site(db, "s1", "www", 10, a.key.id, a.user.id);
+    db.exec("PRAGMA user_version = 1;");
+    upgrade(db);
+    expect(getSiteBySlug(db, "www")).toBeNull();
+    expect(getSite(db, "s1")?.slug).toBeNull();
     db.close();
   });
 });

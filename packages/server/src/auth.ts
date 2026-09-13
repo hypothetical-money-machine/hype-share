@@ -61,13 +61,16 @@ export function requireAdmin(
   const token = extractBearer(req);
   const header = req.headers["x-admin-token"];
   const fromHeader = typeof header === "string" ? header : null;
-  const presented = token || fromHeader;
-  if (!presented) {
+  const bearerOk = hashedTokenEquals(token, adminTokenHash);
+  const headerOk = hashedTokenEquals(fromHeader, adminTokenHash);
+  if (!bearerOk && !headerOk) {
     throw new AuthError(401, "unauthorized", "invalid admin token");
   }
-  const incoming = Buffer.from(hashApiKey(presented), "utf8");
-  const expected = Buffer.from(adminTokenHash, "utf8");
-  if (incoming.length !== expected.length || !timingSafeEqual(incoming, expected)) {
-    throw new AuthError(401, "unauthorized", "invalid admin token");
-  }
+}
+
+function hashedTokenEquals(presented: string | null, expectedHash: string): boolean {
+  const incoming = Buffer.from(hashApiKey(presented ?? ""), "utf8");
+  const expected = Buffer.from(expectedHash, "utf8");
+  if (incoming.length !== expected.length) return false;
+  return timingSafeEqual(incoming, expected);
 }

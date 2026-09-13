@@ -14,6 +14,7 @@ import {
   createUser,
   hashApiKey,
   openDb,
+  setUserTier,
 } from "./db.js";
 import { reapExpiredSites } from "./reap.js";
 import { createFakeS3, type FakeS3 } from "./testing/fake-s3.js";
@@ -492,6 +493,12 @@ describe("visibility", () => {
 });
 
 describe("slugs", () => {
+  it("puts the slug in the returned url", async () => {
+    const { app, config } = await setup();
+    const created = await publish(app, { ...helloSite(), slug: "my-plan" });
+    expect(created.json<{ url: string }>().url).toBe(`${config.publicBaseUrl}/s/my-plan/`);
+  });
+
   it("serves a site by its slug", async () => {
     const { app } = await setup();
     await publish(app, { ...helloSite("slugged"), slug: "my-plan" });
@@ -711,6 +718,19 @@ describe("admin keys", () => {
     });
     expect(res.statusCode).toBe(401);
   });
+
+  it("accepts X-Admin-Token even when Authorization is a user key", async () => {
+    const { app } = await setup();
+    const res = await inject(app, {
+      method: "GET",
+      url: "/api/v1/admin/keys",
+      headers: {
+        authorization: `Bearer ${TOKEN}`,
+        "x-admin-token": ADMIN,
+      },
+    });
+    expect(res.statusCode).toBe(200);
+  });
 });
 
 describe("request limits", () => {
@@ -854,7 +874,8 @@ describe("hostname serving", () => {
 
   it("serves by slug on the site host", async () => {
     const { app } = await setupHosted();
-    await publish(app, { ...helloSite("slugged"), slug: "my-plan" });
+    const created = await publish(app, { ...helloSite("slugged"), slug: "my-plan" });
+    expect(created.json<{ url: string }>().url).toBe(`https://my-plan.${SUFFIX}/`);
     const res = await inject(app, { method: "GET", url: "/", headers: host("my-plan") });
     expect(res.statusCode).toBe(200);
     expect(res.body).toBe("slugged");
@@ -1196,5 +1217,115 @@ describe("register and tiers", () => {
     const created = await publish(app, helloSite());
     expect(created.statusCode).toBe(201);
     expect(created.json<{ expiresAt: string | null }>().expiresAt).toBeNull();
+  });
+
+  it("honours SHAREPLAN_DEFAULT_TTL for ops keys", async () => {
+    const { app } = await setup({ defaultTtl: "1d" });
+    const created = await publish(app, helloSite());
+    const exp = Date.parse(created.json<{ expiresAt: string }>().expiresAt);
+    expect(exp).toBeGreaterThan(Date.now());
+    expect(exp).toBeLessThanOrEqual(Date.now() + 86_400_000 + 1000);
+  });
+
+  it("clamps a permanent site when the owner is downgraded", async () => {
+    const { app, db } = await setup();
+    const paid = createUser(db, { tier: "paid" });
+    createApiKeyRecord(db, { name: "paid", token: "sp_paid", userId: paid.id });
+    const site = (await publish(app, { ...helloSite(), ttl: null }, "sp_paid")).json<{
+      id: string;
+    }>();
+    setUserTier(db, paid.id, "free--");
+    const updated = await inject(app, {
+      method: "PUT",
+      url: `/api/v1/sites/${site.id}`,
+      headers: auth("sp_paid"),
+      payload: helloSite("v2"),
+    });
+    expect(updated.statusCode).toBe(200);
+    expect(updated.json<{ expiresAt: string | null }>().expiresAt).not.toBeNull();
+  });
+
+  it("does not resurrect an expired site via touch", async () => {
+    const { app, db } = await setup();
+    const token = (await register(app)).json<{ token: string }>().token;
+    const site = (await publish(app, helloSite(), token)).json<{ id: string }>();
+    db.prepare(`UPDATE sites SET expires_at = ? WHERE id = ?`).run(Date.now() - 1000, site.id);
+    const gone = await inject(app, { method: "GET", url: `/s/${site.id}/` });
+    expect(gone.statusCode).toBe(410);
+    const touched = await inject(app, {
+      method: "POST",
+      url: `/api/v1/sites/${site.id}/touch`,
+      headers: auth(token),
+    });
+    expect(touched.statusCode).toBe(410);
+  });
+
+  it("does not clear a paid site's explicit ttl on touch", async () => {
+    const { app, db } = await setup();
+    const paid = createUser(db, { tier: "paid" });
+    createApiKeyRecord(db, { name: "paid", token: "sp_paid2", userId: paid.id });
+    const site = (
+      await publish(app, { ...helloSite(), ttl: "1d" }, "sp_paid2")
+    ).json<{ id: string; expiresAt: string }>();
+    const touched = await inject(app, {
+      method: "POST",
+      url: `/api/v1/sites/${site.id}/touch`,
+      headers: auth("sp_paid2"),
+    });
+    expect(touched.statusCode).toBe(200);
+    expect(touched.json<{ expiresAt: string | null }>().expiresAt).toBe(site.expiresAt);
+  });
+
+  it("does not spend quota on a 404 or a tier rejection", async () => {
+    const { app, db } = await setup();
+    const token = (await register(app)).json<{ token: string; userId: string }>().token;
+    const missing = await inject(app, {
+      method: "PUT",
+      url: "/api/v1/sites/doesnotexist",
+      headers: auth(token),
+      payload: helloSite(),
+    });
+    expect(missing.statusCode).toBe(404);
+    const slug = await publish(app, { ...helloSite(), slug: "nope" }, token);
+    expect(slug.statusCode).toBe(400);
+    const rows = db.prepare(`SELECT count FROM rate_limits WHERE action = 'publish'`).all();
+    expect(rows).toEqual([]);
+  });
+
+  it("does not spend a register slot on a bad body", async () => {
+    const { app } = await setup({ registerPerDay: 1 });
+    const bad = await inject(app, {
+      method: "POST",
+      url: "/api/v1/register",
+      payload: { name: "" },
+    });
+    expect(bad.statusCode).toBe(400);
+    expect((await register(app)).statusCode).toBe(201);
+  });
+
+  it("puts CSP on served SVG", async () => {
+    const { app } = await setup();
+    const site = (
+      await publish(app, {
+        files: [
+          { path: "index.html", content: "<h1>x</h1>" },
+          { path: "x.svg", content: "<svg xmlns='http://www.w3.org/2000/svg'></svg>" },
+        ],
+      })
+    ).json<{ id: string }>();
+    const res = await inject(app, { method: "GET", url: `/s/${site.id}/x.svg` });
+    expect(res.statusCode).toBe(200);
+    expect(String(res.headers["content-security-policy"])).toContain("sandbox");
+  });
+
+  it("rejects an unknown tier instead of 500", async () => {
+    const { app, db, keyId } = await setup();
+    const userId = (
+      db.prepare(`SELECT user_id FROM api_keys WHERE id = ?`).get(keyId) as { user_id: string }
+    ).user_id;
+    db.prepare(`UPDATE users SET tier = 'gold' WHERE id = ?`).run(userId);
+    const res = await publish(app, helloSite());
+    expect(res.statusCode).toBe(400);
+    expect(res.json<{ error: { code: string } }>().error.code).toBe("invalid_tier");
   });
 });

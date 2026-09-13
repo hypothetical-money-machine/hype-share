@@ -12,7 +12,7 @@ export function parseTtl(input: string | number | null | undefined): number | nu
   }
 
   const s = input.trim().toLowerCase();
-  const m = /^(\d+(?:\.\d+)?)(ms|s|m|h|d)?$/.exec(s);
+  const m = /^(\d+(?:\.\d+)?)(ms|s|m|h|d|w|y)?$/.exec(s);
   if (!m) {
     throw new Error(`invalid ttl: ${input}`);
   }
@@ -30,7 +30,11 @@ export function parseTtl(input: string | number | null | undefined): number | nu
           ? 60_000
           : unit === "h"
             ? 3_600_000
-            : 86_400_000;
+            : unit === "d"
+              ? 86_400_000
+              : unit === "w"
+                ? 7 * 86_400_000
+                : 365 * 86_400_000;
   return Math.floor(n * mult);
 }
 

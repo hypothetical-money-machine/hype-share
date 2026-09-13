@@ -1,6 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import type { Visibility } from "@shareplan/core";
+import { RESERVED_HOST_LABELS, type Visibility } from "@shareplan/core";
 import type { Tier } from "./tiers.js";
 
 export interface UserRow {
@@ -95,6 +95,23 @@ export function resolveCaseFoldedSlugs(db: DatabaseSync): { id: string; slug: st
   return losers;
 }
 
+function clearReservedSlugs(db: DatabaseSync): void {
+  const clear = db.prepare(`UPDATE sites SET slug = NULL WHERE slug = ? COLLATE NOCASE`);
+  for (const label of RESERVED_HOST_LABELS) clear.run(label);
+}
+
+export function pruneRateLimits(db: DatabaseSync, now = Date.now()): number {
+  const hourStart = Math.floor(now / 3_600_000) * 3_600_000;
+  const dayStart = Math.floor(now / 86_400_000) * 86_400_000;
+  const pub = db
+    .prepare(`DELETE FROM rate_limits WHERE action = 'publish' AND window_start < ?`)
+    .run(hourStart);
+  const reg = db
+    .prepare(`DELETE FROM rate_limits WHERE action = 'register' AND window_start < ?`)
+    .run(dayStart);
+  return Number(pub.changes ?? 0) + Number(reg.changes ?? 0);
+}
+
 function migrate(db: DatabaseSync): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS api_keys (
@@ -139,7 +156,7 @@ function migrate(db: DatabaseSync): void {
  * user_version records the last step applied, so each runs once.
  */
 export function upgrade(db: DatabaseSync): void {
-  const version = (db.prepare("PRAGMA user_version").get() as { user_version: number })
+  let version = (db.prepare("PRAGMA user_version").get() as { user_version: number })
     .user_version;
   if (version < 1) {
     // Slugs are hostname labels now, so they are unique case-insensitively.
@@ -156,6 +173,11 @@ export function upgrade(db: DatabaseSync): void {
       CREATE UNIQUE INDEX IF NOT EXISTS idx_sites_slug_nocase ON sites(slug COLLATE NOCASE);
       PRAGMA user_version = 1;
     `);
+    version = 1;
+  }
+  if (version < 2) {
+    clearReservedSlugs(db);
+    db.exec("PRAGMA user_version = 2;");
   }
 
   addColumn(db, "site_versions", "pruned_at", "INTEGER");
