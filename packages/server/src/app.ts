@@ -219,37 +219,61 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 
   app.get("/docs/agents", async (_req, reply) => {
     reply.type("text/markdown; charset=utf-8");
-    return `# shareplan for agents
-
-## Auth
-\`Authorization: Bearer sp_...\`
-
-## Publish a site
-\`\`\`http
-POST /api/v1/sites
-Content-Type: application/json
-
-{
-  "title": "My plan",
-  "ttl": "14d",
-  "files": [
-    { "path": "index.html", "content": "<!doctype html>..." }
-  ]
-}
-\`\`\`
-
-Response includes \`url\` like \`${siteUrl(deps.config, "<id>")}\`.
-
-## Update
-\`PUT /api/v1/sites/:id\` with the same body shape (new version).
-
-## List / delete
-- \`GET /api/v1/sites\`
-- \`DELETE /api/v1/sites/:id\`
-
-## CLI
-\`shareplan publish ./site --title "..." --ttl 7d\`
-`;
+    return [
+      "# shareplan for agents",
+      "",
+      "## Register",
+      "```http",
+      "POST /api/v1/register",
+      "Content-Type: application/json",
+      "",
+      JSON.stringify({ name: "claude" }, null, 2),
+      "```",
+      "",
+      "Returns `token` (`sp_...`), `claimUrl`, and account metadata. Rate-limited to 10/day per IP hash.",
+      "",
+      "## Auth",
+      "`Authorization: Bearer sp_...`",
+      "",
+      "## Publish a site",
+      "```http",
+      "POST /api/v1/sites",
+      "Content-Type: application/json",
+      "",
+      JSON.stringify({
+        title: "My plan",
+        ttl: "14d",
+        visibility: "unlisted",
+        files: [{ path: "index.html", content: "<!doctype html>..." }],
+      }, null, 2),
+      "```",
+      "",
+      "Binary files use `contentBase64`. Response includes `url` like `" + siteUrl(deps.config, "<id>") + "`.",
+      "",
+      "## Update",
+      "`PUT /api/v1/sites/:id` with the same body shape (new version).",
+      "",
+      "## Keep-alive (touch)",
+      "`POST /api/v1/sites/:id/touch` resets TTL to the tier maximum (30d on free--).",
+      "",
+      "## List / delete",
+      "- `GET /api/v1/sites`",
+      "- `GET /api/v1/sites/:id`",
+      "- `DELETE /api/v1/sites/:id`",
+      "",
+      "## CLI",
+      "```bash",
+      "shareplan register --url <url> --name <name>",
+      "shareplan publish ./site --title \"plan\" --ttl 7d",
+      "shareplan touch <id>",
+      "```",
+      "",
+      "## Limits and tiers",
+      "- free-- (registered / hosted): 7d default TTL, 30d max, unlisted, no vanity slugs",
+      "- ops (self-hosted operator key): no TTL maximum cap, permanent hosting (ttl: null) and slugs allowed",
+      "- Files: HTML, CSS, JS, JSON, text, markdown, images, fonts (up to 50 MiB, 200 files)",
+      "",
+    ].join("\n");
   });
 
   app.post("/api/v1/register", async (req, reply) => {

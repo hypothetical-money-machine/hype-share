@@ -911,6 +911,15 @@ describe("hostname serving", () => {
     expect(deeper.statusCode, "multi-label hosts are not site hosts").toBe(200);
   });
 
+  it("serves agent documentation on the api host", async () => {
+    const { app } = await setup();
+    const res = await inject(app, { method: "GET", url: "/docs/agents" });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["content-type"]).toContain("text/markdown");
+    expect(res.body).toContain("POST /api/v1/register");
+    expect(res.body).toContain("POST /api/v1/sites/:id/touch");
+  });
+
   it("redirects old /s/ links to the site host", async () => {
     const { app, site } = await setupHosted();
     const cases: [string, string][] = [
