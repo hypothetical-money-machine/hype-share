@@ -4,13 +4,16 @@ This is the implementation guide for public accounts on [hype-share.com](https:/
 
 Publish stays `Authorization: Bearer sp_...` on every tier. WorkOS AuthKit is the human login on the apex host only. It is not on register and not on the publish API. Do not copy Hype Comms `docs/workos-authkit.md`: that contract is invite-only desktop PKCE, one workspace, and session revocation. This service is the opposite.
 
-## Current code
+## Implementation status
 
-A site is owned by an API key. `packages/server/src/db.ts` has `api_keys` and `sites.owner_key_id`. `requireApiKey` in `packages/server/src/auth.ts` looks up a SHA-256 hash. `requireAdmin` compares `SHAREPLAN_ADMIN_TOKEN` in the clear. Admin routes in `packages/server/src/app.ts` mint, list, and revoke keys. There are no users, no tiers, no rate limits, and no `touch`. `packages/core/src/mime.ts` maps video, audio, pdf, zip, and wasm; `prepareFiles` in `packages/server/src/files.ts` will store any of those. `resolveTtl` uses `SHAREPLAN_DEFAULT_TTL`, which is empty, so a publish with no `ttl` never expires.
+- [x] **Slice 1 (Schema)**: `users` table, `api_keys.user_id`, `sites.owner_user_id`, migration and backfill.
+- [x] **Slice 2 (Agent registration and limits)**: `POST /api/v1/register`, IP HMAC rate limits, per-tier default and max TTL on create/update.
+- [x] **Slice 3 (Keep-alive)**: `POST /api/v1/sites/:id/touch` resets TTL to tier maximum.
+- [x] **Slice 4 (Upload allowlist)**: HTML and page assets allowlist (`ALLOWED_UPLOAD_EXTS`); video, audio, pdf, zip, and wasm rejected.
+- [ ] **Slice 5 (AuthKit on the apex)**: email code → `free-`, GitHub/Google → `free`, claim URL upgrades a `free--` user in place.
+- [ ] **Slice 6 (Billing)**: Stripe (or Sponsors) webhooks for `unlock` and `paid`.
 
-The CLI (`packages/cli`) logs in with a token you already have. `docs/AGENTS.md` tells agents to call `create-key --admin-token`. Hosted DNS is already described in `.env.zima.example`: API at `https://hype-share.com`, sites at `<id>.hype-share.com`.
-
-## Target
+## Architecture
 
 A user row owns sites. API keys are credentials for that user. `sites.owner_user_id` replaces `owner_key_id` as the ownership check. Listing, updating, deleting, and private GET all key off the user, so rotating a token does not orphan sites.
 
@@ -25,19 +28,6 @@ Five tiers: `free--` (agent register), `free-` (email code), `free` (GitHub or G
 | `paid` | paid | none | none | 3 600/h | 50 MiB |
 
 Vanity slugs stay off `free--`. Unlisted is the default. Public listing starts at `free`. Bytes stay 50 MiB for everyone (`SHAREPLAN_MAX_SITE_BYTES`). Version retention stays 2 unless `paid` later buys more.
-
-## Work order
-
-Ship in this order so each slice is usable without the next.
-
-1. Schema: `users`, `api_keys.user_id`, `sites.owner_user_id`, backfill, dual-read until writes go through the user.
-2. `POST /api/v1/register`, IP HMAC rate limits, per-tier default and max TTL on create/update.
-3. `POST /api/v1/sites/:id/touch`.
-4. File allowlist (HTML and page assets only).
-5. AuthKit on the apex: email code → `free-`, GitHub/Google → `free`, claim URL upgrades a `free--` user in place.
-6. Stripe (or Sponsors) webhooks for `unlock` and `paid`.
-
-Do not start WorkOS or billing before register works. Do not put Turnstile on `POST /register`; agents have no browser. Human signup pages in slice 5 can use it.
 
 ## Schema
 

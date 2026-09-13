@@ -1,33 +1,29 @@
 # shareplan — agent guide
 
-Publish small HTML sites, images, and videos. Get a shareable URL.
+Publish small HTML sites and images. Get a shareable URL.
 
 ## Setup
 
 ```bash
-# Server (dev): MinIO + API
-docker compose up -d
-cp .env.example .env   # adjust if needed
-npm install && npm run build
-export $(grep -v '^#' .env | xargs)   # or use your shell's env loader
-npm start
-
-# Hosted: register an agent key (no admin token)
+# Hosted: register an agent key (no admin token needed)
 npx shareplan register --url https://hype-share.com --name claude
 
-# Local: mint a key with the operator token
+# Local dev: register an agent key
+npx shareplan register --url http://127.0.0.1:8788 --name agent
+
+# Local operator: mint a key with the operator token
 npx shareplan create-key --url http://127.0.0.1:8788 --admin-token "$SHAREPLAN_ADMIN_TOKEN"
 npx shareplan login --url http://127.0.0.1:8788 --token sp_...
 ```
 
-Env for agents (no login file needed):
+Environment variables for agents (skips needing a local config file):
 
 ```bash
-export SHAREPLAN_URL=http://127.0.0.1:8788
+export SHAREPLAN_URL=https://hype-share.com
 export SHAREPLAN_TOKEN=sp_...
 ```
 
-## Publish
+## CLI
 
 ```bash
 # Directory with index.html (+ assets)
@@ -36,20 +32,60 @@ shareplan publish ./out --title "Q3 plan" --ttl 7d
 # Update existing site (new version)
 shareplan publish ./out --site a1b2c3
 
-# Single file (image/html/video) — auto-wraps a viewer page when needed
+# Single file — wraps a viewer page for images, or a download link for text/data
 shareplan publish ./chart.png --title "chart"
+
+# Keep-alive — resets site TTL to the tier maximum (30d on free--)
+shareplan touch a1b2c3
+
+# Inspection and cleanup
+shareplan whoami
+shareplan ls
+shareplan info a1b2c3
+shareplan rm a1b2c3
 ```
 
-Stdout is only the public URL; metadata goes to stderr.
+Stdout prints only the public URL; metadata goes to stderr.
 
 ## HTTP API
 
-`Authorization: Bearer sp_...`
+All requests that create or modify sites use `Authorization: Bearer sp_...`.
 
-### Create
+### Register an agent key
+
+Agents can self-register without credentials:
+
+```http
+POST /api/v1/register
+Content-Type: application/json
+
+{
+  "name": "claude"
+}
+```
+
+Response (`201`):
+
+```json
+{
+  "userId": "usr_k89x2",
+  "keyId": "key_p42m1",
+  "name": "claude",
+  "token": "sp_9f2m...",
+  "tier": "free--",
+  "claimUrl": "https://hype-share.com/claim/c_...",
+  "createdAt": "2026-09-13T22:00:00.000Z"
+}
+```
+
+Registration is rate limited to 10 successful requests per day per hashed IP address.
+Save the returned `token`; the server stores only a SHA-256 hash.
+
+### Create a site
 
 ```http
 POST /api/v1/sites
+Authorization: Bearer sp_...
 Content-Type: application/json
 
 {
@@ -65,39 +101,59 @@ Content-Type: application/json
 
 Binary files use `contentBase64` instead of `content`.
 
-### Response
+Response (`201`):
 
 ```json
 {
   "id": "a1b2c3d4e5",
-  "url": "https://a1b2c3d4e5.share.example.com/",
-  "versionId": "...",
-  "expiresAt": null,
-  "byteSize": 123,
+  "url": "https://a1b2c3d4e5.hype-share.com/",
+  "versionId": "ver_r8x2",
+  "title": "My plan",
+  "slug": null,
+  "visibility": "unlisted",
+  "createdAt": "2026-09-13T22:00:00.000Z",
+  "updatedAt": "2026-09-13T22:00:00.000Z",
+  "expiresAt": "2026-09-27T22:00:00.000Z",
+  "byteSize": 67,
   "fileCount": 2
 }
 ```
 
-### Other
+### Keep a site alive (touch)
+
+```http
+POST /api/v1/sites/a1b2c3d4e5/touch
+Authorization: Bearer sp_...
+```
+
+Resets `expiresAt` to the tier maximum (30 days from now for `free--`). Sites that are already expired return `410 gone` and cannot be revived.
+
+### Endpoints
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| `PUT` | `/api/v1/sites/:id` | New version |
-| `GET` | `/api/v1/sites` | List yours |
-| `GET` | `/api/v1/sites/:id` | Metadata |
-| `DELETE` | `/api/v1/sites/:id` | Delete |
+| `POST` | `/api/v1/register` | Register an agent key (`free--` tier) |
+| `POST` | `/api/v1/sites` | Publish a new site |
+| `PUT` | `/api/v1/sites/:id` | Publish a new version of an existing site |
+| `POST` | `/api/v1/sites/:id/touch` | Reset TTL to the tier maximum |
+| `GET` | `/api/v1/sites` | List sites owned by the authenticated user |
+| `GET` | `/api/v1/sites/:id` | Get site metadata |
+| `DELETE` | `/api/v1/sites/:id` | Delete a site and purge its files |
 | `GET` | `https://<id>.<suffix>/*` | Public serve (`<id>` also accepts a slug) |
 
-Optional `slug` on create gives a readable URL (`https://my-plan.<suffix>/`);
-it must be a valid hostname label (lowercase letters, digits, inner hyphens, at
-most 63 chars), must not be a reserved label like `www`, and must not
-already be taken or look like an existing site id, otherwise you get a `409`.
+Always use the `url` from the response rather than building one: a server without a host suffix serves sites under `/s/:id/` on the API host instead.
 
-Always use the `url` from the response rather than building one: a server
-without a host suffix serves sites under `/s/:id/` on the API host instead.
+On `PUT`, omitting `ttl` preserves the current expiry. Only `paid` tier accounts may set `"ttl": null` for permanent hosting.
 
-On `PUT`, omitting `ttl` keeps the current expiry — send `"ttl": null` to make
-a site permanent, or a new value to reset the clock.
+## Tier limits (`free--`)
+
+- **Allowed files**: `html`, `htm`, `css`, `js`, `mjs`, `json`, `map`, `txt`, `md`, `png`, `jpg`, `jpeg`, `gif`, `webp`, `avif`, `svg`, `ico`, `woff`, `woff2`. Uploading other extensions returns `400 file_type_not_allowed`.
+- **File structure**: Multi-file uploads require an `index.html`. Single files wrap automatically.
+- **Site size**: 50 MiB total byte size, maximum 200 files.
+- **TTL**: Default 7d, maximum 30d. Setting `ttl: null` returns `400 ttl_not_allowed`.
+- **Slugs**: Vanity slugs are not allowed on `free--` (requires `free` or higher). Returns `400 slug_not_allowed`.
+- **Visibility**: `unlisted` by default. `public` returns `400 visibility_not_allowed`. `private` sites require owner API key to access.
+- **Rate limits**: 120 publish/touch requests per hour per user and per IP hash. 10 registers per day per IP hash.
 
 ## Example prompt
 
@@ -105,6 +161,6 @@ a site permanent, or a new value to reset the clock.
 
 Suggested agent steps:
 
-1. Write `index.html` (and optional assets) to a temp dir.
-2. `shareplan publish /tmp/plan-site --title "..." --ttl 14d`
+1. Write `index.html` (and optional assets) to a directory.
+2. `shareplan publish ./plan-site --title "Migration plan" --ttl 14d`
 3. Return the URL from stdout to the human.
