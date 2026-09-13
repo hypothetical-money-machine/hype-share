@@ -31,10 +31,12 @@ export function consumeRate(
        ON CONFLICT(bucket, action, window_start)
        DO UPDATE SET count = count + 1`,
     ).run(bucket, action, windowStart);
-    db.exec("COMMIT");
+    // Same transaction as the increment: a failed cleanup must not leave the
+    // slot spent while the caller sees a 500 and retries.
     db.prepare(
       `DELETE FROM rate_limits WHERE action = ? AND window_start < ?`,
     ).run(action, windowStart);
+    db.exec("COMMIT");
     return true;
   } catch (err) {
     try {
