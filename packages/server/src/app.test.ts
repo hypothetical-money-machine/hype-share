@@ -4,6 +4,7 @@ import type {
   InjectOptions,
   LightMyRequestResponse,
 } from "fastify";
+import net from "node:net";
 import type { DatabaseSync } from "node:sqlite";
 import { buildApp } from "./app.js";
 import type { Config } from "./config.js";
@@ -208,6 +209,22 @@ describe("publish and serve", () => {
     });
     expect(res.statusCode).toBe(200);
     expect(res.body).toBe("docs");
+  });
+
+  it("does not loop on an encoded id in path mode", async () => {
+    const { app } = await setup();
+    for (const url of ["/s/a%20b/", "/s/a%2Fb/", "/s/a%23b/index.html"]) {
+      const res = await inject(app, { method: "GET", url });
+      expect(res.statusCode, url).toBe(404);
+      expect(res.headers.location, url).toBeUndefined();
+    }
+  });
+
+  it("keeps the query on the bare /s/:id redirect in path mode", async () => {
+    const { app } = await setup();
+    const res = await inject(app, { method: "GET", url: "/s/abc?q=1" });
+    expect(res.statusCode).toBe(302);
+    expect(res.headers.location).toBe("/s/abc/?q=1");
   });
 
   it("redirects a directory hit to its trailing-slash URL", async () => {
@@ -885,7 +902,7 @@ describe("hostname serving", () => {
     for (const label of ["www", "api", "admin"]) {
       const res = await inject(app, { method: "GET", url: "/", headers: host(label) });
       expect(res.statusCode, label).toBe(302);
-      expect(res.headers.location, label).toBe("https://api.test");
+      expect(res.headers.location, label).toBe("https://api.test/");
     }
   });
 
@@ -949,6 +966,76 @@ describe("hostname serving", () => {
         expect(res.headers.location, url).toBeUndefined();
       }
     }
+  });
+
+  it("serves percent-encoded file names on the site host", async () => {
+    const h = await setup({ siteHostSuffix: SUFFIX, publicBaseUrl: "https://api.test" });
+    const res = await publish(h.app, {
+      title: "encoded",
+      files: [
+        { path: "index.html", content: "root" },
+        { path: "my file.txt", content: "spaced" },
+        { path: "日.html", content: "<p>sun</p>" },
+      ],
+    });
+    expect(res.statusCode, res.body).toBe(201);
+    const { id } = res.json<{ id: string }>();
+    const spaced = await inject(h.app, { method: "GET", url: "/my%20file.txt", headers: host(id) });
+    expect(spaced.statusCode).toBe(200);
+    expect(spaced.body).toBe("spaced");
+    const sun = await inject(h.app, { method: "GET", url: "/%E6%97%A5.html", headers: host(id) });
+    expect(sun.statusCode).toBe(200);
+    const broken = await inject(h.app, { method: "GET", url: "/%E6%97", headers: host(id) });
+    expect(broken.statusCode).toBe(400);
+  });
+
+  it("re-encodes the path in a legacy redirect instead of pasting it decoded", async () => {
+    const { app, site } = await setupHosted();
+    const cases: [string, string][] = [
+      [`/s/${site.id}/my%20file.txt`, `https://${site.id}.${SUFFIX}/my%20file.txt`],
+      [`/s/${site.id}/%E6%97%A5.html`, `https://${site.id}.${SUFFIX}/%E6%97%A5.html`],
+      [`/s/${site.id}/a%23b`, `https://${site.id}.${SUFFIX}/a%23b`],
+      [`/s/${site.id}/docs/%3Fx`, `https://${site.id}.${SUFFIX}/docs/%3Fx`],
+    ];
+    for (const [url, location] of cases) {
+      const res = await inject(app, { method: "GET", url });
+      expect(res.statusCode, url).toBe(302);
+      expect(res.headers.location, url).toBe(location);
+    }
+  });
+
+  it("keeps the path and query when bouncing a reserved label to the api host", async () => {
+    const { app } = await setupHosted();
+    const res = await inject(app, { method: "GET", url: "/docs/agents?x=1", headers: host("www") });
+    expect(res.statusCode).toBe(302);
+    expect(res.headers.location).toBe("https://api.test/docs/agents?x=1");
+  });
+
+  it("never turns a directory redirect into a scheme-relative location", async () => {
+    const h = await setup({ siteHostSuffix: SUFFIX, publicBaseUrl: "https://api.test" });
+    const res = await publish(h.app, {
+      title: "trap",
+      files: [
+        { path: "index.html", content: "root" },
+        { path: "evil.example/index.html", content: "x" },
+      ],
+    });
+    expect(res.statusCode, res.body).toBe(201);
+    const { id } = res.json<{ id: string }>();
+    // inject() would parse "//evil.example" as a host, so go over a socket.
+    const address = await h.app.listen({ host: "127.0.0.1", port: 0 });
+    const port = Number(new URL(address).port);
+    const raw = await new Promise<string>((resolve, reject) => {
+      const sock = net.connect(port, "127.0.0.1", () => {
+        sock.write(`GET //evil.example HTTP/1.1\r\nHost: ${id}.${SUFFIX}\r\nConnection: close\r\n\r\n`);
+      });
+      let buf = "";
+      sock.on("data", (d) => (buf += d.toString()));
+      sock.on("end", () => resolve(buf));
+      sock.on("error", reject);
+    });
+    expect(raw).toMatch(/^HTTP\/1.1 302/);
+    expect(raw).toMatch(/^location: \/evil\.example\/\r$/im);
   });
 
   it("keeps the query on a bare /s/:id redirect", async () => {
