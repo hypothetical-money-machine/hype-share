@@ -18,4 +18,9 @@ describe("parseTtl", () => {
     expect(parseTtl(undefined)).toBeNull();
     expect(parseTtl("")).toBeNull();
   });
+
+  it("rejects values that cannot become a Date", () => {
+    expect(() => parseTtl(1e20)).toThrow(/ttl/);
+    expect(() => parseTtl("1e20")).toThrow(/invalid ttl/);
+  });
 });

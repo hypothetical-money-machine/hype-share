@@ -32,6 +32,9 @@ export function consumeRate(
        DO UPDATE SET count = count + 1`,
     ).run(bucket, action, windowStart);
     db.exec("COMMIT");
+    db.prepare(
+      `DELETE FROM rate_limits WHERE action = ? AND window_start < ?`,
+    ).run(action, windowStart);
     return true;
   } catch (err) {
     try {

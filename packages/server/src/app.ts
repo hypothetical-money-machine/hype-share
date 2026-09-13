@@ -388,6 +388,7 @@ Response includes \`url\` like \`${siteUrl(deps.config, "<id>")}\`.
       expiresAt = resolveTierExpiry(policy, policy.maxTtl, now, "explicit");
     }
     updateSiteExpiry(deps.db, id, expiresAt, now);
+    applyStoredTierLimits(deps.db, existing, policy);
     const row = getSite(deps.db, id)!;
     return reply.send(toSiteResponse(deps.config, row));
   });
@@ -575,6 +576,20 @@ function assertTierPublish(
   }
 }
 
+/** Drop stored slug/public that the current tier is not allowed to keep. */
+function applyStoredTierLimits(
+  db: Ctx["db"],
+  existing: SiteRow,
+  policy: TierPolicy,
+): void {
+  if (!policy.slugs && existing.slug !== null) {
+    updateSiteSlug(db, existing.id, null);
+  }
+  if (!policy.publicVisibility && existing.visibility === "public") {
+    db.prepare(`UPDATE sites SET visibility = 'unlisted' WHERE id = ?`).run(existing.id);
+  }
+}
+
 async function publishNewSite(
   ctx: Ctx,
   key: ApiKeyRow,
@@ -656,10 +671,14 @@ async function publishVersion(
   if (newSlug !== null) {
     assertSlugAvailable(ctx, newSlug, existing.id);
   }
+  const dropSlug = !policy.slugs && existing.slug !== null;
 
   const byte_size = files.reduce((n, f) => n + f.body.byteLength, 0);
   const file_count = files.length;
-  const visibility = body.visibility ?? existing.visibility;
+  let visibility = body.visibility ?? existing.visibility;
+  if (visibility === "public" && !policy.publicVisibility) {
+    visibility = "unlisted";
+  }
 
   await putSiteFiles(ctx.s3, ctx.config.s3.bucket, existing.id, versionId, files);
 
@@ -675,6 +694,8 @@ async function publishVersion(
       throw err;
     }
     updateSiteSlug(ctx.db, existing.id, newSlug);
+  } else if (dropSlug) {
+    updateSiteSlug(ctx.db, existing.id, null);
   }
   updateSiteVersion(ctx.db, existing.id, {
     current_version_id: versionId,

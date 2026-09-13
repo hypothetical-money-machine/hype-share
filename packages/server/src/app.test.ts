@@ -1318,6 +1318,41 @@ describe("register and tiers", () => {
     expect(String(res.headers["content-security-policy"])).toContain("sandbox");
   });
 
+  it("clears slug and public visibility after a downgrade republish", async () => {
+    const { app, db } = await setup();
+    const paid = createUser(db, { tier: "paid" });
+    createApiKeyRecord(db, { name: "paid", token: "sp_paid3", userId: paid.id });
+    const site = (
+      await publish(
+        app,
+        { ...helloSite(), slug: "kept", visibility: "public" },
+        "sp_paid3",
+      )
+    ).json<{ id: string; slug: string; visibility: string }>();
+    expect(site.slug).toBe("kept");
+    expect(site.visibility).toBe("public");
+    setUserTier(db, paid.id, "free--");
+    const updated = await inject(app, {
+      method: "PUT",
+      url: `/api/v1/sites/${site.id}`,
+      headers: auth("sp_paid3"),
+      payload: helloSite("v2"),
+    });
+    expect(updated.statusCode).toBe(200);
+    const body = updated.json<{ slug: string | null; visibility: string }>();
+    expect(body.slug).toBeNull();
+    expect(body.visibility).toBe("unlisted");
+  });
+
+  it("rejects a ttl that cannot be serialized as a Date", async () => {
+    const { app, db } = await setup();
+    const paid = createUser(db, { tier: "paid" });
+    createApiKeyRecord(db, { name: "paid", token: "sp_paid4", userId: paid.id });
+    const res = await publish(app, { ...helloSite(), ttl: 1e20 }, "sp_paid4");
+    expect(res.statusCode).toBe(400);
+    expect(res.json<{ error: { code: string } }>().error.code).toBe("invalid_ttl");
+  });
+
   it("rejects an unknown tier instead of 500", async () => {
     const { app, db, keyId } = await setup();
     const userId = (
