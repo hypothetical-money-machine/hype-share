@@ -3,8 +3,8 @@ import { normalizeSiteHostSuffix } from "./config.js";
 
 describe("normalizeSiteHostSuffix", () => {
   it("accepts a bare domain and tidies it", () => {
-    expect(normalizeSiteHostSuffix("hype-share.com")).toBe("hype-share.com");
-    expect(normalizeSiteHostSuffix(" .Hype-Share.COM. ")).toBe("hype-share.com");
+    expect(normalizeSiteHostSuffix("share.example.com")).toBe("share.example.com");
+    expect(normalizeSiteHostSuffix(" .Share.Example.COM. ")).toBe("share.example.com");
   });
 
   it("treats unset and blank as disabled", () => {
@@ -15,8 +15,8 @@ describe("normalizeSiteHostSuffix", () => {
 
   it("rejects schemes, wildcards, single labels, and bad dns labels", () => {
     const bad = [
-      "https://hype-share.com",
-      "*.hype-share.com",
+      "https://share.example.com",
+      "*.share.example.com",
       "localhost",
       "a b.com",
       "sites.example.org/",

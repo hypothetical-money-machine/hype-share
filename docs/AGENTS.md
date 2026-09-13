@@ -67,7 +67,7 @@ Binary files use `contentBase64` instead of `content`.
 ```json
 {
   "id": "a1b2c3d4e5",
-  "url": "https://a1b2c3d4e5.hype-share.com/",
+  "url": "https://a1b2c3d4e5.share.example.com/",
   "versionId": "...",
   "expiresAt": null,
   "byteSize": 123,

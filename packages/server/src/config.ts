@@ -97,7 +97,7 @@ export function loadConfig(envSource: NodeJS.ProcessEnv = process.env): Config {
 }
 
 /**
- * A hostname suffix is a bare domain like `hype-share.com`: lowercase, no
+ * A hostname suffix is a bare domain like `share.example.com`: lowercase, no
  * scheme, no leading or trailing dot. Anything else is a misconfiguration
  * worth failing on at startup rather than serving 404s.
  */
