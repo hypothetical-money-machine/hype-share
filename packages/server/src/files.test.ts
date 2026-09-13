@@ -20,6 +20,46 @@ describe("prepareFiles", () => {
       }),
     ).toThrow(FileError);
   });
+
+  it("accepts html and page assets", () => {
+    const files = prepareFiles(
+      [
+        { path: "index.html", content: "<h1>hi</h1>" },
+        { path: "assets/style.css", content: "body{}" },
+        { path: "app.js", content: "console.log(1)" },
+        { path: "data.json", content: "{}" },
+        { path: "notes.md", content: "# hi" },
+        { path: "photo.png", contentBase64: Buffer.from([1, 2, 3]).toString("base64") },
+      ],
+      { maxSiteBytes: 10000, maxFileCount: 10 },
+    );
+    expect(files.map((f) => f.path)).toEqual([
+      "index.html",
+      "assets/style.css",
+      "app.js",
+      "data.json",
+      "notes.md",
+      "photo.png",
+    ]);
+  });
+
+  it("rejects mp4, zip, and files with no extension", () => {
+    const limits = { maxSiteBytes: 10000, maxFileCount: 10 };
+    const reject = (path: string): FileError => {
+      try {
+        prepareFiles([{ path, content: "x" }], limits);
+      } catch (e) {
+        if (e instanceof FileError) return e;
+        throw e;
+      }
+      throw new Error(`expected a FileError for ${path}`);
+    };
+    for (const path of ["clip.mp4", "site.zip", "blob"]) {
+      const err = reject(path);
+      expect(err.code).toBe("file_type_not_allowed");
+      expect(err.message).toContain(path);
+    }
+  });
 });
 
 describe("prepareFiles base64", () => {

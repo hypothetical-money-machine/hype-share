@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { isHostLabel } from "@shareplan/core";
@@ -26,7 +27,13 @@ export interface Config {
   maxSiteBytes: number;
   maxFileCount: number;
   defaultTtl: string | null;
-  adminToken: string | null;
+  /** SHA-256 hex of SHAREPLAN_ADMIN_TOKEN; null if unset. */
+  adminTokenHash: string | null;
+  /** HMAC pepper for client IP buckets. Null disables register / free-- IP limits. */
+  ipHashPepper: string | null;
+  /** Trust CF-Connecting-IP / X-Forwarded-For. Off unless behind a known proxy. */
+  trustForwarded: boolean;
+  registerPerDay: number;
   /** How many versions of a site keep their objects in S3. */
   versionRetention: number;
   /** How often to sweep expired sites, in ms. 0 disables the sweeper. */
@@ -65,6 +72,7 @@ export function loadConfig(envSource: NodeJS.ProcessEnv = process.env): Config {
   );
 
   const siteHostSuffix = normalizeSiteHostSuffix(env("SHAREPLAN_SITE_HOST_SUFFIX"));
+  const adminToken = env("SHAREPLAN_ADMIN_TOKEN") ?? null;
 
   const accessKeyId = env("SHAREPLAN_S3_ACCESS_KEY", env("AWS_ACCESS_KEY_ID", "minioadmin"))!;
   const secretAccessKey = env(
@@ -90,7 +98,12 @@ export function loadConfig(envSource: NodeJS.ProcessEnv = process.env): Config {
     maxSiteBytes: envInt("SHAREPLAN_MAX_SITE_BYTES", 52_428_800),
     maxFileCount: envInt("SHAREPLAN_MAX_FILE_COUNT", 200),
     defaultTtl: env("SHAREPLAN_DEFAULT_TTL") ?? null,
-    adminToken: env("SHAREPLAN_ADMIN_TOKEN") ?? null,
+    adminTokenHash: adminToken
+      ? createHash("sha256").update(adminToken, "utf8").digest("hex")
+      : null,
+    ipHashPepper: env("SHAREPLAN_IP_HASH_PEPPER") ?? null,
+    trustForwarded: envBool("SHAREPLAN_TRUST_FORWARDED", false),
+    registerPerDay: Math.max(1, envInt("SHAREPLAN_REGISTER_PER_DAY", 10)),
     versionRetention: Math.max(1, envInt("SHAREPLAN_VERSION_RETENTION", 2)),
     reapIntervalMs: Math.max(0, envInt("SHAREPLAN_REAP_INTERVAL_SEC", 300)) * 1000,
   };

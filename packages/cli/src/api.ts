@@ -77,6 +77,32 @@ export function deleteSite(cfg: CliConfig, id: string): Promise<void> {
   return request(cfg, "DELETE", `/api/v1/sites/${encodeURIComponent(id)}`);
 }
 
+export interface RegisterResponse {
+  userId: string;
+  keyId: string;
+  name: string;
+  token: string;
+  tier: string;
+  claimUrl: string;
+  createdAt: string;
+}
+
+export function registerAccount(
+  baseUrl: string,
+  name = "default",
+): Promise<RegisterResponse> {
+  return request(
+    { url: baseUrl.replace(/\/$/, ""), token: "" },
+    "POST",
+    "/api/v1/register",
+    { name },
+  );
+}
+
+export function touchSite(cfg: CliConfig, id: string): Promise<SiteResponse> {
+  return request(cfg, "POST", `/api/v1/sites/${encodeURIComponent(id)}/touch`);
+}
+
 export interface AdminKeyInfo {
   id: string;
   name: string;

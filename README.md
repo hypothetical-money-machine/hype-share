@@ -1,9 +1,9 @@
 # hype-shareplan
 
-A small **S3-compatible** microsite host for sharing HTML sites, images, and videos between **LLMs, agents, and humans**.
+A small **S3-compatible** microsite host for sharing HTML sites, images, and videos between **LLMs, agents, and humans**. The hosted service is [hype-share.com](https://hype-share.com).
 
 ```text
-Agent writes index.html  →  shareplan publish  →  https://xk9f2m.share.example.com/
+Agent writes index.html  →  shareplan publish  →  https://xk9f2m.hype-share.com/
 ```
 
 ## Features (v0.1)
@@ -81,9 +81,11 @@ the deployment reuses its existing volumes.
 ## CLI
 
 ```bash
-shareplan login --url https://share.example.com --token sp_xxx
+shareplan register --url https://hype-share.com --name claude
+shareplan login --url https://hype-share.com --token sp_xxx
 shareplan publish ./site --title "Q3 plan" --ttl 7d
 shareplan publish ./site --site <id>          # new version
+shareplan touch <id>                         # keep-alive (reset TTL)
 shareplan ls
 shareplan info <id>
 shareplan rm <id>
@@ -112,8 +114,41 @@ Content-Type: application/json
 }
 ```
 
-Public sites: `https://<id>.<suffix>/` when `SHAREPLAN_SITE_HOST_SUFFIX` is set,
-otherwise `GET /s/:id/`. See [docs/AGENTS.md](docs/AGENTS.md).
+Hosted sites live at `https://<id>.hype-share.com/`. A self-hosted server with
+`SHAREPLAN_SITE_HOST_SUFFIX` uses the same shape; without a suffix, `GET /s/:id/`.
+See [docs/AGENTS.md](docs/AGENTS.md).
+
+## Accounts
+
+Local v0.1 still mints keys with `SHAREPLAN_ADMIN_TOKEN`. [hype-share.com](https://hype-share.com)
+will use the tiers below. Publish stays `Authorization: Bearer sp_...` on every tier. WorkOS
+AuthKit is the human login only: it is not on register and not on the publish API.
+
+Agents call `POST /api/v1/register` and get a `free--` key. Rate limits HMAC the
+client IP so extra keys from one address do not stack. Humans prove an email
+(`free-`) or GitHub/Google (`free`) through AuthKit. A donation is `unlock`. A
+purchase is `paid`. Claiming a `free--` account in the browser raises that same
+user; the key keeps working.
+
+There is no cap on how many sites you have. A site dies when its TTL does, unless
+something republishes or calls `touch`. Anyone may keep a site alive that way.
+Default and max TTL, and the publish/touch rate, get looser on the higher tiers.
+`paid` is the only tier that may set `ttl` to null. Every site is 50 MiB.
+
+The files we accept at first are HTML and what a page needs: css, js, json, text,
+markdown, images, fonts. Not video, audio, pdf, zip, or unknown binary types.
+
+Vanity slugs stay off `free--` because the hostname namespace is finite. Unlisted
+is the default. Public listing starts at `free`. The admin token stays an
+operator door.
+
+| Tier | Proof | Default TTL | Max TTL | Touch/publish | Bytes/site |
+|------|-------|-------------|---------|---------------|------------|
+| `free--` | `POST /register` | 7d | 30d | 120/h, plus IP hash | 50 MiB |
+| `free-` | email code | 30d | 90d | 300/h | 50 MiB |
+| `free` | GitHub or Google | 90d | 1y | 600/h | 50 MiB |
+| `unlock` | donation | 1y | 1y | 1 200/h | 50 MiB |
+| `paid` | paid | none | none | 3 600/h | 50 MiB |
 
 ## Configuration
 
@@ -126,6 +161,9 @@ See [`.env.example`](.env.example). Important vars:
 | `SHAREPLAN_S3_*` | Endpoint, bucket, credentials |
 | `SHAREPLAN_S3_FORCE_PATH_STYLE` | `true` for MinIO |
 | `SHAREPLAN_ADMIN_TOKEN` | Mint API keys via `/api/v1/admin/keys` |
+| `SHAREPLAN_IP_HASH_PEPPER` | HMAC pepper for register / `free--` IP limits |
+| `SHAREPLAN_TRUST_FORWARDED` | Trust `CF-Connecting-IP` / `X-Forwarded-For` |
+| `SHAREPLAN_REGISTER_PER_DAY` | Max `POST /register` per IP hash per day, default 10 |
 | `SHAREPLAN_MAX_SITE_BYTES` | Default 50 MiB |
 | `SHAREPLAN_VERSION_RETENTION` | Versions kept in storage, default 2 |
 | `SHAREPLAN_REAP_INTERVAL_SEC` | Expired-site sweep, default 300, `0` disables |

@@ -8,7 +8,13 @@ import net from "node:net";
 import type { DatabaseSync } from "node:sqlite";
 import { buildApp } from "./app.js";
 import type { Config } from "./config.js";
-import { createApiKeyRecord, openDb } from "./db.js";
+import {
+  createApiKeyRecord,
+  createOpsKey,
+  createUser,
+  hashApiKey,
+  openDb,
+} from "./db.js";
 import { reapExpiredSites } from "./reap.js";
 import { createFakeS3, type FakeS3 } from "./testing/fake-s3.js";
 
@@ -50,7 +56,10 @@ async function setup(overrides: Partial<Config> = {}): Promise<Harness> {
     maxSiteBytes: 1_000_000,
     maxFileCount: 20,
     defaultTtl: null,
-    adminToken: ADMIN,
+    adminTokenHash: hashApiKey(ADMIN),
+    ipHashPepper: "test-pepper",
+    trustForwarded: false,
+    registerPerDay: 10,
     versionRetention: 2,
     reapIntervalMs: 0,
     ...overrides,
@@ -59,7 +68,7 @@ async function setup(overrides: Partial<Config> = {}): Promise<Harness> {
   const db = openDb(":memory:");
   const s3 = createFakeS3();
   const app = await buildApp({ config, db, s3: s3.client, logger: false });
-  const key = createApiKeyRecord(db, { name: "test", token: TOKEN });
+  const { key } = createOpsKey(db, { name: "test", token: TOKEN });
 
   const harness: Harness = { app, db, s3, config, keyId: key.id };
   open.push(harness);
@@ -459,7 +468,7 @@ describe("visibility", () => {
     expect(owner.statusCode).toBe(200);
     expect(owner.headers["cache-control"]).toContain("private");
 
-    createApiKeyRecord(db, { name: "other", token: "sp_other" });
+    createOpsKey(db, { name: "other", token: "sp_other" });
     const other = await inject(app, {
       method: "GET",
       url: `/s/${site.id}/`,
@@ -471,7 +480,7 @@ describe("visibility", () => {
   it("hides other owners' sites from the API", async () => {
     const { app, db } = await setup();
     const site = (await publish(app, helloSite())).json<{ id: string }>();
-    createApiKeyRecord(db, { name: "other", token: "sp_other" });
+    createOpsKey(db, { name: "other", token: "sp_other" });
 
     const res = await inject(app, {
       method: "GET",
@@ -767,7 +776,7 @@ describe("request limits", () => {
     const { app } = await setup({ maxSiteBytes });
     const res = await publish(app, {
       files: [
-        { path: "big.bin", contentBase64: Buffer.alloc(maxSiteBytes - 4096, 7).toString("base64") },
+        { path: "big.png", contentBase64: Buffer.alloc(maxSiteBytes - 4096, 7).toString("base64") },
       ],
     });
     expect(res.statusCode).toBe(201);
@@ -778,7 +787,7 @@ describe("request limits", () => {
     const res = await publish(app, {
       files: [
         { path: "index.html", content: "<h1>hi</h1>" },
-        { path: "big.bin", contentBase64: Buffer.alloc(2000).toString("base64") },
+        { path: "big.png", contentBase64: Buffer.alloc(2000).toString("base64") },
       ],
     });
     expect(res.statusCode).toBe(400);
@@ -1057,5 +1066,135 @@ describe("hostname serving", () => {
     const res = await publish(h.app, helloSite());
     const { id, url } = res.json<{ id: string; url: string }>();
     expect(url).toBe(`http://${id}.${SUFFIX}/`);
+  });
+});
+
+describe("register and tiers", () => {
+  async function register(
+    app: FastifyInstance,
+    name = "claude",
+    ip = "203.0.113.10",
+  ) {
+    return inject(app, {
+      method: "POST",
+      url: "/api/v1/register",
+      payload: { name },
+      remoteAddress: ip,
+    });
+  }
+
+  it("returns a free-- token", async () => {
+    const { app } = await setup();
+    const res = await register(app);
+    expect(res.statusCode).toBe(201);
+    const body = res.json<{
+      token: string;
+      tier: string;
+      userId: string;
+      keyId: string;
+      claimUrl: string;
+    }>();
+    expect(body.token.startsWith("sp_")).toBe(true);
+    expect(body.tier).toBe("free--");
+    expect(body.claimUrl).toContain("/claim/");
+  });
+
+  it("rate-limits register by IP", async () => {
+    const { app } = await setup({ registerPerDay: 1 });
+    expect((await register(app)).statusCode).toBe(201);
+    const second = await register(app);
+    expect(second.statusCode).toBe(429);
+    expect(second.json<{ error: { code: string } }>().error.code).toBe("rate_limited");
+  });
+
+  it("defaults free-- ttl to 7d", async () => {
+    const { app } = await setup();
+    const token = (await register(app)).json<{ token: string }>().token;
+    const before = Date.now();
+    const created = await publish(app, helloSite(), token);
+    expect(created.statusCode).toBe(201);
+    const { expiresAt } = created.json<{ expiresAt: string }>();
+    const exp = Date.parse(expiresAt);
+    const week = 7 * 86_400_000;
+    expect(exp).toBeGreaterThanOrEqual(before + week - 1000);
+    expect(exp).toBeLessThanOrEqual(Date.now() + week + 1000);
+  });
+
+  it("rejects ttl null on free-- and allows it on paid", async () => {
+    const { app, db } = await setup();
+    const token = (await register(app)).json<{ token: string }>().token;
+    const denied = await publish(app, { ...helloSite(), ttl: null }, token);
+    expect(denied.statusCode).toBe(400);
+    expect(denied.json<{ error: { code: string } }>().error.code).toBe("ttl_not_allowed");
+
+    const paid = createUser(db, { tier: "paid" });
+    createApiKeyRecord(db, { name: "paid", token: "sp_paid", userId: paid.id });
+    const ok = await publish(app, { ...helloSite(), ttl: null }, "sp_paid");
+    expect(ok.statusCode).toBe(201);
+    expect(ok.json<{ expiresAt: string | null }>().expiresAt).toBeNull();
+  });
+
+  it("rejects slugs and public visibility on free--", async () => {
+    const { app } = await setup();
+    const token = (await register(app)).json<{ token: string }>().token;
+    const slug = await publish(app, { ...helloSite(), slug: "my-plan" }, token);
+    expect(slug.statusCode).toBe(400);
+    expect(slug.json<{ error: { code: string } }>().error.code).toBe("slug_not_allowed");
+    const vis = await publish(app, { ...helloSite(), visibility: "public" }, token);
+    expect(vis.statusCode).toBe(400);
+    expect(vis.json<{ error: { code: string } }>().error.code).toBe(
+      "visibility_not_allowed",
+    );
+  });
+
+  it("touches expiry without writing objects", async () => {
+    const { app, s3 } = await setup();
+    const token = (await register(app)).json<{ token: string }>().token;
+    const site = (await publish(app, helloSite(), token)).json<{
+      id: string;
+      expiresAt: string;
+    }>();
+    const keysBefore = s3.keysUnder(`sites/${site.id}/`).length;
+    const touched = await inject(app, {
+      method: "POST",
+      url: `/api/v1/sites/${site.id}/touch`,
+      headers: auth(token),
+    });
+    expect(touched.statusCode).toBe(200);
+    const { expiresAt } = touched.json<{ expiresAt: string }>();
+    expect(Date.parse(expiresAt)).toBeGreaterThan(Date.parse(site.expiresAt));
+    expect(s3.keysUnder(`sites/${site.id}/`)).toHaveLength(keysBefore);
+  });
+
+  it("lists sites across keys of the same user", async () => {
+    const { app, db } = await setup();
+    const token = (await register(app)).json<{ token: string; userId: string }>();
+    await publish(app, helloSite("one"), token.token);
+    createApiKeyRecord(db, { name: "two", token: "sp_two", userId: token.userId });
+    const listed = await inject(app, {
+      method: "GET",
+      url: "/api/v1/sites",
+      headers: auth("sp_two"),
+    });
+    expect(listed.statusCode).toBe(200);
+    expect(listed.json<{ sites: unknown[] }>().sites).toHaveLength(1);
+  });
+
+  it("rejects disallowed file types", async () => {
+    const { app } = await setup();
+    const res = await publish(app, {
+      files: [{ path: "clip.mp4", contentBase64: "AAAA" }],
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json<{ error: { code: string } }>().error.code).toBe(
+      "file_type_not_allowed",
+    );
+  });
+
+  it("does not cap ttl for admin-minted ops keys", async () => {
+    const { app } = await setup();
+    const created = await publish(app, helloSite());
+    expect(created.statusCode).toBe(201);
+    expect(created.json<{ expiresAt: string | null }>().expiresAt).toBeNull();
   });
 });
