@@ -14,6 +14,8 @@ import {
   createVersionId,
   contentTypeForPath,
   expiresAtFromTtl,
+  HOST_LABEL_RE,
+  isHostLabel,
   isHtmlPath,
   s3ObjectKey,
   sanitizeSitePath,
@@ -59,11 +61,11 @@ const fileInputSchema = z.object({
 
 const createSiteSchema = z.object({
   title: z.string().max(200).optional(),
+  // A slug is a hostname label under hostname serving, so it follows the
+  // label rule in every mode: the rule must not change when a suffix is set.
   slug: z
     .string()
-    .min(1)
-    .max(64)
-    .regex(/^[a-z0-9][a-z0-9-]*$/i, "slug must be alphanumeric with hyphens")
+    .regex(HOST_LABEL_RE, "slug must be a lowercase hostname label (a-z, 0-9, hyphens)")
     .optional(),
   visibility: z.enum(["public", "unlisted", "private"]).optional(),
   ttl: z.union([z.string(), z.number(), z.null()]).optional(),
@@ -182,7 +184,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 <body>
   <h1>shareplan</h1>
   <p>Small S3-backed microsite host for agents and humans.</p>
-  <p>Publish with the CLI or <code>POST /api/v1/sites</code>. Sites live at <code>/s/:id/</code>.</p>
+  <p>Publish with the CLI or <code>POST /api/v1/sites</code>. Sites live at <code>${siteUrlShape(deps.config)}</code>.</p>
   <p><a href="/healthz">healthz</a> · <a href="/docs/agents">agent docs</a></p>
 </body>
 </html>`;
@@ -209,7 +211,7 @@ Content-Type: application/json
 }
 \`\`\`
 
-Response includes \`url\` like \`${deps.config.publicBaseUrl}/s/<id>/\`.
+Response includes \`url\` like \`${siteUrl(deps.config, "<id>")}\`.
 
 ## Update
 \`PUT /api/v1/sites/:id\` with the same body shape (new version).
@@ -314,26 +316,109 @@ Response includes \`url\` like \`${deps.config.publicBaseUrl}/s/<id>/\`.
     return reply.status(204).send();
   });
 
-  // --- Public serve --- (:id accepts a site id or a vanity slug)
-  app.get("/s/:id", async (req, reply) => {
-    const { id } = req.params as { id: string };
-    return reply.redirect(`/s/${encodeURIComponent(id)}/`, 302);
-  });
+  // --- Public serve ---
+  const suffix = deps.config.siteHostSuffix;
 
-  app.get("/s/:id/*", async (req, reply) => {
-    const { id } = req.params as { id: string };
-    const wildcard = (req.params as { "*": string })["*"] ?? "";
-    return serveSitePath(ctx, req, reply, id, wildcard);
-  });
+  if (suffix !== null) {
+    // Every site gets its own origin: <label>.<suffix>. Requests on a site
+    // host are answered here, before any route handler, so nothing but that
+    // site's content is reachable from it. A route constraint would not do:
+    // find-my-way prefers a static match like /healthz over a constrained
+    // wildcard, so the API would leak through. Only single-label subdomains
+    // count; the apex stays the API host.
+    app.addHook("onRequest", async (req, reply) => {
+      const label = siteLabelFromHost(req.headers.host ?? "", suffix);
+      if (label === null) return;
+      if (req.method !== "GET" && req.method !== "HEAD") {
+        reply.header("Allow", "GET, HEAD");
+        await reply.status(405).send({
+          error: { code: "method_not_allowed", message: "site hosts serve content only" },
+        });
+        return reply;
+      }
+      if (RESERVED_LABELS.has(label)) {
+        // Never a site (slugs cannot claim these), so send www and friends
+        // to the same path on the API host rather than 404 them as missing
+        // sites. req.url always starts with "/", so the base stays in charge.
+        await reply.redirect(`${deps.config.publicBaseUrl}${req.url}`, 302);
+        return reply;
+      }
+      // No route matched here, so nothing has percent-decoded the path yet;
+      // the /s/:id/* route got that from find-my-way for free.
+      const relPath = decodePath(splitQuery(req.url).path);
+      if (relPath === null) {
+        await reply.status(400).send({ error: { code: "invalid_path", message: "invalid path" } });
+        return reply;
+      }
+      await serveSitePath(ctx, req, reply, label, relPath);
+      return reply;
+    });
+  }
 
-  // Fastify may not match trailing slash path with splat alone in all versions
-  app.get("/s/:id/", async (req, reply) => {
-    const { id } = req.params as { id: string };
-    return serveSitePath(ctx, req, reply, id, "");
-  });
+  // /s/:id/... is the only site URL without a suffix, and a legacy link with
+  // one: it then hops to the site's own origin instead of being served from
+  // the shared one. Temporary redirect, since the layout is config, not a
+  // fact about the site. Three registrations because find-my-way does not
+  // fold the bare, trailing-slash, and splat forms into one route.
+  const legacy = async (req: FastifyRequest, reply: FastifyReply, bare: boolean) => {
+    const params = req.params as { id: string; "*"?: string };
+    // Params arrive decoded, so anything that goes back into a URL is
+    // re-encoded per segment rather than pasted in as text.
+    const rest = (params["*"] ?? "").split("/").map(encodeURIComponent).join("/");
+    const { query } = splitQuery(req.url);
+    if (suffix === null) {
+      if (bare) {
+        return reply.redirect(`/s/${encodeURIComponent(params.id)}/${query}`, 302);
+      }
+      return serveSitePath(ctx, req, reply, params.id, params["*"] ?? "");
+    }
+    // The id lands in the Location hostname, so it must be a clean label:
+    // anything else (a dot, an encoded "#" or "/") would let a crafted link
+    // redirect to a host of the attacker's choosing.
+    const label = params.id.toLowerCase();
+    if (!isHostLabel(label)) {
+      return reply.status(404).send({ error: { code: "not_found", message: "site not found" } });
+    }
+    return reply.redirect(`${siteUrl(deps.config, label)}${rest}${query}`, 302);
+  };
+  app.get("/s/:id", (req, reply) => legacy(req, reply, true));
+  app.get("/s/:id/", (req, reply) => legacy(req, reply, false));
+  app.get("/s/:id/*", (req, reply) => legacy(req, reply, false));
 
   return app;
 }
+
+/** Request URL split at the "?", with the query keeping its "?" (or ""). */
+function splitQuery(url: string): { path: string; query: string } {
+  const q = url.indexOf("?");
+  return q === -1 ? { path: url, query: "" } : { path: url.slice(0, q), query: url.slice(q) };
+}
+
+/** A raw request path percent-decoded, or null if the encoding is broken. */
+function decodePath(path: string): string | null {
+  try {
+    return decodeURIComponent(path);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The subdomain label of a site host, lowercased, or null if the host is not
+ * `<one-label>.<suffix>`. Works from the raw Host header, so it drops the
+ * port and a trailing dot first: `site.example.com.:443` is the same host as
+ * `site.example.com`, and treating it as anything else would let a request
+ * on a site's own name reach the API.
+ */
+export function siteLabelFromHost(host: string, suffix: string): string | null {
+  const name = host.trim().toLowerCase().replace(/:\d+$/, "").replace(/\.$/, "");
+  if (!name.endsWith(`.${suffix}`)) return null;
+  const label = name.slice(0, -(suffix.length + 1));
+  return isHostLabel(label) ? label : null;
+}
+
+/** Labels that must stay free so they can never be claimed as a slug. */
+const RESERVED_LABELS = new Set(["www", "api", "admin", "docs", "mail", "static", "cdn"]);
 
 async function publishNewSite(
   ctx: Ctx,
@@ -470,8 +555,16 @@ function resolveTtl(
   }
 }
 
-/** Slugs share the `/s/:id/` namespace with site ids, so both must be free. */
+/**
+ * Slugs share a namespace with site ids, so both must be free. A slug is also
+ * a DNS label under hostname serving, so reserved labels stay off limits in
+ * every mode: a site claimed as "www" under path serving would break the
+ * moment a suffix was configured.
+ */
 function assertSlugAvailable(ctx: Ctx, slug: string, exceptSiteId?: string): void {
+  if (RESERVED_LABELS.has(slug)) {
+    throw new HttpError(409, "slug_taken", `slug "${slug}" is reserved`);
+  }
   const bySlug = getSiteBySlug(ctx.db, slug);
   if (bySlug && bySlug.id !== exceptSiteId) {
     throw new HttpError(409, "slug_taken", `slug "${slug}" is already in use`);
@@ -613,11 +706,11 @@ async function serveSitePath(
     if (indexPath !== null) {
       const idxKey = s3ObjectKey(site.id, site.current_version_id, indexPath);
       if (await getObject(ctx.s3, ctx.config.s3.bucket, idxKey)) {
-        const q = req.url.indexOf("?");
-        const target =
-          q === -1 ? `${req.url}/` : `${req.url.slice(0, q)}/${req.url.slice(q)}`;
+        const { path: reqPath, query } = splitQuery(req.url);
         setSiteHeaders(reply, site);
-        await reply.redirect(target, 302);
+        // Collapse leading slashes so "//host" can never become a
+        // scheme-relative Location; the redirect stays on this origin.
+        await reply.redirect(`${reqPath.replace(/^\/+/, "/")}/${query}`, 302);
         return;
       }
     }
@@ -654,8 +747,26 @@ async function serveSitePath(
   await reply.send(obj.body);
 }
 
+/**
+ * Sites share the API host's scheme; a plain-http deployment behind no TLS
+ * would otherwise hand out https links that do not resolve.
+ */
+function siteScheme(config: Config): "http" | "https" {
+  return config.publicBaseUrl.startsWith("http://") ? "http" : "https";
+}
+
 function siteUrl(config: Config, id: string): string {
-  return `${config.publicBaseUrl}/s/${id}/`;
+  if (config.siteHostSuffix === null) {
+    return `${config.publicBaseUrl}/s/${id}/`;
+  }
+  return `${siteScheme(config)}://${id}.${config.siteHostSuffix}/`;
+}
+
+/** How the landing page describes site URLs, without inventing an id. */
+function siteUrlShape(config: Config): string {
+  return config.siteHostSuffix === null
+    ? "/s/:id/"
+    : `${siteScheme(config)}://:id.${config.siteHostSuffix}/`;
 }
 
 function toSiteResponse(config: Config, row: SiteRow): SiteResponse {

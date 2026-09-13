@@ -67,7 +67,7 @@ Binary files use `contentBase64` instead of `content`.
 ```json
 {
   "id": "a1b2c3d4e5",
-  "url": "http://127.0.0.1:8788/s/a1b2c3d4e5/",
+  "url": "https://a1b2c3d4e5.share.example.com/",
   "versionId": "...",
   "expiresAt": null,
   "byteSize": 123,
@@ -83,10 +83,15 @@ Binary files use `contentBase64` instead of `content`.
 | `GET` | `/api/v1/sites` | List yours |
 | `GET` | `/api/v1/sites/:id` | Metadata |
 | `DELETE` | `/api/v1/sites/:id` | Delete |
-| `GET` | `/s/:id/*` | Public serve (`:id` also accepts a slug) |
+| `GET` | `https://<id>.<suffix>/*` | Public serve (`<id>` also accepts a slug) |
 
-Optional `slug` on create gives a readable URL (`/s/my-plan/`); it must not
+Optional `slug` on create gives a readable URL (`https://my-plan.<suffix>/`);
+it must be a valid hostname label (lowercase letters, digits, inner hyphens, at
+most 63 chars), must not be a reserved label like `www`, and must not
 already be taken or look like an existing site id, otherwise you get a `409`.
+
+Always use the `url` from the response rather than building one: a server
+without a host suffix serves sites under `/s/:id/` on the API host instead.
 
 On `PUT`, omitting `ttl` keeps the current expiry — send `"ttl": null` to make
 a site permanent, or a new value to reset the clock.

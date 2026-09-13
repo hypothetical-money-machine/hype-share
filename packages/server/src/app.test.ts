@@ -4,6 +4,7 @@ import type {
   InjectOptions,
   LightMyRequestResponse,
 } from "fastify";
+import net from "node:net";
 import type { DatabaseSync } from "node:sqlite";
 import { buildApp } from "./app.js";
 import type { Config } from "./config.js";
@@ -36,6 +37,7 @@ async function setup(overrides: Partial<Config> = {}): Promise<Harness> {
     host: "127.0.0.1",
     port: 0,
     publicBaseUrl: "http://test.local",
+    siteHostSuffix: null,
     dataDir: "/tmp",
     dbPath: ":memory:",
     s3: {
@@ -207,6 +209,22 @@ describe("publish and serve", () => {
     });
     expect(res.statusCode).toBe(200);
     expect(res.body).toBe("docs");
+  });
+
+  it("does not loop on an encoded id in path mode", async () => {
+    const { app } = await setup();
+    for (const url of ["/s/a%20b/", "/s/a%2Fb/", "/s/a%23b/index.html"]) {
+      const res = await inject(app, { method: "GET", url });
+      expect(res.statusCode, url).toBe(404);
+      expect(res.headers.location, url).toBeUndefined();
+    }
+  });
+
+  it("keeps the query on the bare /s/:id redirect in path mode", async () => {
+    const { app } = await setup();
+    const res = await inject(app, { method: "GET", url: "/s/abc?q=1" });
+    expect(res.statusCode).toBe(302);
+    expect(res.headers.location).toBe("/s/abc/?q=1");
   });
 
   it("redirects a directory hit to its trailing-slash URL", async () => {
@@ -768,3 +786,276 @@ describe("request limits", () => {
   });
 });
 
+
+describe("hostname serving", () => {
+  const SUFFIX = "sites.test";
+  const host = (label: string) => ({ host: `${label}.${SUFFIX}` });
+
+  async function setupHosted() {
+    const h = await setup({ siteHostSuffix: SUFFIX, publicBaseUrl: "https://api.test" });
+    const res = await publish(h.app, {
+      title: "hosted",
+      files: [
+        { path: "index.html", content: "root" },
+        { path: "docs/index.html", content: "docs" },
+        { path: "style.css", content: "body{}" },
+      ],
+    });
+    expect(res.statusCode).toBe(201);
+    return { ...h, site: res.json<{ id: string; url: string }>() };
+  }
+
+  it("returns subdomain urls from the api", async () => {
+    const { site } = await setupHosted();
+    expect(site.url).toBe(`https://${site.id}.${SUFFIX}/`);
+  });
+
+  it("serves the site from its own host", async () => {
+    const { app, site } = await setupHosted();
+    const index = await inject(app, { method: "GET", url: "/", headers: host(site.id) });
+    expect(index.statusCode).toBe(200);
+    expect(index.body).toBe("root");
+
+    const css = await inject(app, { method: "GET", url: "/style.css", headers: host(site.id) });
+    expect(css.statusCode).toBe(200);
+    expect(css.headers["content-type"]).toContain("text/css");
+
+    const nested = await inject(app, { method: "GET", url: "/docs/", headers: host(site.id) });
+    expect(nested.statusCode).toBe(200);
+    expect(nested.body).toBe("docs");
+  });
+
+  it("redirects a directory hit on the site host without the /s/ prefix", async () => {
+    const { app, site } = await setupHosted();
+    const res = await inject(app, { method: "GET", url: "/docs?x=1", headers: host(site.id) });
+    expect(res.statusCode).toBe(302);
+    expect(res.headers.location).toBe("/docs/?x=1");
+  });
+
+  it("matches the host case-insensitively and with a port", async () => {
+    const { app, site } = await setupHosted();
+    const res = await inject(app, {
+      method: "GET",
+      url: "/",
+      headers: { host: `${site.id.toUpperCase()}.${SUFFIX}:8788` },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toBe("root");
+  });
+
+  it("serves by slug on the site host", async () => {
+    const { app } = await setupHosted();
+    await publish(app, { ...helloSite("slugged"), slug: "my-plan" });
+    const res = await inject(app, { method: "GET", url: "/", headers: host("my-plan") });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toBe("slugged");
+  });
+
+  it("hides the api from site hosts", async () => {
+    const { app, site } = await setupHosted();
+    for (const url of ["/healthz", "/api/v1/sites", "/docs/agents"]) {
+      const res = await inject(app, { method: "GET", url, headers: { ...host(site.id), ...auth() } });
+      // Anything under a site host is looked up as a file of that site.
+      expect(res.statusCode, url).toBe(404);
+      expect(res.json<{ error: { message: string } }>().error.message).toBe("file not found");
+    }
+    const post = await inject(app, {
+      method: "POST",
+      url: "/api/v1/sites",
+      headers: { ...host(site.id), ...auth() },
+      payload: helloSite(),
+    });
+    expect(post.statusCode).toBe(405);
+    expect(post.headers.allow).toBe("GET, HEAD");
+  });
+
+  it("keeps the api on the apex host", async () => {
+    const { app } = await setupHosted();
+    const res = await inject(app, { method: "GET", url: "/healthz", headers: { host: SUFFIX } });
+    expect(res.statusCode).toBe(200);
+    const deeper = await inject(app, {
+      method: "GET",
+      url: "/healthz",
+      headers: { host: `a.b.${SUFFIX}` },
+    });
+    expect(deeper.statusCode, "multi-label hosts are not site hosts").toBe(200);
+  });
+
+  it("redirects old /s/ links to the site host", async () => {
+    const { app, site } = await setupHosted();
+    const cases: [string, string][] = [
+      [`/s/${site.id}`, `https://${site.id}.${SUFFIX}/`],
+      [`/s/${site.id}/`, `https://${site.id}.${SUFFIX}/`],
+      [`/s/${site.id}/?q=1`, `https://${site.id}.${SUFFIX}/?q=1`],
+      [`/s/${site.id}/docs/style.css?v=2`, `https://${site.id}.${SUFFIX}/docs/style.css?v=2`],
+      [`/s/${site.id.toUpperCase()}/`, `https://${site.id}.${SUFFIX}/`],
+    ];
+    for (const [url, location] of cases) {
+      const res = await inject(app, { method: "GET", url });
+      expect(res.statusCode, url).toBe(302);
+      expect(res.headers.location, url).toBe(location);
+    }
+  });
+
+  it("sends reserved labels like www to the api host", async () => {
+    const { app } = await setupHosted();
+    for (const label of ["www", "api", "admin"]) {
+      const res = await inject(app, { method: "GET", url: "/", headers: host(label) });
+      expect(res.statusCode, label).toBe(302);
+      expect(res.headers.location, label).toBe("https://api.test/");
+    }
+  });
+
+  it("rejects slugs that cannot be hostnames, in either mode", async () => {
+    for (const h of [await setupHosted(), await setup()]) {
+      for (const slug of ["MyPlan", "-lead", "trail-", "a".repeat(64)]) {
+        const bad = await publish(h.app, { ...helloSite(), slug });
+        expect(bad.statusCode, slug).toBe(400);
+        expect(bad.json<{ error: { code: string } }>().error.code).toBe("validation_error");
+      }
+
+      const reserved = await publish(h.app, { ...helloSite(), slug: "www" });
+      expect(reserved.statusCode).toBe(409);
+      expect(reserved.json<{ error: { code: string } }>().error.code).toBe("slug_taken");
+    }
+  });
+
+  it("keeps a legacy mixed-case slug reachable from its lowercase host", async () => {
+    const { app, db } = await setupHosted();
+    const site = (await publish(app, helloSite("legacy"))).json<{ id: string }>();
+    // Stored before slugs were forced lowercase.
+    db.prepare(`UPDATE sites SET slug = ? WHERE id = ?`).run("MyPlan", site.id);
+
+    const served = await inject(app, { method: "GET", url: "/", headers: host("myplan") });
+    expect(served.statusCode).toBe(200);
+    expect(served.body).toBe("legacy");
+
+    const legacyLink = await inject(app, { method: "GET", url: "/s/MyPlan/" });
+    expect(legacyLink.headers.location).toBe(`https://myplan.${SUFFIX}/`);
+
+    // And nobody else can claim the lowercase form out from under it.
+    const clash = await publish(app, { ...helloSite(), slug: "myplan" });
+    expect(clash.statusCode).toBe(409);
+    // Not even by writing around the API: the index is case-insensitive.
+    expect(() =>
+      db.prepare(`UPDATE sites SET slug = 'MYPLAN' WHERE id <> ?`).run(site.id),
+    ).toThrow(/UNIQUE/);
+  });
+
+  it("treats a trailing-dot or ported host as the same site host", async () => {
+    const { app, site } = await setupHosted();
+    for (const h of [
+      `${site.id}.${SUFFIX}.`,
+      `${site.id}.${SUFFIX}.:443`,
+      ` ${site.id}.${SUFFIX}:8788 `,
+    ]) {
+      const page = await inject(app, { method: "GET", url: "/", headers: { host: h } });
+      expect(page.statusCode, h).toBe(200);
+      expect(page.body, h).toBe("root");
+      const api = await inject(app, { method: "GET", url: "/healthz", headers: { host: h } });
+      expect(api.statusCode, `${h} must not reach the api`).toBe(404);
+    }
+  });
+
+  it("refuses legacy ids that could steer the redirect off the suffix", async () => {
+    const { app } = await setupHosted();
+    for (const id of ["evil.example%23", "evil.example", "a%2Fb", "x%3Ay", "%20", "a%2Eb"]) {
+      for (const url of [`/s/${id}`, `/s/${id}/`, `/s/${id}/index.html`]) {
+        const res = await inject(app, { method: "GET", url });
+        expect(res.statusCode, url).toBe(404);
+        expect(res.headers.location, url).toBeUndefined();
+      }
+    }
+  });
+
+  it("serves percent-encoded file names on the site host", async () => {
+    const h = await setup({ siteHostSuffix: SUFFIX, publicBaseUrl: "https://api.test" });
+    const res = await publish(h.app, {
+      title: "encoded",
+      files: [
+        { path: "index.html", content: "root" },
+        { path: "my file.txt", content: "spaced" },
+        { path: "日.html", content: "<p>sun</p>" },
+      ],
+    });
+    expect(res.statusCode, res.body).toBe(201);
+    const { id } = res.json<{ id: string }>();
+    const spaced = await inject(h.app, { method: "GET", url: "/my%20file.txt", headers: host(id) });
+    expect(spaced.statusCode).toBe(200);
+    expect(spaced.body).toBe("spaced");
+    const sun = await inject(h.app, { method: "GET", url: "/%E6%97%A5.html", headers: host(id) });
+    expect(sun.statusCode).toBe(200);
+    const broken = await inject(h.app, { method: "GET", url: "/%E6%97", headers: host(id) });
+    expect(broken.statusCode).toBe(400);
+  });
+
+  it("re-encodes the path in a legacy redirect instead of pasting it decoded", async () => {
+    const { app, site } = await setupHosted();
+    const cases: [string, string][] = [
+      [`/s/${site.id}/my%20file.txt`, `https://${site.id}.${SUFFIX}/my%20file.txt`],
+      [`/s/${site.id}/%E6%97%A5.html`, `https://${site.id}.${SUFFIX}/%E6%97%A5.html`],
+      [`/s/${site.id}/a%23b`, `https://${site.id}.${SUFFIX}/a%23b`],
+      [`/s/${site.id}/docs/%3Fx`, `https://${site.id}.${SUFFIX}/docs/%3Fx`],
+    ];
+    for (const [url, location] of cases) {
+      const res = await inject(app, { method: "GET", url });
+      expect(res.statusCode, url).toBe(302);
+      expect(res.headers.location, url).toBe(location);
+    }
+  });
+
+  it("keeps the path and query when bouncing a reserved label to the api host", async () => {
+    const { app } = await setupHosted();
+    const res = await inject(app, { method: "GET", url: "/docs/agents?x=1", headers: host("www") });
+    expect(res.statusCode).toBe(302);
+    expect(res.headers.location).toBe("https://api.test/docs/agents?x=1");
+  });
+
+  it("never turns a directory redirect into a scheme-relative location", async () => {
+    const h = await setup({ siteHostSuffix: SUFFIX, publicBaseUrl: "https://api.test" });
+    const res = await publish(h.app, {
+      title: "trap",
+      files: [
+        { path: "index.html", content: "root" },
+        { path: "evil.example/index.html", content: "x" },
+      ],
+    });
+    expect(res.statusCode, res.body).toBe(201);
+    const { id } = res.json<{ id: string }>();
+    // inject() would parse "//evil.example" as a host, so go over a socket.
+    const address = await h.app.listen({ host: "127.0.0.1", port: 0 });
+    const port = Number(new URL(address).port);
+    const raw = await new Promise<string>((resolve, reject) => {
+      const sock = net.connect(port, "127.0.0.1", () => {
+        sock.write(`GET //evil.example HTTP/1.1\r\nHost: ${id}.${SUFFIX}\r\nConnection: close\r\n\r\n`);
+      });
+      let buf = "";
+      sock.on("data", (d) => (buf += d.toString()));
+      sock.on("end", () => resolve(buf));
+      sock.on("error", reject);
+    });
+    expect(raw).toMatch(/^HTTP\/1.1 302/);
+    expect(raw).toMatch(/^location: \/evil\.example\/\r$/im);
+  });
+
+  it("keeps the query on a bare /s/:id redirect", async () => {
+    const { app, site } = await setupHosted();
+    const res = await inject(app, { method: "GET", url: `/s/${site.id}?q=1&r=2` });
+    expect(res.statusCode).toBe(302);
+    expect(res.headers.location).toBe(`https://${site.id}.${SUFFIX}/?q=1&r=2`);
+  });
+
+  it("describes site urls on the landing page with the api scheme", async () => {
+    const http = await setup({ siteHostSuffix: SUFFIX, publicBaseUrl: "http://localhost:8788" });
+    const page = await inject(http.app, { method: "GET", url: "/" });
+    expect(page.body).toContain(`http://:id.${SUFFIX}/`);
+    expect(page.body).not.toContain(`https://:id.${SUFFIX}/`);
+  });
+
+  it("uses http site urls when the api base is http", async () => {
+    const h = await setup({ siteHostSuffix: SUFFIX, publicBaseUrl: "http://localhost:8788" });
+    const res = await publish(h.app, helloSite());
+    const { id, url } = res.json<{ id: string; url: string }>();
+    expect(url).toBe(`http://${id}.${SUFFIX}/`);
+  });
+});

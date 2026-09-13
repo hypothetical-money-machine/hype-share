@@ -3,7 +3,7 @@
 A small **S3-compatible** microsite host for sharing HTML sites, images, and videos between **LLMs, agents, and humans**.
 
 ```text
-Agent writes index.html  →  shareplan publish  →  https://share.example.com/s/xk9f2m/
+Agent writes index.html  →  shareplan publish  →  https://xk9f2m.share.example.com/
 ```
 
 ## Features (v0.1)
@@ -14,7 +14,9 @@ Agent writes index.html  →  shareplan publish  →  https://share.example.com/
 - **Versioned publishes** — replace content without breaking mid-upload, with
   old versions swept from storage automatically
 - **TTL / expiry** — optional `7d`-style lifetimes, reclaimed by a background sweeper
-- **Vanity slugs** — `/s/my-plan/` alongside `/s/xk9f2m/`
+- **Per-site origins** — each site served from `<id>.<your-domain>` so the
+  browser's same-origin policy keeps sites apart (or single-origin `/s/:id/`)
+- **Vanity slugs** — `my-plan.<your-domain>` alongside `xk9f2m.<your-domain>`
 - **Security headers** on served HTML (CSP, nosniff, noindex)
 
 ## Quick start (local)
@@ -88,7 +90,8 @@ Content-Type: application/json
 }
 ```
 
-Public sites: `GET /s/:id/`. See [docs/AGENTS.md](docs/AGENTS.md).
+Public sites: `https://<id>.<suffix>/` when `SHAREPLAN_SITE_HOST_SUFFIX` is set,
+otherwise `GET /s/:id/`. See [docs/AGENTS.md](docs/AGENTS.md).
 
 ## Configuration
 
@@ -96,7 +99,8 @@ See [`.env.example`](.env.example). Important vars:
 
 | Var | Purpose |
 |-----|---------|
-| `SHAREPLAN_PUBLIC_BASE_URL` | URLs returned to clients |
+| `SHAREPLAN_PUBLIC_BASE_URL` | API host, and the base of site URLs when no suffix is set |
+| `SHAREPLAN_SITE_HOST_SUFFIX` | Serve sites at `<id>.<suffix>`; needs wildcard DNS + cert |
 | `SHAREPLAN_S3_*` | Endpoint, bucket, credentials |
 | `SHAREPLAN_S3_FORCE_PATH_STYLE` | `true` for MinIO |
 | `SHAREPLAN_ADMIN_TOKEN` | Mint API keys via `/api/v1/admin/keys` |
@@ -117,8 +121,13 @@ than orphaning files.
 
 ## Security notes
 
-- Untrusted HTML is served under `/s/:id/` with CSP and `X-Robots-Tag: noindex`.
-- Path-based hosting shares an origin across sites (XSS can affect other path-sites). Prefer a wildcard subdomain deploy for stronger isolation later.
+- Untrusted HTML is served with CSP, `X-Robots-Tag: noindex`, and `Referrer-Policy: no-referrer`.
+- Set `SHAREPLAN_SITE_HOST_SUFFIX` so every site gets its own origin. Site hosts
+  answer only `GET`/`HEAD` for that site's files; the API is reachable only on the
+  apex. Old `/s/:id/` links redirect to the site host. Use a domain that hosts
+  nothing trusted: a site can still set cookies for the parent domain.
+- Without a suffix, all sites share one origin under `/s/:id/`, so a script in
+  one site can reach another. Fine for local dev, not for public hosting.
 - API keys are stored as SHA-256 hashes only.
 - Zip/tar upload is not in v0.1 (JSON + directory CLI only).
 

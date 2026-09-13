@@ -47,6 +47,34 @@ export function openDb(dbPath: string): DatabaseSync {
   return db;
 }
 
+/**
+ * Slugs are matched case-insensitively, but the original UNIQUE column is
+ * case-sensitive, so a database from before that rule may hold both "MyPlan"
+ * and "myplan" on different sites. The oldest site keeps its slug; the rest
+ * lose theirs (the site itself, and its id URL, are untouched). Runs once,
+ * before the case-insensitive unique index is created. Returns what it
+ * cleared so the caller can log it.
+ */
+export function resolveCaseFoldedSlugs(db: DatabaseSync): { id: string; slug: string }[] {
+  const losers = db
+    .prepare(
+      `SELECT s.id, s.slug
+       FROM sites s
+       WHERE s.slug IS NOT NULL
+         AND EXISTS (
+           SELECT 1 FROM sites o
+           WHERE o.slug = s.slug COLLATE NOCASE
+             AND o.id <> s.id
+             AND (o.created_at < s.created_at OR (o.created_at = s.created_at AND o.id < s.id))
+         )
+       ORDER BY s.created_at, s.id`,
+    )
+    .all() as { id: string; slug: string }[];
+  const clear = db.prepare(`UPDATE sites SET slug = NULL WHERE id = ?`);
+  for (const row of losers) clear.run(row.id);
+  return losers;
+}
+
 function migrate(db: DatabaseSync): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS api_keys (
@@ -83,6 +111,32 @@ function migrate(db: DatabaseSync): void {
     CREATE INDEX IF NOT EXISTS idx_sites_owner ON sites(owner_key_id);
     CREATE INDEX IF NOT EXISTS idx_versions_site ON site_versions(site_id);
   `);
+  upgrade(db);
+}
+
+/**
+ * Versioned steps for databases created by an earlier schema. PRAGMA
+ * user_version records the last step applied, so each runs once.
+ */
+export function upgrade(db: DatabaseSync): void {
+  const version = (db.prepare("PRAGMA user_version").get() as { user_version: number })
+    .user_version;
+  if (version < 1) {
+    // Slugs are hostname labels now, so they are unique case-insensitively.
+    // Settle any pre-existing case-folded duplicates, then let the index
+    // enforce the rule (and serve the case-insensitive lookup).
+    const cleared = resolveCaseFoldedSlugs(db);
+    if (cleared.length > 0) {
+      console.warn(
+        `cleared ${cleared.length} slug(s) that differed from another only by case: ` +
+          cleared.map((c) => `${c.slug} (site ${c.id})`).join(", "),
+      );
+    }
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_sites_slug_nocase ON sites(slug COLLATE NOCASE);
+      PRAGMA user_version = 1;
+    `);
+  }
 
   addColumn(db, "site_versions", "pruned_at", "INTEGER");
 
@@ -241,12 +295,18 @@ export function getSite(db: DatabaseSync, id: string): SiteRow | null {
   return row ?? null;
 }
 
+/**
+ * Case-insensitive, served by idx_sites_slug_nocase: a slug is a hostname
+ * label, and a mixed-case slug stored before slugs were forced lowercase must
+ * still resolve from its lowercase hostname. The index is unique, so there is
+ * at most one match. Uniqueness checks go through here too.
+ */
 export function getSiteBySlug(db: DatabaseSync, slug: string): SiteRow | null {
   const row = db
     .prepare(
       `SELECT id, owner_key_id, slug, title, visibility, current_version_id,
               created_at, updated_at, expires_at, byte_size, file_count
-       FROM sites WHERE slug = ?`,
+       FROM sites WHERE slug = ? COLLATE NOCASE`,
     )
     .get(slug) as SiteRow | undefined;
   return row ?? null;
