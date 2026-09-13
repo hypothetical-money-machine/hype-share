@@ -1,5 +1,6 @@
 import {
   PathError,
+  isAllowedUploadPath,
   sanitizeSitePath,
   type SiteFileInput,
 } from "@shareplan/core";
@@ -39,6 +40,12 @@ export function prepareFiles(
       throw new FileError("duplicate_path", `duplicate path: ${path}`);
     }
     seen.add(path);
+    if (!isAllowedUploadPath(path)) {
+      throw new FileError(
+        "file_type_not_allowed",
+        `file type not allowed: ${path}`,
+      );
+    }
 
     let body: Buffer;
     if (input.contentBase64 !== undefined && input.contentBase64 !== null) {
@@ -76,17 +83,10 @@ export function ensureIndexHtml(files: PreparedFile[]): PreparedFile[] {
       // Rename to index.html for clean URL
       return [{ path: "index.html", body: only.body }];
     }
-    // Generate a simple index that embeds/links the asset
     const isImage = /\.(png|jpe?g|gif|webp|avif|svg)$/i.test(only.path);
-    const isVideo = /\.(mp4|webm|mov)$/i.test(only.path);
-    const isAudio = /\.(mp3|wav|ogg)$/i.test(only.path);
     let body: string;
     if (isImage) {
       body = `<!doctype html><meta charset="utf-8"><title>${escapeHtml(only.path)}</title><style>body{margin:0;background:#111;display:grid;place-items:center;min-height:100vh}img{max-width:100%;max-height:100vh}</style><img src="${escapeAttr(only.path)}" alt="">`;
-    } else if (isVideo) {
-      body = `<!doctype html><meta charset="utf-8"><title>${escapeHtml(only.path)}</title><style>body{margin:0;background:#111;display:grid;place-items:center;min-height:100vh}video{max-width:100%;max-height:100vh}</style><video src="${escapeAttr(only.path)}" controls autoplay></video>`;
-    } else if (isAudio) {
-      body = `<!doctype html><meta charset="utf-8"><title>${escapeHtml(only.path)}</title><style>body{margin:0;background:#111;display:grid;place-items:center;min-height:100vh;color:#eee;font-family:system-ui}</style><audio src="${escapeAttr(only.path)}" controls autoplay></audio>`;
     } else {
       body = `<!doctype html><meta charset="utf-8"><title>${escapeHtml(only.path)}</title><style>body{font-family:system-ui;max-width:40rem;margin:2rem auto;padding:0 1rem}</style><p><a href="${escapeAttr(only.path)}">Download ${escapeHtml(only.path)}</a></p>`;
     }

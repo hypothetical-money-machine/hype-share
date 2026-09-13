@@ -1,18 +1,20 @@
 import { describe, expect, it } from "vitest";
-import {
-  createApiKeyRecord,
-  getSiteBySlug,
-  insertSite,
-  openDb,
-  upgrade,
-} from "./db.js";
+import { createOpsKey, getSite, getSiteBySlug, insertSite, openDb, upgrade } from "./db.js";
 
 type Db = ReturnType<typeof openDb>;
 
-function site(db: Db, id: string, slug: string, created_at: number, owner: string) {
+function site(
+  db: Db,
+  id: string,
+  slug: string,
+  created_at: number,
+  ownerKeyId: string,
+  ownerUserId: string,
+) {
   insertSite(db, {
     id,
-    owner_key_id: owner,
+    owner_key_id: ownerKeyId,
+    owner_user_id: ownerUserId,
     slug,
     title: null,
     visibility: "unlisted",
@@ -35,12 +37,12 @@ function legacyDb(): Db {
 describe("upgrade", () => {
   it("keeps the oldest site's slug, clears the rest, then enforces uniqueness", () => {
     const db = legacyDb();
-    const a = createApiKeyRecord(db, { name: "a", token: "sp_a" }).id;
-    const b = createApiKeyRecord(db, { name: "b", token: "sp_b" }).id;
-    site(db, "s1", "MyPlan", 10, a);
-    site(db, "s2", "myplan", 20, b);
-    site(db, "s3", "MYPLAN", 20, b);
-    site(db, "s4", "other", 5, a);
+    const a = createOpsKey(db, { name: "a", token: "sp_a" });
+    const b = createOpsKey(db, { name: "b", token: "sp_b" });
+    site(db, "s1", "MyPlan", 10, a.key.id, a.user.id);
+    site(db, "s2", "myplan", 20, b.key.id, b.user.id);
+    site(db, "s3", "MYPLAN", 20, b.key.id, b.user.id);
+    site(db, "s4", "other", 5, a.key.id, a.user.id);
 
     upgrade(db);
 
@@ -50,14 +52,27 @@ describe("upgrade", () => {
       { id: "s2" },
       { id: "s3" },
     ]);
-    expect(() => site(db, "s5", "MYPLAN", 30, a)).toThrow(/UNIQUE/);
+    expect(() => site(db, "s5", "MYPLAN", 30, a.key.id, a.user.id)).toThrow(/UNIQUE/);
     db.close();
   });
 
   it("runs once", () => {
     const db = openDb(":memory:");
-    expect((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(1);
+    expect((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(
+      2,
+    );
     upgrade(db); // no-op, index already exists
+    db.close();
+  });
+
+  it("clears reserved slugs", () => {
+    const db = openDb(":memory:");
+    const a = createOpsKey(db, { name: "a", token: "sp_a" });
+    site(db, "s1", "www", 10, a.key.id, a.user.id);
+    db.exec("PRAGMA user_version = 1;");
+    upgrade(db);
+    expect(getSiteBySlug(db, "www")).toBeNull();
+    expect(getSite(db, "s1")?.slug).toBeNull();
     db.close();
   });
 });

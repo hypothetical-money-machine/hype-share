@@ -4,6 +4,9 @@ import { parseTtl } from "./ttl.js";
 describe("parseTtl", () => {
   it("parses units", () => {
     expect(parseTtl("7d")).toBe(7 * 86_400_000);
+    expect(parseTtl("1w")).toBe(7 * 86_400_000);
+    expect(parseTtl("1y")).toBe(365 * 86_400_000);
+    expect(parseTtl("2y")).toBe(2 * 365 * 86_400_000);
     expect(parseTtl("12h")).toBe(12 * 3_600_000);
     expect(parseTtl("30m")).toBe(30 * 60_000);
     expect(parseTtl("60s")).toBe(60_000);
@@ -14,5 +17,10 @@ describe("parseTtl", () => {
     expect(parseTtl(null)).toBeNull();
     expect(parseTtl(undefined)).toBeNull();
     expect(parseTtl("")).toBeNull();
+  });
+
+  it("rejects values that cannot become a Date", () => {
+    expect(() => parseTtl(1e20)).toThrow(/ttl/);
+    expect(() => parseTtl("1e20")).toThrow(/invalid ttl/);
   });
 });

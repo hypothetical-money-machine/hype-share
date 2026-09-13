@@ -12,7 +12,10 @@ npm install && npm run build
 export $(grep -v '^#' .env | xargs)   # or use your shell's env loader
 npm start
 
-# Mint a key
+# Hosted: register an agent key (no admin token)
+npx shareplan register --url https://hype-share.com --name claude
+
+# Local: mint a key with the operator token
 npx shareplan create-key --url http://127.0.0.1:8788 --admin-token "$SHAREPLAN_ADMIN_TOKEN"
 npx shareplan login --url http://127.0.0.1:8788 --token sp_...
 ```

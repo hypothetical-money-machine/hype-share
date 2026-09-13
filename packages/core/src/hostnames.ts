@@ -10,3 +10,14 @@ export const HOST_LABEL_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 export function isHostLabel(value: string): boolean {
   return HOST_LABEL_RE.test(value);
 }
+
+/** Labels that must stay free so they can never be claimed as a site slug. */
+export const RESERVED_HOST_LABELS = new Set([
+  "www",
+  "api",
+  "admin",
+  "docs",
+  "mail",
+  "static",
+  "cdn",
+]);

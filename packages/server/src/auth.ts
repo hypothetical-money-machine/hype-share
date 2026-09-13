@@ -1,6 +1,13 @@
 import type { FastifyRequest } from "fastify";
 import type { DatabaseSync } from "node:sqlite";
-import { findApiKeyByToken, type ApiKeyRow } from "./db.js";
+import { timingSafeEqual } from "node:crypto";
+import {
+  findApiKeyByToken,
+  getUser,
+  hashApiKey,
+  type ApiKeyRow,
+  type UserRow,
+} from "./db.js";
 
 export class AuthError extends Error {
   override readonly name = "AuthError";
@@ -32,20 +39,38 @@ export function requireApiKey(db: DatabaseSync, req: FastifyRequest): ApiKeyRow 
   return key;
 }
 
+export function requireAccount(
+  db: DatabaseSync,
+  req: FastifyRequest,
+): { key: ApiKeyRow; user: UserRow } {
+  const key = requireApiKey(db, req);
+  const user = getUser(db, key.user_id);
+  if (!user) {
+    throw new AuthError(401, "unauthorized", "invalid API key");
+  }
+  return { key, user };
+}
+
 export function requireAdmin(
-  adminToken: string | null,
+  adminTokenHash: string | null,
   req: FastifyRequest,
 ): void {
-  if (!adminToken) {
+  if (!adminTokenHash) {
     throw new AuthError(503, "admin_disabled", "admin token not configured");
   }
   const token = extractBearer(req);
-  if (!token || token !== adminToken) {
-    // Also accept X-Admin-Token
-    const header = req.headers["x-admin-token"];
-    const fromHeader = typeof header === "string" ? header : null;
-    if (fromHeader !== adminToken && token !== adminToken) {
-      throw new AuthError(401, "unauthorized", "invalid admin token");
-    }
+  const header = req.headers["x-admin-token"];
+  const fromHeader = typeof header === "string" ? header : null;
+  const bearerOk = hashedTokenEquals(token, adminTokenHash);
+  const headerOk = hashedTokenEquals(fromHeader, adminTokenHash);
+  if (!bearerOk && !headerOk) {
+    throw new AuthError(401, "unauthorized", "invalid admin token");
   }
+}
+
+function hashedTokenEquals(presented: string | null, expectedHash: string): boolean {
+  const incoming = Buffer.from(hashApiKey(presented ?? ""), "utf8");
+  const expected = Buffer.from(expectedHash, "utf8");
+  if (incoming.length !== expected.length) return false;
+  return timingSafeEqual(incoming, expected);
 }

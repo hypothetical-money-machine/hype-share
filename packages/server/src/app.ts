@@ -13,10 +13,10 @@ import {
   createSiteId,
   createVersionId,
   contentTypeForPath,
-  expiresAtFromTtl,
   HOST_LABEL_RE,
   isHostLabel,
   isHtmlPath,
+  RESERVED_HOST_LABELS,
   s3ObjectKey,
   sanitizeSitePath,
   type SiteResponse,
@@ -24,8 +24,10 @@ import {
   type Visibility,
 } from "@shareplan/core";
 import type { Config } from "./config.js";
+import { randomBytes } from "node:crypto";
 import {
   createApiKeyRecord,
+  createUser,
   deleteSite,
   getSite,
   getSiteByIdOrSlug,
@@ -35,16 +37,28 @@ import {
   isExpired,
   listApiKeys,
   listPrunableVersions,
-  listSitesForKey,
+  listSitesForUser,
   markVersionPruned,
   revokeApiKey,
+  updateSiteExpiry,
   updateSiteSlug,
   updateSiteVersion,
   type ApiKeyRow,
   type SiteRow,
+  type UserRow,
 } from "./db.js";
-import { AuthError, requireAdmin, requireApiKey } from "./auth.js";
+import { AuthError, requireAccount, requireAdmin } from "./auth.js";
 import { HttpError } from "./errors.js";
+import { hashIp, requestIp } from "./ip.js";
+import { consumeRate, DAY_MS, HOUR_MS } from "./rate-limit.js";
+import {
+  clampStoredExpiry,
+  policyFor,
+  resolveTierExpiry,
+  TtlPolicyError,
+  UnknownTierError,
+  type TierPolicy,
+} from "./tiers.js";
 import { FileError, ensureIndexHtml, prepareFiles } from "./files.js";
 import {
   deleteSiteObjects,
@@ -109,6 +123,9 @@ interface Ctx extends AppDeps {
 export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   const app = Fastify({
     logger: deps.logger ?? true,
+    // One hop: the socket peer, or the address the immediate proxy added.
+    // `true` would trust every X-Forwarded-For entry, including the client's.
+    trustProxy: deps.config.trustForwarded ? 1 : false,
     // maxSiteBytes is enforced on *decoded* bytes in prepareFiles, but binary
     // files reach us base64-encoded inside JSON — 4 characters per 3 bytes — so
     // the transport limit has to cover that inflation or it would reject
@@ -123,6 +140,16 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     if (err instanceof AuthError || err instanceof HttpError) {
       return reply.status(err.statusCode).send({
         error: { code: err.code, message: err.message },
+      });
+    }
+    if (err instanceof TtlPolicyError) {
+      return reply.status(400).send({
+        error: { code: err.code, message: err.message },
+      });
+    }
+    if (err instanceof UnknownTierError) {
+      return reply.status(400).send({
+        error: { code: "invalid_tier", message: err.message },
       });
     }
     if (err instanceof FileError) {
@@ -225,12 +252,62 @@ Response includes \`url\` like \`${siteUrl(deps.config, "<id>")}\`.
 `;
   });
 
+  app.post("/api/v1/register", async (req, reply) => {
+    const pepper = deps.config.ipHashPepper;
+    if (!pepper) {
+      throw new AuthError(
+        503,
+        "rate_limit_unconfigured",
+        "SHAREPLAN_IP_HASH_PEPPER is not set",
+      );
+    }
+    const body = createKeySchema.parse(req.body ?? {});
+    const ip = requestIp(req);
+    const ipBucket = `ip:${hashIp(ip, pepper)}`;
+    if (
+      !consumeRate(
+        deps.db,
+        ipBucket,
+        "register",
+        DAY_MS,
+        deps.config.registerPerDay,
+      )
+    ) {
+      throw new HttpError(429, "rate_limited", "too many registrations from this address");
+    }
+    const claimToken = randomBytes(16).toString("base64url");
+    const user = createUser(deps.db, {
+      tier: "free--",
+      claimToken,
+    });
+    const token = createApiKey();
+    const row = createApiKeyRecord(deps.db, {
+      name: body.name,
+      token,
+      userId: user.id,
+    });
+    return reply.status(201).send({
+      userId: user.id,
+      keyId: row.id,
+      name: row.name,
+      token,
+      tier: user.tier,
+      claimUrl: `${deps.config.publicBaseUrl}/claim/${claimToken}`,
+      createdAt: new Date(row.created_at).toISOString(),
+    });
+  });
+
   // --- Admin: mint API keys ---
   app.post("/api/v1/admin/keys", async (req, reply) => {
-    requireAdmin(deps.config.adminToken, req);
+    requireAdmin(deps.config.adminTokenHash, req);
     const body = createKeySchema.parse(req.body ?? {});
     const token = createApiKey();
-    const row = createApiKeyRecord(deps.db, { name: body.name, token });
+    const user = createUser(deps.db, { tier: "ops" });
+    const row = createApiKeyRecord(deps.db, {
+      name: body.name,
+      token,
+      userId: user.id,
+    });
     return reply.status(201).send({
       id: row.id,
       name: row.name,
@@ -240,7 +317,7 @@ Response includes \`url\` like \`${siteUrl(deps.config, "<id>")}\`.
   });
 
   app.get("/api/v1/admin/keys", async (req, reply) => {
-    requireAdmin(deps.config.adminToken, req);
+    requireAdmin(deps.config.adminTokenHash, req);
     const keys = listApiKeys(deps.db).map((k) => ({
       id: k.id,
       name: k.name,
@@ -251,7 +328,7 @@ Response includes \`url\` like \`${siteUrl(deps.config, "<id>")}\`.
   });
 
   app.delete("/api/v1/admin/keys/:id", async (req, reply) => {
-    requireAdmin(deps.config.adminToken, req);
+    requireAdmin(deps.config.adminTokenHash, req);
     const { id } = req.params as { id: string };
     if (!revokeApiKey(deps.db, id)) {
       return reply.status(404).send({
@@ -263,38 +340,71 @@ Response includes \`url\` like \`${siteUrl(deps.config, "<id>")}\`.
 
   // --- Sites API ---
   app.post("/api/v1/sites", async (req, reply) => {
-    const key = requireApiKey(deps.db, req);
+    const { key, user } = requireAccount(deps.db, req);
     const body = createSiteSchema.parse(req.body);
-    const site = await publishNewSite(ctx, key, body);
+    assertTierPublish(user, body);
+    consumePublishQuota(ctx, req, user);
+    const site = await publishNewSite(ctx, key, user, body);
     return reply.status(201).send(site);
   });
 
   app.put("/api/v1/sites/:id", async (req, reply) => {
-    const key = requireApiKey(deps.db, req);
+    const { key, user } = requireAccount(deps.db, req);
     const { id } = req.params as { id: string };
     const body = updateSiteSchema.parse(req.body);
     const existing = getSite(deps.db, id);
-    if (!existing || existing.owner_key_id !== key.id) {
+    if (!existing || existing.owner_user_id !== user.id) {
       return reply.status(404).send({
         error: { code: "not_found", message: "site not found" },
       });
     }
-    const site = await publishVersion(ctx, existing, body);
+    assertTierPublish(user, body);
+    consumePublishQuota(ctx, req, user);
+    const site = await publishVersion(ctx, existing, user, body);
     return reply.send(site);
   });
 
+  app.post("/api/v1/sites/:id/touch", async (req, reply) => {
+    const { user } = requireAccount(deps.db, req);
+    const { id } = req.params as { id: string };
+    const existing = getSite(deps.db, id);
+    if (!existing || existing.owner_user_id !== user.id) {
+      return reply.status(404).send({
+        error: { code: "not_found", message: "site not found" },
+      });
+    }
+    if (isExpired(existing)) {
+      throw new HttpError(410, "site_expired", "site expired");
+    }
+    consumePublishQuota(ctx, req, user);
+    const policy = policyForUser(user, ctx.config);
+    const now = Date.now();
+    let expiresAt: number | null;
+    if (existing.expires_at === null && policy.allowNullTtl) {
+      expiresAt = null;
+    } else if (policy.maxTtl === null) {
+      expiresAt = existing.expires_at;
+    } else {
+      expiresAt = resolveTierExpiry(policy, policy.maxTtl, now, "explicit");
+    }
+    updateSiteExpiry(deps.db, id, expiresAt, now);
+    applyStoredTierLimits(deps.db, existing, policy);
+    const row = getSite(deps.db, id)!;
+    return reply.send(toSiteResponse(deps.config, row));
+  });
+
   app.get("/api/v1/sites", async (req, reply) => {
-    const key = requireApiKey(deps.db, req);
-    const rows = listSitesForKey(deps.db, key.id);
+    const { user } = requireAccount(deps.db, req);
+    const rows = listSitesForUser(deps.db, user.id);
     const items: SiteListItem[] = rows.map((r) => toListItem(deps.config, r));
     return reply.send({ sites: items });
   });
 
   app.get("/api/v1/sites/:id", async (req, reply) => {
-    const key = requireApiKey(deps.db, req);
+    const { user } = requireAccount(deps.db, req);
     const { id } = req.params as { id: string };
     const row = getSite(deps.db, id);
-    if (!row || row.owner_key_id !== key.id) {
+    if (!row || row.owner_user_id !== user.id) {
       return reply.status(404).send({
         error: { code: "not_found", message: "site not found" },
       });
@@ -303,10 +413,10 @@ Response includes \`url\` like \`${siteUrl(deps.config, "<id>")}\`.
   });
 
   app.delete("/api/v1/sites/:id", async (req, reply) => {
-    const key = requireApiKey(deps.db, req);
+    const { user } = requireAccount(deps.db, req);
     const { id } = req.params as { id: string };
     const row = getSite(deps.db, id);
-    if (!row || row.owner_key_id !== key.id) {
+    if (!row || row.owner_user_id !== user.id) {
       return reply.status(404).send({
         error: { code: "not_found", message: "site not found" },
       });
@@ -336,10 +446,11 @@ Response includes \`url\` like \`${siteUrl(deps.config, "<id>")}\`.
         });
         return reply;
       }
-      if (RESERVED_LABELS.has(label)) {
+      if (RESERVED_HOST_LABELS.has(label)) {
         // Never a site (slugs cannot claim these), so send www and friends
         // to the same path on the API host rather than 404 them as missing
-        // sites. req.url always starts with "/", so the base stays in charge.
+        // sites. Fastify gives a path-form url here; Node already 400s
+        // authority-form targets.
         await reply.redirect(`${deps.config.publicBaseUrl}${req.url}`, 302);
         return reply;
       }
@@ -417,14 +528,76 @@ export function siteLabelFromHost(host: string, suffix: string): string | null {
   return isHostLabel(label) ? label : null;
 }
 
-/** Labels that must stay free so they can never be claimed as a slug. */
-const RESERVED_LABELS = new Set(["www", "api", "admin", "docs", "mail", "static", "cdn"]);
+function policyForUser(user: UserRow, config: Config): TierPolicy {
+  const policy = policyFor(user.tier);
+  if (user.tier === "ops" && config.defaultTtl) {
+    return { ...policy, defaultTtl: config.defaultTtl };
+  }
+  return policy;
+}
+
+function consumePublishQuota(ctx: Ctx, req: FastifyRequest, user: UserRow): void {
+  const policy = policyForUser(user, ctx.config);
+  if (policy.ipPublishLimit) {
+    const pepper = ctx.config.ipHashPepper;
+    if (!pepper) {
+      throw new AuthError(
+        503,
+        "rate_limit_unconfigured",
+        "SHAREPLAN_IP_HASH_PEPPER is not set",
+      );
+    }
+    const ip = requestIp(req);
+    const ipBucket = `ip:${hashIp(ip, pepper)}`;
+    if (!consumeRate(ctx.db, ipBucket, "publish", HOUR_MS, policy.publishPerHour)) {
+      throw new HttpError(429, "rate_limited", "too many publishes from this address");
+    }
+  }
+  const userBucket = `user:${user.id}`;
+  if (!consumeRate(ctx.db, userBucket, "publish", HOUR_MS, policy.publishPerHour)) {
+    throw new HttpError(429, "rate_limited", "too many publishes");
+  }
+}
+
+function assertTierPublish(
+  user: UserRow,
+  body: { slug?: string; visibility?: Visibility },
+): void {
+  const policy = policyFor(user.tier);
+  if (body.slug !== undefined && !policy.slugs) {
+    throw new HttpError(400, "slug_not_allowed", "this tier cannot set a vanity slug");
+  }
+  if (body.visibility === "public" && !policy.publicVisibility) {
+    throw new HttpError(
+      400,
+      "visibility_not_allowed",
+      "this tier cannot list sites as public",
+    );
+  }
+}
+
+/** Drop stored slug/public that the current tier is not allowed to keep. */
+function applyStoredTierLimits(
+  db: Ctx["db"],
+  existing: SiteRow,
+  policy: TierPolicy,
+): void {
+  if (!policy.slugs && existing.slug !== null) {
+    updateSiteSlug(db, existing.id, null);
+  }
+  if (!policy.publicVisibility && existing.visibility === "public") {
+    db.prepare(`UPDATE sites SET visibility = 'unlisted' WHERE id = ?`).run(existing.id);
+  }
+}
 
 async function publishNewSite(
   ctx: Ctx,
   key: ApiKeyRow,
+  user: UserRow,
   body: z.infer<typeof createSiteSchema>,
 ): Promise<SiteResponse> {
+  assertTierPublish(user, body);
+  const policy = policyForUser(user, ctx.config);
   let files = prepareFiles(body.files, ctx.config);
   files = ensureIndexHtml(files);
 
@@ -432,10 +605,7 @@ async function publishNewSite(
   const versionId = createVersionId();
   const now = Date.now();
   const visibility: Visibility = body.visibility ?? "unlisted";
-  const expires_at = resolveTtl(
-    body.ttl !== undefined ? body.ttl : ctx.config.defaultTtl,
-    now,
-  );
+  const expires_at = resolveTierExpiry(policy, body.ttl, now, "create");
 
   if (body.slug !== undefined) {
     assertSlugAvailable(ctx, body.slug);
@@ -449,6 +619,7 @@ async function publishNewSite(
   insertSite(ctx.db, {
     id: siteId,
     owner_key_id: key.id,
+    owner_user_id: user.id,
     slug: body.slug ?? null,
     title: body.title ?? null,
     visibility,
@@ -475,23 +646,23 @@ async function publishNewSite(
 async function publishVersion(
   ctx: Ctx,
   existing: SiteRow,
+  user: UserRow,
   body: z.infer<typeof updateSiteSchema>,
 ): Promise<SiteResponse> {
+  assertTierPublish(user, body);
+  const policy = policyForUser(user, ctx.config);
   let files = prepareFiles(body.files, ctx.config);
   files = ensureIndexHtml(files);
 
   const versionId = createVersionId();
   const now = Date.now();
 
-  // An explicit ttl always wins (including `null` to clear it). Otherwise keep
-  // whatever expiry the site already had, and only fall back to the server
-  // default for a site that has never had one.
-  let expires_at = existing.expires_at;
-  if (body.ttl !== undefined) {
-    expires_at = resolveTtl(body.ttl, now);
-  } else if (existing.expires_at === null) {
-    expires_at = resolveTtl(ctx.config.defaultTtl, now);
-  }
+  // An explicit ttl always wins (including `null` to clear it, if the tier
+  // allows). Otherwise keep the stored expiry if this tier still allows it.
+  const expires_at =
+    body.ttl !== undefined
+      ? resolveTierExpiry(policy, body.ttl, now, "explicit")
+      : clampStoredExpiry(policy, existing.expires_at, now);
 
   // Checked up front so a taken slug fails before we upload anything, but only
   // written once the upload lands — a failed publish must not move the slug.
@@ -500,10 +671,14 @@ async function publishVersion(
   if (newSlug !== null) {
     assertSlugAvailable(ctx, newSlug, existing.id);
   }
+  const dropSlug = !policy.slugs && existing.slug !== null;
 
   const byte_size = files.reduce((n, f) => n + f.body.byteLength, 0);
   const file_count = files.length;
-  const visibility = body.visibility ?? existing.visibility;
+  let visibility = body.visibility ?? existing.visibility;
+  if (visibility === "public" && !policy.publicVisibility) {
+    visibility = "unlisted";
+  }
 
   await putSiteFiles(ctx.s3, ctx.config.s3.bucket, existing.id, versionId, files);
 
@@ -519,6 +694,8 @@ async function publishVersion(
       throw err;
     }
     updateSiteSlug(ctx.db, existing.id, newSlug);
+  } else if (dropSlug) {
+    updateSiteSlug(ctx.db, existing.id, null);
   }
   updateSiteVersion(ctx.db, existing.id, {
     current_version_id: versionId,
@@ -544,17 +721,6 @@ async function publishVersion(
   return toSiteResponse(ctx.config, row);
 }
 
-function resolveTtl(
-  ttl: string | number | null | undefined,
-  now: number,
-): number | null {
-  try {
-    return expiresAtFromTtl(ttl, now);
-  } catch (e) {
-    throw new FileError("invalid_ttl", e instanceof Error ? e.message : "invalid ttl");
-  }
-}
-
 /**
  * Slugs share a namespace with site ids, so both must be free. A slug is also
  * a DNS label under hostname serving, so reserved labels stay off limits in
@@ -562,7 +728,7 @@ function resolveTtl(
  * moment a suffix was configured.
  */
 function assertSlugAvailable(ctx: Ctx, slug: string, exceptSiteId?: string): void {
-  if (RESERVED_LABELS.has(slug)) {
+  if (RESERVED_HOST_LABELS.has(slug)) {
     throw new HttpError(409, "slug_taken", `slug "${slug}" is reserved`);
   }
   const bySlug = getSiteBySlug(ctx.db, slug);
@@ -674,8 +840,8 @@ async function serveSitePath(
   if (site.visibility === "private") {
     // Require API key of owner for private sites (v1 simple)
     try {
-      const key = requireApiKey(ctx.db, req);
-      if (key.id !== site.owner_key_id) {
+      const { user } = requireAccount(ctx.db, req);
+      if (user.id !== site.owner_user_id) {
         await reply.status(404).send({ error: { code: "not_found", message: "site not found" } });
         return;
       }
@@ -742,6 +908,11 @@ async function serveSitePath(
         "form-action 'self'",
       ].join("; "),
     );
+  } else if (ct.startsWith("image/svg") || path.toLowerCase().endsWith(".svg")) {
+    reply.header(
+      "Content-Security-Policy",
+      "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; sandbox",
+    );
   }
 
   await reply.send(obj.body);
@@ -772,7 +943,7 @@ function siteUrlShape(config: Config): string {
 function toSiteResponse(config: Config, row: SiteRow): SiteResponse {
   return {
     id: row.id,
-    url: siteUrl(config, row.id),
+    url: siteUrl(config, row.slug ?? row.id),
     versionId: row.current_version_id ?? "",
     title: row.title,
     slug: row.slug,
@@ -788,7 +959,7 @@ function toSiteResponse(config: Config, row: SiteRow): SiteResponse {
 function toListItem(config: Config, row: SiteRow): SiteListItem {
   return {
     id: row.id,
-    url: siteUrl(config, row.id),
+    url: siteUrl(config, row.slug ?? row.id),
     title: row.title,
     slug: row.slug,
     visibility: row.visibility,

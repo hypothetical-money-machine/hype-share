@@ -10,7 +10,9 @@ import {
   getSite,
   listKeys,
   listSites,
+  registerAccount,
   revokeKey,
+  touchSite,
   updateSite,
 } from "./api.js";
 import { collectDirectory, collectSingleFile } from "./bundle.js";
@@ -25,6 +27,25 @@ program
   .name("shareplan")
   .description("Publish small HTML sites and media to shareplan")
   .version("0.1.0");
+
+program
+  .command("register")
+  .description("Create a free-- agent account and save the token")
+  .requiredOption("--url <url>", "shareplan base URL")
+  .option("--name <name>", "key name", "default")
+  .action(async (opts: { url: string; name: string }) => {
+    const url = opts.url.replace(/\/$/, "");
+    try {
+      const created = await registerAccount(url, opts.name);
+      saveCliConfig({ url, token: created.token });
+      console.log(created.token);
+      console.error(`id=${created.keyId} user=${created.userId} tier=${created.tier}`);
+      console.error(`claim=${created.claimUrl}`);
+      console.error("Save this token; it will not be shown again.");
+    } catch (e) {
+      fail(e);
+    }
+  });
 
 program
   .command("login")
@@ -118,6 +139,21 @@ program
     try {
       const site = await getSite(cfg, id);
       console.log(JSON.stringify(site, null, 2));
+    } catch (e) {
+      fail(e);
+    }
+  });
+
+program
+  .command("touch")
+  .description("Reset a site's TTL to this tier's maximum")
+  .argument("<id>", "site id")
+  .action(async (id: string) => {
+    const cfg = requireConfig();
+    try {
+      const site = await touchSite(cfg, id);
+      console.log(site.url);
+      console.error(`id=${site.id} expires=${site.expiresAt ?? "never"}`);
     } catch (e) {
       fail(e);
     }

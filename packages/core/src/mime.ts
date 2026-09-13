@@ -32,12 +32,44 @@ const EXT_MAP: Record<string, string> = {
   zip: "application/zip",
 };
 
-export function contentTypeForPath(path: string): string {
+const ALLOWED_UPLOAD_EXTS = new Set([
+  "html",
+  "htm",
+  "css",
+  "js",
+  "mjs",
+  "json",
+  "txt",
+  "md",
+  "png",
+  "jpg",
+  "jpeg",
+  "gif",
+  "webp",
+  "avif",
+  "svg",
+  "ico",
+  "woff",
+  "woff2",
+]);
+
+function extensionOf(path: string): string | null {
   const base = path.split("/").pop() ?? path;
   const dot = base.lastIndexOf(".");
-  if (dot < 0) return "application/octet-stream";
+  if (dot < 0) return null;
   const ext = base.slice(dot + 1).toLowerCase();
+  return ext.length > 0 ? ext : null;
+}
+
+export function contentTypeForPath(path: string): string {
+  const ext = extensionOf(path);
+  if (!ext) return "application/octet-stream";
   return EXT_MAP[ext] ?? "application/octet-stream";
+}
+
+export function isAllowedUploadPath(path: string): boolean {
+  const ext = extensionOf(path);
+  return ext !== null && ALLOWED_UPLOAD_EXTS.has(ext);
 }
 
 export function isHtmlPath(path: string): boolean {
