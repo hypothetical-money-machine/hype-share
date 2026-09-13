@@ -338,11 +338,19 @@ Response includes \`url\` like \`${siteUrl(deps.config, "<id>")}\`.
       }
       if (RESERVED_LABELS.has(label)) {
         // Never a site (slugs cannot claim these), so send www and friends
-        // to the API host rather than 404 them as missing sites.
-        await reply.redirect(deps.config.publicBaseUrl, 302);
+        // to the same path on the API host rather than 404 them as missing
+        // sites. req.url always starts with "/", so the base stays in charge.
+        await reply.redirect(`${deps.config.publicBaseUrl}${req.url}`, 302);
         return reply;
       }
-      await serveSitePath(ctx, req, reply, label, splitQuery(req.url).path);
+      // No route matched here, so nothing has percent-decoded the path yet;
+      // the /s/:id/* route got that from find-my-way for free.
+      const relPath = decodePath(splitQuery(req.url).path);
+      if (relPath === null) {
+        await reply.status(400).send({ error: { code: "invalid_path", message: "invalid path" } });
+        return reply;
+      }
+      await serveSitePath(ctx, req, reply, label, relPath);
       return reply;
     });
   }
@@ -352,14 +360,17 @@ Response includes \`url\` like \`${siteUrl(deps.config, "<id>")}\`.
   // the shared one. Temporary redirect, since the layout is config, not a
   // fact about the site. Three registrations because find-my-way does not
   // fold the bare, trailing-slash, and splat forms into one route.
-  const legacy = async (req: FastifyRequest, reply: FastifyReply) => {
+  const legacy = async (req: FastifyRequest, reply: FastifyReply, bare: boolean) => {
     const params = req.params as { id: string; "*"?: string };
-    const rest = params["*"] ?? "";
+    // Params arrive decoded, so anything that goes back into a URL is
+    // re-encoded per segment rather than pasted in as text.
+    const rest = (params["*"] ?? "").split("/").map(encodeURIComponent).join("/");
+    const { query } = splitQuery(req.url);
     if (suffix === null) {
-      if (!req.url.startsWith(`/s/${params.id}/`)) {
-        return reply.redirect(`/s/${encodeURIComponent(params.id)}/`, 302);
+      if (bare) {
+        return reply.redirect(`/s/${encodeURIComponent(params.id)}/${query}`, 302);
       }
-      return serveSitePath(ctx, req, reply, params.id, rest);
+      return serveSitePath(ctx, req, reply, params.id, params["*"] ?? "");
     }
     // The id lands in the Location hostname, so it must be a clean label:
     // anything else (a dot, an encoded "#" or "/") would let a crafted link
@@ -368,11 +379,11 @@ Response includes \`url\` like \`${siteUrl(deps.config, "<id>")}\`.
     if (!isHostLabel(label)) {
       return reply.status(404).send({ error: { code: "not_found", message: "site not found" } });
     }
-    return reply.redirect(`${siteUrl(deps.config, label)}${rest}${splitQuery(req.url).query}`, 302);
+    return reply.redirect(`${siteUrl(deps.config, label)}${rest}${query}`, 302);
   };
-  app.get("/s/:id", legacy);
-  app.get("/s/:id/", legacy);
-  app.get("/s/:id/*", legacy);
+  app.get("/s/:id", (req, reply) => legacy(req, reply, true));
+  app.get("/s/:id/", (req, reply) => legacy(req, reply, false));
+  app.get("/s/:id/*", (req, reply) => legacy(req, reply, false));
 
   return app;
 }
@@ -381,6 +392,15 @@ Response includes \`url\` like \`${siteUrl(deps.config, "<id>")}\`.
 function splitQuery(url: string): { path: string; query: string } {
   const q = url.indexOf("?");
   return q === -1 ? { path: url, query: "" } : { path: url.slice(0, q), query: url.slice(q) };
+}
+
+/** A raw request path percent-decoded, or null if the encoding is broken. */
+function decodePath(path: string): string | null {
+  try {
+    return decodeURIComponent(path);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -688,7 +708,9 @@ async function serveSitePath(
       if (await getObject(ctx.s3, ctx.config.s3.bucket, idxKey)) {
         const { path: reqPath, query } = splitQuery(req.url);
         setSiteHeaders(reply, site);
-        await reply.redirect(`${reqPath}/${query}`, 302);
+        // Collapse leading slashes so "//host" can never become a
+        // scheme-relative Location; the redirect stays on this origin.
+        await reply.redirect(`${reqPath.replace(/^\/+/, "/")}/${query}`, 302);
         return;
       }
     }
