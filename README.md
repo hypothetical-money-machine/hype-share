@@ -48,6 +48,28 @@ mkdir -p /tmp/demo && echo '<!doctype html><h1>hello shareplan</h1>' > /tmp/demo
 npx shareplan publish /tmp/demo --title "demo" --ttl 7d
 ```
 
+## Docker Compose deployment
+
+The standalone [compose.prod.yaml](compose.prod.yaml) runs the API and MinIO
+on a Docker host, with named volumes for metadata and uploaded files.
+
+```bash
+cp .env.prod.example .env.prod
+# Set your public URL and replace both secret placeholders in .env.prod.
+docker compose --env-file .env.prod -f compose.prod.yaml up -d --build
+```
+
+Set `SHAREPLAN_PUBLIC_BASE_URL` to the URL clients will use. The API binds to
+`127.0.0.1:8788` on the host; configure your reverse proxy to forward that public
+URL to it and provide HTTPS. MinIO is reachable only within the Compose network.
+Set `SHAREPLAN_SITE_HOST_SUFFIX` to your site domain and configure wildcard DNS
+and a matching TLS certificate. Forward both the API host and site hosts to the
+API, preserving the original `Host` header.
+You can also supply the variables through your deployment manager's environment.
+
+Keep `.env.prod` private. Use the same Compose project name when upgrading so
+the deployment reuses its existing volumes.
+
 ## Packages
 
 | Package | Role |

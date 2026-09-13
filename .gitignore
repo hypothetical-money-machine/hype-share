@@ -2,7 +2,9 @@ node_modules/
 dist/
 data/
 .env
-.env.local
+.env.*
+!.env.example
+!.env.*.example
 *.log
 .DS_Store
 coverage/

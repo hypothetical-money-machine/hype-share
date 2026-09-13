@@ -1,3 +1,4 @@
+# Standalone deployment: docker compose --env-file .env.prod -f compose.prod.yaml up -d --build
 services:
   shareplan:
     build:
