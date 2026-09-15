@@ -9,7 +9,7 @@
     "packages/*"
   ],
   "engines": {
-    "node": ">=22"
+    "node": ">=22.11.0"
   },
   "scripts": {
     "build": "npm run build -w @shareplan/core && npm run build -w @shareplan/server && npm run build -w @shareplan/cli",

@@ -44,7 +44,7 @@ npx shareplan publish /tmp/demo --title "demo" --ttl 7d
 On `hype-share.com`, agents and humans follow a tiered account model. All publishing uses `Authorization: Bearer sp_...`.
 
 - **Agents (`free--`)**: Call `POST /api/v1/register` or run `shareplan register`. No human credentials required. Receives an API key and a `claimUrl`. Rate limits use an HMAC hash of the client IP (10 registrations/day; 120 publishes or touches per hour).
-- **Claiming an account**: Opening the `claimUrl` in a browser lets a human link an email (`free-`) or GitHub/Google login (`free`) through WorkOS AuthKit. The user row is upgraded in place and the agent's API key keeps working.
+- **Claiming an account**: Opening the `claimUrl` shows what will happen before sign-in starts. After the human confirms, WorkOS AuthKit links an email (`free-`) or GitHub/Google login (`free`). The user row is upgraded in place and the agent's API key keeps working.
 - **Donations and paid**: `unlock` and `paid` tiers extend TTL and rate limits. `paid` is the only tier that can set permanent hosting (`"ttl": null`).
 - **Slugs and visibility**: Vanity slugs and public directory listings require `free` tier or higher. `free--` sites are unlisted and use random site IDs (`xk9f2m.hype-share.com`).
 - **Upload rules**: Allowed files are HTML and page assets (`html`, `htm`, `css`, `js`, `mjs`, `json`, `map`, `txt`, `md`, `png`, `jpg`, `jpeg`, `gif`, `webp`, `avif`, `svg`, `ico`, `woff`, `woff2`). Max 50 MiB and 200 files per site. Video, audio, pdf, zip, and wasm are rejected.
@@ -238,6 +238,9 @@ Response (`201`):
 | Method | Path | Auth | Purpose |
 |--------|------|------|---------|
 | `POST` | `/api/v1/register` | None | Register a `free--` account and mint an API key |
+| `GET` | `/claim/:token` | Claim token | Confirm an agent account claim |
+| `POST` | `/claim/:token` | Claim token + browser cookie | Start WorkOS AuthKit |
+| `GET` | `/v1/auth/workos/callback` | WorkOS code | Complete an account claim |
 | `POST` | `/api/v1/sites` | Bearer token | Create a new site |
 | `PUT` | `/api/v1/sites/:id` | Bearer token | Publish a new version of an existing site |
 | `POST` | `/api/v1/sites/:id/touch` | Bearer token | Reset TTL to tier maximum (site owner only) |
@@ -271,6 +274,12 @@ For self-hosted instances. See [`.env.example`](.env.example) and [`.env.prod.ex
 | `SHAREPLAN_DEFAULT_TTL` | Default TTL for operator keys when unset |
 | `SHAREPLAN_VERSION_RETENTION` | Versions kept in storage, default 2 |
 | `SHAREPLAN_REAP_INTERVAL_SEC` | Expired-site sweep interval in seconds, default 300 (`0` disables) |
+| `WORKOS_API_KEY` | WorkOS secret API key; required with the other WorkOS settings to enable claiming |
+| `WORKOS_CLIENT_ID` | WorkOS AuthKit client ID |
+| `WORKOS_REDIRECT_URI` | Exact AuthKit callback URL: `<SHAREPLAN_PUBLIC_BASE_URL>/v1/auth/workos/callback` |
+
+Configure AuthKit to offer email codes, GitHub, and Google. The server rejects other
+authentication methods and asks the user to reopen the original claim link.
 
 ### Storage lifecycle
 
@@ -294,6 +303,7 @@ than orphaning files.
 - Without a suffix, all sites share one origin under `/s/:id/`, so a script in
   one site can reach another. Suitable for local dev, not for public hosting.
 - API keys are stored as SHA-256 hashes only. IP rate limits use HMAC-SHA256 with `SHAREPLAN_IP_HASH_PEPPER`.
+- Claim tokens, OAuth state, and the browser nonce are stored as SHA-256 hashes. The callback must return in the browser that confirmed the claim. A successful claim consumes the token and all pending flows for that account.
 - Zip/tar upload is not supported in v0.1 (JSON + directory CLI only).
 
 ## Packages

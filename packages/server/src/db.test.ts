@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { createOpsKey, getSite, getSiteBySlug, insertSite, openDb, upgrade } from "./db.js";
+import {
+  createOpsKey,
+  createUser,
+  getSite,
+  getSiteBySlug,
+  insertSite,
+  openDb,
+  upgrade,
+} from "./db.js";
 
 type Db = ReturnType<typeof openDb>;
 
@@ -59,7 +67,7 @@ describe("upgrade", () => {
   it("runs once", () => {
     const db = openDb(":memory:");
     expect((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(
-      2,
+      3,
     );
     upgrade(db); // no-op, index already exists
     db.close();
@@ -73,6 +81,29 @@ describe("upgrade", () => {
     upgrade(db);
     expect(getSiteBySlug(db, "www")).toBeNull();
     expect(getSite(db, "s1")?.slug).toBeNull();
+    db.close();
+  });
+
+  it("replaces the old email index with case-insensitive uniqueness", () => {
+    const db = openDb(":memory:");
+    db.exec(`
+      DROP INDEX idx_users_email;
+      CREATE UNIQUE INDEX idx_users_email ON users(email) WHERE email IS NOT NULL;
+      PRAGMA user_version = 2;
+    `);
+    const first = createUser(db, { tier: "free" });
+    const second = createUser(db, { tier: "free" });
+    db.prepare(`UPDATE users SET email = ? WHERE id = ?`).run("Human@Example.com", first.id);
+
+    upgrade(db);
+
+    const index = db
+      .prepare(`SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_users_email'`)
+      .get() as { sql: string };
+    expect(index.sql).toContain("email COLLATE NOCASE");
+    expect(() =>
+      db.prepare(`UPDATE users SET email = ? WHERE id = ?`).run("human@example.com", second.id),
+    ).toThrow(/UNIQUE/);
     db.close();
   });
 });

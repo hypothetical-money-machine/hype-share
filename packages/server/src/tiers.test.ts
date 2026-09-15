@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   clampStoredExpiry,
+  higherTier,
   policyFor,
   resolveTierExpiry,
+  tierForAuthenticationMethod,
   TtlPolicyError,
 } from "./tiers.js";
 
@@ -35,6 +37,30 @@ describe("resolveTierExpiry", () => {
 describe("policyFor", () => {
   it("rejects unknown tiers", () => {
     expect(() => policyFor("gold")).toThrow(/unknown tier/);
+  });
+});
+
+describe("higherTier", () => {
+  it("raises email accounts after social login", () => {
+    expect(higherTier("free-", "free")).toBe("free");
+  });
+
+  it("does not lower paid or operator accounts", () => {
+    expect(higherTier("paid", "free")).toBe("paid");
+    expect(higherTier("ops", "free")).toBe("ops");
+  });
+});
+
+describe("tierForAuthenticationMethod", () => {
+  it("maps email codes below approved social logins", () => {
+    expect(tierForAuthenticationMethod("MagicAuth")).toBe("free-");
+    expect(tierForAuthenticationMethod("GitHubOAuth")).toBe("free");
+    expect(tierForAuthenticationMethod("GoogleOAuth")).toBe("free");
+  });
+
+  it("rejects login methods outside the account policy", () => {
+    expect(tierForAuthenticationMethod("Password")).toBeNull();
+    expect(tierForAuthenticationMethod(undefined)).toBeNull();
   });
 });
 

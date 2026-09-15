@@ -10,7 +10,7 @@ Publish stays `Authorization: Bearer sp_...` on every tier. WorkOS AuthKit is th
 - [x] **Slice 2 (Agent registration and limits)**: `POST /api/v1/register`, IP HMAC rate limits, per-tier default and max TTL on create/update.
 - [x] **Slice 3 (Keep-alive)**: `POST /api/v1/sites/:id/touch` resets TTL to tier maximum.
 - [x] **Slice 4 (Upload allowlist)**: HTML and page assets allowlist (`ALLOWED_UPLOAD_EXTS`); video, audio, pdf, zip, and wasm rejected.
-- [ ] **Slice 5 (AuthKit on the apex)**: email code → `free-`, GitHub/Google → `free`, claim URL upgrades a `free--` user in place.
+- [ ] **Slice 5 (AuthKit on the apex)**: claim URL upgrades are implemented (email code → `free-`, GitHub/Google → `free`); standalone human login and browser sessions remain.
 - [ ] **Slice 6 (Billing)**: Stripe (or Sponsors) webhooks for `unlock` and `paid`.
 
 ## Architecture

@@ -1,7 +1,8 @@
 import { DatabaseSync } from "node:sqlite";
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { RESERVED_HOST_LABELS, type Visibility } from "@shareplan/core";
-import type { Tier } from "./tiers.js";
+import { RATE_LIMIT_WINDOWS, type RateLimitAction } from "./rate-limit.js";
+import { higherTier, type Tier } from "./tiers.js";
 
 export interface UserRow {
   id: string;
@@ -21,6 +22,23 @@ export interface ApiKeyRow {
   key_hash: string;
   created_at: number;
   revoked_at: number | null;
+}
+
+export interface ClaimAuthFlowRow {
+  state_hash: string;
+  browser_nonce_hash: string;
+  user_id: string;
+  code_verifier: string;
+  created_at: number;
+  expires_at: number;
+}
+
+export class ClaimStateError extends Error {
+  override readonly name = "ClaimStateError";
+}
+
+export class ClaimIdentityConflictError extends Error {
+  override readonly name = "ClaimIdentityConflictError";
 }
 
 export interface SiteRow {
@@ -101,15 +119,26 @@ function clearReservedSlugs(db: DatabaseSync): void {
 }
 
 export function pruneRateLimits(db: DatabaseSync, now = Date.now()): number {
-  const hourStart = Math.floor(now / 3_600_000) * 3_600_000;
-  const dayStart = Math.floor(now / 86_400_000) * 86_400_000;
-  const pub = db
-    .prepare(`DELETE FROM rate_limits WHERE action = 'publish' AND window_start < ?`)
-    .run(hourStart);
-  const reg = db
-    .prepare(`DELETE FROM rate_limits WHERE action = 'register' AND window_start < ?`)
-    .run(dayStart);
-  return Number(pub.changes ?? 0) + Number(reg.changes ?? 0);
+  const remove = db.prepare(
+    `DELETE FROM rate_limits WHERE action = ? AND window_start < ?`,
+  );
+  let removed = 0;
+  for (const [action, windowMs] of Object.entries(RATE_LIMIT_WINDOWS) as [
+    RateLimitAction,
+    number,
+  ][]) {
+    const windowStart = Math.floor(now / windowMs) * windowMs;
+    const result = remove.run(action, windowStart);
+    removed += Number(result.changes ?? 0);
+  }
+  return removed;
+}
+
+export function pruneClaimAuthFlows(db: DatabaseSync, now = Date.now()): number {
+  const result = db
+    .prepare(`DELETE FROM claim_auth_flows WHERE expires_at <= ?`)
+    .run(now);
+  return Number(result.changes ?? 0);
 }
 
 function migrate(db: DatabaseSync): void {
@@ -178,8 +207,8 @@ export function upgrade(db: DatabaseSync): void {
   if (version < 2) {
     clearReservedSlugs(db);
     db.exec("PRAGMA user_version = 2;");
+    version = 2;
   }
-
   addColumn(db, "site_versions", "pruned_at", "INTEGER");
 
   db.exec(`
@@ -193,9 +222,6 @@ export function upgrade(db: DatabaseSync): void {
       created_at INTEGER NOT NULL,
       claimed_at INTEGER
     );
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email
-      ON users(email) WHERE email IS NOT NULL;
-
     CREATE TABLE IF NOT EXISTS rate_limits (
       bucket TEXT NOT NULL,
       action TEXT NOT NULL,
@@ -203,7 +229,20 @@ export function upgrade(db: DatabaseSync): void {
       count INTEGER NOT NULL,
       PRIMARY KEY (bucket, action, window_start)
     );
+
+    CREATE TABLE IF NOT EXISTS claim_auth_flows (
+      state_hash TEXT PRIMARY KEY,
+      browser_nonce_hash TEXT NOT NULL,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      code_verifier TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_claim_auth_flows_expires
+      ON claim_auth_flows(expires_at);
   `);
+
+  addColumn(db, "claim_auth_flows", "browser_nonce_hash", "TEXT");
 
   addColumn(db, "api_keys", "user_id", "TEXT REFERENCES users(id)");
   addColumn(db, "sites", "owner_user_id", "TEXT REFERENCES users(id)");
@@ -215,6 +254,14 @@ export function upgrade(db: DatabaseSync): void {
      CREATE INDEX IF NOT EXISTS idx_sites_owner_user ON sites(owner_user_id);
      CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id);`,
   );
+  if (version < 3) {
+    db.exec(`
+      DROP INDEX IF EXISTS idx_users_email;
+      CREATE UNIQUE INDEX idx_users_email
+        ON users(email COLLATE NOCASE) WHERE email IS NOT NULL;
+      PRAGMA user_version = 3;
+    `);
+  }
 }
 
 /** Existing keys become operator users so self-host and Zima keep working. */
@@ -300,6 +347,173 @@ export function getUser(db: DatabaseSync, id: string): UserRow | null {
   return row ?? null;
 }
 
+export function findUserByClaimToken(db: DatabaseSync, token: string): UserRow | null {
+  const claimTokenHash = hashApiKey(token);
+  const row = db
+    .prepare(
+      `SELECT ${USER_COLS} FROM users
+       WHERE claim_token_hash = ? AND claimed_at IS NULL`,
+    )
+    .get(claimTokenHash) as UserRow | undefined;
+  return row ?? null;
+}
+
+export function createClaimAuthFlow(
+  db: DatabaseSync,
+  opts: {
+    state: string;
+    browserNonce: string;
+    userId: string;
+    codeVerifier: string;
+    now?: number;
+    ttlMs?: number;
+  },
+): void {
+  const createdAt = opts.now ?? Date.now();
+  const expiresAt = createdAt + (opts.ttlMs ?? 10 * 60_000);
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    pruneClaimAuthFlows(db, createdAt);
+    db.prepare(`DELETE FROM claim_auth_flows WHERE user_id = ?`).run(opts.userId);
+    db.prepare(
+      `INSERT INTO claim_auth_flows
+         (state_hash, browser_nonce_hash, user_id, code_verifier, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(
+      hashApiKey(opts.state),
+      hashApiKey(opts.browserNonce),
+      opts.userId,
+      opts.codeVerifier,
+      createdAt,
+      expiresAt,
+    );
+    db.exec("COMMIT");
+  } catch (err) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // already closed / no transaction
+    }
+    throw err;
+  }
+}
+
+export function getClaimAuthFlow(
+  db: DatabaseSync,
+  state: string,
+  browserNonce: string,
+  now = Date.now(),
+): ClaimAuthFlowRow | null {
+  const row = db
+    .prepare(
+      `SELECT state_hash, browser_nonce_hash, user_id, code_verifier, created_at, expires_at
+       FROM claim_auth_flows
+       WHERE state_hash = ? AND browser_nonce_hash = ? AND expires_at > ?`,
+    )
+    .get(hashApiKey(state), hashApiKey(browserNonce), now) as ClaimAuthFlowRow | undefined;
+  return row ?? null;
+}
+
+export function deleteClaimAuthFlow(
+  db: DatabaseSync,
+  state: string,
+  browserNonce: string,
+): boolean {
+  const result = db
+    .prepare(
+      `DELETE FROM claim_auth_flows
+       WHERE state_hash = ? AND browser_nonce_hash = ?`,
+    )
+    .run(hashApiKey(state), hashApiKey(browserNonce));
+  return Number(result.changes ?? 0) > 0;
+}
+
+export function completeClaim(
+  db: DatabaseSync,
+  opts: {
+    state: string;
+    browserNonce: string;
+    workosUserId: string;
+    email: string;
+    authenticatedTier: "free-" | "free";
+    now?: number;
+  },
+): UserRow {
+  const now = opts.now ?? Date.now();
+  const stateHash = hashApiKey(opts.state);
+  const browserNonceHash = hashApiKey(opts.browserNonce);
+  const email = opts.email.trim().toLowerCase();
+  let updated: UserRow;
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const flow = db
+      .prepare(
+        `SELECT state_hash, browser_nonce_hash, user_id, code_verifier, created_at, expires_at
+         FROM claim_auth_flows
+         WHERE state_hash = ? AND browser_nonce_hash = ? AND expires_at > ?`,
+      )
+      .get(stateHash, browserNonceHash, now) as ClaimAuthFlowRow | undefined;
+    if (!flow) throw new ClaimStateError("claim flow is missing or expired");
+
+    const target = getUser(db, flow.user_id);
+    if (!target || target.claimed_at !== null || target.claim_token_hash === null) {
+      throw new ClaimStateError("claim link has already been used");
+    }
+
+    const conflict = db
+      .prepare(
+        `SELECT id FROM users
+         WHERE id <> ?
+           AND (workos_user_id = ? OR email = ? COLLATE NOCASE)
+         LIMIT 1`,
+      )
+      .get(target.id, opts.workosUserId, email) as { id: string } | undefined;
+    if (conflict) {
+      throw new ClaimIdentityConflictError("this login belongs to another account");
+    }
+
+    const tier = higherTier(target.tier, opts.authenticatedTier);
+    const changed = db
+      .prepare(
+        `UPDATE users
+         SET tier = ?, email = ?, workos_user_id = ?,
+             claim_token_hash = NULL, claimed_at = ?
+         WHERE id = ? AND claim_token_hash IS NOT NULL AND claimed_at IS NULL`,
+      )
+      .run(tier, email, opts.workosUserId, now, target.id);
+    if ((changed.changes ?? 0) !== 1) {
+      throw new ClaimStateError("claim link has already been used");
+    }
+    updated = {
+      ...target,
+      tier,
+      email,
+      workos_user_id: opts.workosUserId,
+      claim_token_hash: null,
+      claimed_at: now,
+    };
+    db.prepare(`DELETE FROM claim_auth_flows WHERE user_id = ?`).run(target.id);
+    db.exec("COMMIT");
+  } catch (err) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // already closed / no transaction
+    }
+    if (
+      err instanceof ClaimStateError ||
+      err instanceof ClaimIdentityConflictError
+    ) {
+      throw err;
+    }
+    if (err instanceof Error && /UNIQUE constraint failed/.test(err.message)) {
+      throw new ClaimIdentityConflictError("this login belongs to another account");
+    }
+    throw err;
+  }
+  return updated;
+}
+
 export function setUserTier(db: DatabaseSync, id: string, tier: Tier): void {
   db.prepare(`UPDATE users SET tier = ? WHERE id = ?`).run(tier, id);
 }
@@ -343,11 +557,7 @@ export function findApiKeyByToken(db: DatabaseSync, token: string): ApiKeyRow | 
        FROM api_keys WHERE key_hash = ? AND revoked_at IS NULL`,
     )
     .get(key_hash) as ApiKeyRow | undefined;
-  if (!row) return null;
-  const a = Buffer.from(row.key_hash, "utf8");
-  const b = Buffer.from(key_hash, "utf8");
-  if (a.length !== b.length || !timingSafeEqual(a, b)) return null;
-  return row;
+  return row ?? null;
 }
 
 export function listApiKeys(db: DatabaseSync): ApiKeyRow[] {
