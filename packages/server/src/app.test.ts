@@ -1491,9 +1491,9 @@ describe("account claiming", () => {
     ).toBe(true);
   });
 
-  it("does not accept a valid state from another browser", async () => {
+  it("requires state and browser nonce without clearing an unrelated flow", async () => {
     const workos = createFakeWorkOS();
-    const { app } = await setup({ workos: WORKOS_CONFIG }, workos.client);
+    const { app, db } = await setup({ workos: WORKOS_CONFIG }, workos.client);
     const created = (await register(app)).json<{ claimUrl: string }>();
     const { callbackCookie } = await beginClaim(
       app,
@@ -1509,9 +1509,23 @@ describe("account claiming", () => {
       url: "/v1/auth/workos/callback?code=auth_code&state=state_1",
       headers: { cookie: "shareplan_claim_callback=wrong" },
     });
+    const unrelated = await inject(app, {
+      method: "GET",
+      url: "/v1/auth/workos/callback?code=auth_code&state=made_up",
+      headers: { cookie: callbackCookie },
+    });
 
     expect(missing.statusCode).toBe(400);
     expect(wrong.statusCode).toBe(400);
+    expect(unrelated.statusCode).toBe(400);
+    expect(
+      setCookieHeaders(unrelated).some((value) =>
+        value.startsWith("shareplan_claim_callback=;"),
+      ),
+    ).toBe(false);
+    expect(db.prepare(`SELECT count(*) AS count FROM claim_auth_flows`).get()).toEqual({
+      count: 1,
+    });
     expect(workos.authenticationCalls).toHaveLength(0);
 
     const original = await inject(app, {

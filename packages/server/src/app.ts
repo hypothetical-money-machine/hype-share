@@ -484,8 +484,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     { logLevel: "silent" },
     async (req, reply) => {
       const browserNonce = req.cookies[claimCookieName(deps.config, CLAIM_CALLBACK_COOKIE)];
-      clearClaimCallbackCookie(reply, deps.config);
       if (!workos || !deps.config.workos) {
+        clearClaimCallbackCookie(reply, deps.config);
         return authPage(
           reply,
           503,
@@ -500,7 +500,9 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
           typeof browserNonce === "string" &&
           BROWSER_NONCE_RE.test(browserNonce)
         ) {
-          deleteClaimAuthFlow(deps.db, query.state, browserNonce);
+          if (deleteClaimAuthFlow(deps.db, query.state, browserNonce)) {
+            clearClaimCallbackCookie(reply, deps.config);
+          }
         }
         return authPage(
           reply,
@@ -519,6 +521,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       }
       const flow = getClaimAuthFlow(deps.db, query.state, browserNonce);
       if (!flow) return invalidClaimAttemptPage(reply);
+      clearClaimCallbackCookie(reply, deps.config);
 
       let authentication: Awaited<
         ReturnType<WorkOSAuthClient["userManagement"]["authenticateWithCode"]>
