@@ -7,6 +7,8 @@ import Fastify, {
 } from "fastify";
 import type { DatabaseSync } from "node:sqlite";
 import type { S3Client } from "@aws-sdk/client-s3";
+import fastifyCookie from "@fastify/cookie";
+import { createWorkOS } from "@workos-inc/node";
 import { z } from "zod";
 import {
   createApiKey,
@@ -19,19 +21,28 @@ import {
   RESERVED_HOST_LABELS,
   s3ObjectKey,
   sanitizeSitePath,
+  siteLabelFromHost,
   type SiteResponse,
   type SiteListItem,
   type Visibility,
 } from "@shareplan/core";
-import type { Config } from "./config.js";
+import { WORKOS_CALLBACK_PATH, type Config } from "./config.js";
 import { randomBytes } from "node:crypto";
 import {
   createApiKeyRecord,
+  createClaimAuthFlow,
   createUser,
+  ClaimIdentityConflictError,
+  ClaimStateError,
+  completeClaim,
+  deleteClaimAuthFlow,
   deleteSite,
+  findUserByClaimToken,
+  getClaimAuthFlow,
   getSite,
   getSiteByIdOrSlug,
   getSiteBySlug,
+  hashApiKey,
   insertSite,
   insertVersion,
   isExpired,
@@ -50,11 +61,12 @@ import {
 import { AuthError, requireAccount, requireAdmin } from "./auth.js";
 import { HttpError } from "./errors.js";
 import { hashIp, requestIp } from "./ip.js";
-import { consumeRate, DAY_MS, HOUR_MS } from "./rate-limit.js";
+import { consumeRate } from "./rate-limit.js";
 import {
   clampStoredExpiry,
   policyFor,
   resolveTierExpiry,
+  tierForAuthenticationMethod,
   TtlPolicyError,
   UnknownTierError,
   type TierPolicy,
@@ -95,6 +107,14 @@ const createKeySchema = z.object({
   name: z.string().min(1).max(100).default("default"),
 });
 
+const CLAIM_TOKEN_RE = /^[A-Za-z0-9_-]{22}$/;
+const BROWSER_NONCE_RE = /^[A-Za-z0-9_-]{43}$/;
+const CLAIM_CONFIRM_COOKIE = "shareplan_claim_confirm";
+const CLAIM_CALLBACK_COOKIE = "shareplan_claim_callback";
+const CLAIM_CONFIRM_MAX_AGE_SECONDS = 5 * 60;
+const CLAIM_CALLBACK_MAX_AGE_SECONDS = 10 * 60;
+const CLAIM_STARTS_PER_HOUR = 10;
+
 /**
  * Fastify's transport errors carry a usable status and a safe message, but
  * their codes are FST_ERR_*; map the ones a client can actually trigger onto
@@ -113,6 +133,29 @@ export interface AppDeps {
   s3: S3Client;
   /** Fastify options passthrough, mainly so tests can silence the logger. */
   logger?: boolean;
+  /** Test override for the two WorkOS methods used by account claiming. */
+  workos?: WorkOSAuthClient;
+}
+
+export interface WorkOSAuthClient {
+  userManagement: {
+    getAuthorizationUrlWithPKCE(options: {
+      clientId: string;
+      provider: "authkit";
+      redirectUri: string;
+      screenHint: "sign-up";
+    }): Promise<{ url: string; state: string; codeVerifier: string }>;
+    authenticateWithCode(options: {
+      clientId: string;
+      code: string;
+      codeVerifier: string;
+      ipAddress: string;
+      userAgent?: string;
+    }): Promise<{
+      user: { id: string; email: string; emailVerified: boolean };
+      authenticationMethod?: string;
+    }>;
+  };
 }
 
 /** AppDeps plus the app logger, so helpers can report background failures. */
@@ -135,6 +178,30 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   });
 
   const ctx: Ctx = { ...deps, log: app.log };
+  const workos = deps.workos ?? createWorkOSAuthClient(deps.config);
+
+  app.register(fastifyCookie);
+  app.addContentTypeParser(
+    "application/x-www-form-urlencoded",
+    { parseAs: "string" },
+    (req, body, done) => {
+      const isClaimConfirmation =
+        req.method === "POST" &&
+        /^\/claim\/[A-Za-z0-9_-]{22}$/.test(splitQuery(req.url).path) &&
+        body === "";
+      if (isClaimConfirmation) {
+        done(null, {});
+        return;
+      }
+      done(
+        new HttpError(
+          415,
+          "unsupported_media_type",
+          "Unsupported Media Type: application/x-www-form-urlencoded",
+        ),
+      );
+    },
+  );
 
   app.setErrorHandler((err: FastifyError, _req, reply) => {
     if (err instanceof AuthError || err instanceof HttpError) {
@@ -293,7 +360,6 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
         deps.db,
         ipBucket,
         "register",
-        DAY_MS,
         deps.config.registerPerDay,
       )
     ) {
@@ -320,6 +386,207 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       createdAt: new Date(row.created_at).toISOString(),
     });
   });
+
+  app.get(
+    "/claim/:token",
+    { logLevel: "silent", exposeHeadRoute: false },
+    async (req, reply) => {
+      if (!workos || !deps.config.workos) {
+        return authPage(
+          reply,
+          503,
+          "Claiming unavailable",
+          "Account claiming is not configured on this server.",
+        );
+      }
+      const { token } = req.params as { token: string };
+      if (!CLAIM_TOKEN_RE.test(token)) {
+        return invalidClaimPage(reply);
+      }
+      const user = findUserByClaimToken(deps.db, token);
+      if (!user) return invalidClaimPage(reply);
+
+      setClaimConfirmationCookie(reply, deps.config, hashApiKey(token));
+      return claimConfirmationPage(reply);
+    },
+  );
+
+  app.post(
+    "/claim/:token",
+    { logLevel: "silent" },
+    async (req, reply) => {
+      const confirmation = req.cookies[claimCookieName(deps.config, CLAIM_CONFIRM_COOKIE)];
+      clearClaimConfirmationCookie(reply, deps.config);
+      if (!workos || !deps.config.workos) {
+        return authPage(
+          reply,
+          503,
+          "Claiming unavailable",
+          "Account claiming is not configured on this server.",
+        );
+      }
+      const { token } = req.params as { token: string };
+      if (!CLAIM_TOKEN_RE.test(token)) {
+        return invalidClaimPage(reply);
+      }
+      const user = findUserByClaimToken(deps.db, token);
+      if (!user) return invalidClaimPage(reply);
+
+      if (confirmation !== hashApiKey(token)) {
+        return authPage(
+          reply,
+          400,
+          "Confirmation expired",
+          "Open the claim link and confirm again before signing in.",
+        );
+      }
+      if (!consumeRate(deps.db, `user:${user.id}`, "claim", CLAIM_STARTS_PER_HOUR)) {
+        return authPage(
+          reply,
+          429,
+          "Too many sign-in attempts",
+          "Wait before opening the claim link and trying again.",
+        );
+      }
+
+      try {
+        const authorization = await workos.userManagement.getAuthorizationUrlWithPKCE({
+          clientId: deps.config.workos.clientId,
+          provider: "authkit",
+          redirectUri: deps.config.workos.redirectUri,
+          screenHint: "sign-up",
+        });
+        const browserNonce = randomBytes(32).toString("base64url");
+        createClaimAuthFlow(deps.db, {
+          state: authorization.state,
+          browserNonce,
+          userId: user.id,
+          codeVerifier: authorization.codeVerifier,
+        });
+        setClaimCallbackCookie(reply, deps.config, browserNonce);
+        reply.header("Cache-Control", "no-store");
+        reply.header("Referrer-Policy", "no-referrer");
+        return reply.redirect(authorization.url, 302);
+      } catch (err) {
+        app.log.error({ err }, "could not start WorkOS account claim");
+        return authPage(
+          reply,
+          502,
+          "Sign-in unavailable",
+          "WorkOS could not start sign-in. Open the claim link and try again.",
+        );
+      }
+    },
+  );
+
+  app.get(
+    WORKOS_CALLBACK_PATH,
+    { logLevel: "silent" },
+    async (req, reply) => {
+      const browserNonce = req.cookies[claimCookieName(deps.config, CLAIM_CALLBACK_COOKIE)];
+      if (!workos || !deps.config.workos) {
+        clearClaimCallbackCookie(reply, deps.config);
+        return authPage(
+          reply,
+          503,
+          "Claiming unavailable",
+          "Account claiming is not configured on this server.",
+        );
+      }
+      const query = req.query as Record<string, unknown>;
+      if (typeof query.error === "string") {
+        if (
+          typeof query.state === "string" &&
+          typeof browserNonce === "string" &&
+          BROWSER_NONCE_RE.test(browserNonce)
+        ) {
+          if (deleteClaimAuthFlow(deps.db, query.state, browserNonce)) {
+            clearClaimCallbackCookie(reply, deps.config);
+          }
+        }
+        return authPage(
+          reply,
+          400,
+          "Sign-in cancelled",
+          "Open the claim link again when you are ready to retry.",
+        );
+      }
+      if (
+        typeof query.code !== "string" ||
+        typeof query.state !== "string" ||
+        typeof browserNonce !== "string" ||
+        !BROWSER_NONCE_RE.test(browserNonce)
+      ) {
+        return invalidClaimAttemptPage(reply);
+      }
+      const flow = getClaimAuthFlow(deps.db, query.state, browserNonce);
+      if (!flow) return invalidClaimAttemptPage(reply);
+      clearClaimCallbackCookie(reply, deps.config);
+
+      let authentication: Awaited<
+        ReturnType<WorkOSAuthClient["userManagement"]["authenticateWithCode"]>
+      >;
+      try {
+        authentication = await workos.userManagement.authenticateWithCode({
+          clientId: deps.config.workos.clientId,
+          code: query.code,
+          codeVerifier: flow.code_verifier,
+          ipAddress: requestIp(req),
+          userAgent: req.headers["user-agent"],
+        });
+      } catch (err) {
+        deleteClaimAuthFlow(deps.db, query.state, browserNonce);
+        app.log.error({ err }, "WorkOS account claim failed");
+        return authPage(
+          reply,
+          502,
+          "Sign-in failed",
+          "WorkOS could not complete sign-in. Open the claim link and try again.",
+        );
+      }
+
+      const authenticatedTier = tierForAuthenticationMethod(
+        authentication.authenticationMethod,
+      );
+      if (!authenticatedTier || !authentication.user.emailVerified) {
+        deleteClaimAuthFlow(deps.db, query.state, browserNonce);
+        return authPage(
+          reply,
+          403,
+          "Login method not supported",
+          "Use an email code, GitHub, or Google to claim this account.",
+        );
+      }
+
+      try {
+        const user = completeClaim(deps.db, {
+          state: query.state,
+          browserNonce,
+          workosUserId: authentication.user.id,
+          email: authentication.user.email,
+          authenticatedTier,
+        });
+        return authPage(
+          reply,
+          200,
+          "Account claimed",
+          `The agent's existing API key now has ${user.tier} limits.`,
+        );
+      } catch (err) {
+        deleteClaimAuthFlow(deps.db, query.state, browserNonce);
+        if (err instanceof ClaimStateError) return invalidClaimAttemptPage(reply);
+        if (err instanceof ClaimIdentityConflictError) {
+          return authPage(
+            reply,
+            409,
+            "Account already exists",
+            "That login belongs to another account, so this agent account was not changed.",
+          );
+        }
+        throw err;
+      }
+    },
+  );
 
   // --- Admin: mint API keys ---
   app.post("/api/v1/admin/keys", async (req, reply) => {
@@ -366,9 +633,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   app.post("/api/v1/sites", async (req, reply) => {
     const { key, user } = requireAccount(deps.db, req);
     const body = createSiteSchema.parse(req.body);
-    assertTierPublish(user, body);
-    consumePublishQuota(ctx, req, user);
-    const site = await publishNewSite(ctx, key, user, body);
+    const site = await publishNewSite(ctx, key, user, body, req);
     return reply.status(201).send(site);
   });
 
@@ -382,9 +647,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
         error: { code: "not_found", message: "site not found" },
       });
     }
-    assertTierPublish(user, body);
-    consumePublishQuota(ctx, req, user);
-    const site = await publishVersion(ctx, existing, user, body);
+    const site = await publishVersion(ctx, existing, user, body, req);
     return reply.send(site);
   });
 
@@ -523,6 +786,174 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   return app;
 }
 
+function createWorkOSAuthClient(config: Config): WorkOSAuthClient | null {
+  if (!config.workos) return null;
+  const client = createWorkOS({
+    apiKey: config.workos.apiKey,
+    clientId: config.workos.clientId,
+  });
+  return {
+    userManagement: {
+      getAuthorizationUrlWithPKCE: (options) =>
+        client.userManagement.getAuthorizationUrlWithPKCE(options),
+      authenticateWithCode: async (options) => {
+        const result = await client.userManagement.authenticateWithCode(options);
+        return {
+          user: {
+            id: result.user.id,
+            email: result.user.email,
+            emailVerified: result.user.emailVerified,
+          },
+          authenticationMethod: result.authenticationMethod,
+        };
+      },
+    },
+  };
+}
+
+function invalidClaimPage(reply: FastifyReply): FastifyReply {
+  return authPage(
+    reply,
+    404,
+    "Claim link not found",
+    "This claim link is invalid or has already been used.",
+  );
+}
+
+function invalidClaimAttemptPage(reply: FastifyReply): FastifyReply {
+  return authPage(
+    reply,
+    400,
+    "Sign-in expired",
+    "This sign-in attempt is invalid or expired. Open the claim link again.",
+  );
+}
+
+function authPage(
+  reply: FastifyReply,
+  statusCode: number,
+  title: string,
+  message: string,
+): FastifyReply {
+  setAuthPageHeaders(reply, false);
+  reply.type("text/html; charset=utf-8");
+  return reply.status(statusCode).send(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapeHtml(title)} · shareplan</title>
+  <style>
+    :root { color-scheme: dark light; font-family: ui-sans-serif, system-ui, sans-serif; }
+    body { max-width: 34rem; margin: 5rem auto; padding: 0 1.25rem; line-height: 1.5; }
+    h1 { font-size: 1.5rem; }
+  </style>
+</head>
+<body>
+  <h1>${escapeHtml(title)}</h1>
+  <p>${escapeHtml(message)}</p>
+</body>
+</html>`);
+}
+
+function claimConfirmationPage(reply: FastifyReply): FastifyReply {
+  setAuthPageHeaders(reply, true);
+  reply.type("text/html; charset=utf-8");
+  return reply.status(200).send(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Claim this agent account · shareplan</title>
+  <style>
+    :root { color-scheme: dark light; font-family: ui-sans-serif, system-ui, sans-serif; }
+    body { max-width: 34rem; margin: 5rem auto; padding: 0 1.25rem; line-height: 1.5; }
+    h1 { font-size: 1.5rem; }
+    button { font: inherit; padding: 0.65rem 1rem; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h1>Claim this agent account?</h1>
+  <p>Signing in links your verified identity to this agent account and raises its limits.</p>
+  <p>The agent's existing API key will keep access. Continue only if you intended to claim this account and trust whoever gave you the link.</p>
+  <form method="post"><button type="submit">Continue to sign in</button></form>
+</body>
+</html>`);
+}
+
+function setAuthPageHeaders(reply: FastifyReply, allowForm: boolean): void {
+  reply.header("Cache-Control", "no-store");
+  reply.header("Referrer-Policy", "no-referrer");
+  reply.header("X-Content-Type-Options", "nosniff");
+  reply.header("X-Robots-Tag", "noindex, nofollow");
+  reply.header(
+    "Content-Security-Policy",
+    `default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action ${allowForm ? "'self'" : "'none'"}; frame-ancestors 'none'`,
+  );
+}
+
+function claimCookieName(config: Config, name: string): string {
+  return new URL(config.publicBaseUrl).protocol === "https:" ? `__Host-${name}` : name;
+}
+
+function claimCookiesAreSecure(config: Config): boolean {
+  return new URL(config.publicBaseUrl).protocol === "https:";
+}
+
+function setClaimConfirmationCookie(
+  reply: FastifyReply,
+  config: Config,
+  tokenHash: string,
+): void {
+  reply.setCookie(claimCookieName(config, CLAIM_CONFIRM_COOKIE), tokenHash, {
+    httpOnly: true,
+    sameSite: "strict",
+    secure: claimCookiesAreSecure(config),
+    path: "/",
+    maxAge: CLAIM_CONFIRM_MAX_AGE_SECONDS,
+  });
+}
+
+function clearClaimConfirmationCookie(reply: FastifyReply, config: Config): void {
+  reply.clearCookie(claimCookieName(config, CLAIM_CONFIRM_COOKIE), {
+    httpOnly: true,
+    sameSite: "strict",
+    secure: claimCookiesAreSecure(config),
+    path: "/",
+  });
+}
+
+function setClaimCallbackCookie(
+  reply: FastifyReply,
+  config: Config,
+  browserNonce: string,
+): void {
+  reply.setCookie(claimCookieName(config, CLAIM_CALLBACK_COOKIE), browserNonce, {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: claimCookiesAreSecure(config),
+    path: "/",
+    maxAge: CLAIM_CALLBACK_MAX_AGE_SECONDS,
+  });
+}
+
+function clearClaimCallbackCookie(reply: FastifyReply, config: Config): void {
+  reply.clearCookie(claimCookieName(config, CLAIM_CALLBACK_COOKIE), {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: claimCookiesAreSecure(config),
+    path: "/",
+  });
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
 /** Request URL split at the "?", with the query keeping its "?" (or ""). */
 function splitQuery(url: string): { path: string; query: string } {
   const q = url.indexOf("?");
@@ -536,20 +967,6 @@ function decodePath(path: string): string | null {
   } catch {
     return null;
   }
-}
-
-/**
- * The subdomain label of a site host, lowercased, or null if the host is not
- * `<one-label>.<suffix>`. Works from the raw Host header, so it drops the
- * port and a trailing dot first: `site.example.com.:443` is the same host as
- * `site.example.com`, and treating it as anything else would let a request
- * on a site's own name reach the API.
- */
-export function siteLabelFromHost(host: string, suffix: string): string | null {
-  const name = host.trim().toLowerCase().replace(/:\d+$/, "").replace(/\.$/, "");
-  if (!name.endsWith(`.${suffix}`)) return null;
-  const label = name.slice(0, -(suffix.length + 1));
-  return isHostLabel(label) ? label : null;
 }
 
 function policyForUser(user: UserRow, config: Config): TierPolicy {
@@ -573,12 +990,12 @@ function consumePublishQuota(ctx: Ctx, req: FastifyRequest, user: UserRow): void
     }
     const ip = requestIp(req);
     const ipBucket = `ip:${hashIp(ip, pepper)}`;
-    if (!consumeRate(ctx.db, ipBucket, "publish", HOUR_MS, policy.publishPerHour)) {
+    if (!consumeRate(ctx.db, ipBucket, "publish", policy.publishPerHour)) {
       throw new HttpError(429, "rate_limited", "too many publishes from this address");
     }
   }
   const userBucket = `user:${user.id}`;
-  if (!consumeRate(ctx.db, userBucket, "publish", HOUR_MS, policy.publishPerHour)) {
+  if (!consumeRate(ctx.db, userBucket, "publish", policy.publishPerHour)) {
     throw new HttpError(429, "rate_limited", "too many publishes");
   }
 }
@@ -619,8 +1036,10 @@ async function publishNewSite(
   key: ApiKeyRow,
   user: UserRow,
   body: z.infer<typeof createSiteSchema>,
+  req: FastifyRequest,
 ): Promise<SiteResponse> {
   assertTierPublish(user, body);
+  consumePublishQuota(ctx, req, user);
   const policy = policyForUser(user, ctx.config);
   let files = prepareFiles(body.files, ctx.config);
   files = ensureIndexHtml(files);
@@ -672,8 +1091,10 @@ async function publishVersion(
   existing: SiteRow,
   user: UserRow,
   body: z.infer<typeof updateSiteSchema>,
+  req: FastifyRequest,
 ): Promise<SiteResponse> {
   assertTierPublish(user, body);
+  consumePublishQuota(ctx, req, user);
   const policy = policyForUser(user, ctx.config);
   let files = prepareFiles(body.files, ctx.config);
   files = ensureIndexHtml(files);

@@ -89,12 +89,12 @@ Response (`201`):
 
 ```json
 {
-  "userId": "usr_k89x2",
-  "keyId": "key_p42m1",
+  "userId": "8f14e45fceea167a",
+  "keyId": "c9f0f895fb98ab91",
   "name": "claude",
   "token": "sp_9f2m...",
   "tier": "free--",
-  "claimUrl": "https://hype-share.com/claim/c_...",
+  "claimUrl": "https://hype-share.com/claim/AbCdEfGhIjKlMnOpQrStUv",
   "createdAt": "2026-09-13T22:00:00.000Z"
 }
 ```

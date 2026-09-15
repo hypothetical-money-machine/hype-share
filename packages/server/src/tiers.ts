@@ -71,6 +71,29 @@ export const TIER_POLICIES: Record<Tier, TierPolicy> = {
   },
 };
 
+const TIER_RANK: Record<Tier, number> = {
+  "free--": 0,
+  "free-": 1,
+  free: 2,
+  unlock: 3,
+  paid: 4,
+  ops: 5,
+};
+
+/** Return the stronger tier so a successful login never lowers an account. */
+export function higherTier(current: Tier, authenticated: Tier): Tier {
+  return TIER_RANK[current] >= TIER_RANK[authenticated] ? current : authenticated;
+}
+
+/** AuthKit methods accepted for a human account claim. */
+export function tierForAuthenticationMethod(
+  method: string | undefined,
+): "free-" | "free" | null {
+  if (method === "MagicAuth") return "free-";
+  if (method === "GitHubOAuth" || method === "GoogleOAuth") return "free";
+  return null;
+}
+
 export function isTier(value: string): value is Tier {
   return Object.hasOwn(TIER_POLICIES, value);
 }

@@ -1,7 +1,12 @@
 import type { DatabaseSync } from "node:sqlite";
 import type { S3Client } from "@aws-sdk/client-s3";
 import type { Config } from "./config.js";
-import { deleteSite, listExpiredSites, pruneRateLimits } from "./db.js";
+import {
+  deleteSite,
+  listExpiredSites,
+  pruneClaimAuthFlows,
+  pruneRateLimits,
+} from "./db.js";
 import { deleteSiteObjects } from "./storage.js";
 
 export interface Logger {
@@ -28,6 +33,7 @@ export async function reapExpiredSites(
   now = Date.now(),
 ): Promise<{ sites: number; objects: number }> {
   pruneRateLimits(deps.db, now);
+  pruneClaimAuthFlows(deps.db, now);
   const expired = listExpiredSites(deps.db, now);
   let sites = 0;
   let objects = 0;
