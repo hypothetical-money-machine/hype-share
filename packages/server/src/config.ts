@@ -1,7 +1,9 @@
 import { mkdirSync } from "node:fs";
 import path from "node:path";
-import { isHostLabel } from "@shareplan/core";
+import { isHostLabel, siteLabelFromHost } from "@shareplan/core";
 import { hashApiKey } from "./db.js";
+
+export const WORKOS_CALLBACK_PATH = "/v1/auth/workos/callback";
 
 export interface Config {
   host: string;
@@ -38,6 +40,14 @@ export interface Config {
   versionRetention: number;
   /** How often to sweep expired sites, in ms. 0 disables the sweeper. */
   reapIntervalMs: number;
+  /** WorkOS AuthKit settings. Null keeps human account claiming disabled. */
+  workos: WorkOSConfig | null;
+}
+
+export interface WorkOSConfig {
+  apiKey: string;
+  clientId: string;
+  redirectUri: string;
 }
 
 export function loadConfig(envSource: NodeJS.ProcessEnv = process.env): Config {
@@ -72,7 +82,16 @@ export function loadConfig(envSource: NodeJS.ProcessEnv = process.env): Config {
   );
 
   const siteHostSuffix = normalizeSiteHostSuffix(env("SHAREPLAN_SITE_HOST_SUFFIX"));
+  assertPublicBaseUrlIsApiHost(publicBaseUrl, siteHostSuffix);
   const adminToken = env("SHAREPLAN_ADMIN_TOKEN") ?? null;
+  const workos = normalizeWorkOSConfig(
+    {
+      apiKey: env("WORKOS_API_KEY"),
+      clientId: env("WORKOS_CLIENT_ID"),
+      redirectUri: env("WORKOS_REDIRECT_URI"),
+    },
+    publicBaseUrl,
+  );
 
   const accessKeyId = env("SHAREPLAN_S3_ACCESS_KEY", env("AWS_ACCESS_KEY_ID", "minioadmin"))!;
   const secretAccessKey = env(
@@ -104,7 +123,68 @@ export function loadConfig(envSource: NodeJS.ProcessEnv = process.env): Config {
     registerPerDay: Math.max(1, envInt("SHAREPLAN_REGISTER_PER_DAY", 10)),
     versionRetention: Math.max(1, envInt("SHAREPLAN_VERSION_RETENTION", 2)),
     reapIntervalMs: Math.max(0, envInt("SHAREPLAN_REAP_INTERVAL_SEC", 300)) * 1000,
+    workos,
   };
+}
+
+export function normalizeWorkOSConfig(
+  values: {
+    apiKey?: string;
+    clientId?: string;
+    redirectUri?: string;
+  },
+  publicBaseUrl: string,
+): WorkOSConfig | null {
+  const configured = [values.apiKey, values.clientId, values.redirectUri].filter(Boolean).length;
+  if (configured === 0) return null;
+  if (configured !== 3) {
+    throw new Error(
+      "WORKOS_API_KEY, WORKOS_CLIENT_ID, and WORKOS_REDIRECT_URI must all be set",
+    );
+  }
+
+  let redirect: URL;
+  let publicBase: URL;
+  try {
+    redirect = new URL(values.redirectUri!);
+    publicBase = new URL(publicBaseUrl);
+  } catch {
+    throw new Error("WORKOS_REDIRECT_URI and SHAREPLAN_PUBLIC_BASE_URL must be absolute URLs");
+  }
+  if (!/^https?:$/.test(redirect.protocol) || redirect.origin !== publicBase.origin) {
+    throw new Error("WORKOS_REDIRECT_URI must use the SHAREPLAN_PUBLIC_BASE_URL origin");
+  }
+  if (
+    redirect.pathname !== WORKOS_CALLBACK_PATH ||
+    redirect.search !== "" ||
+    redirect.hash !== ""
+  ) {
+    throw new Error(`WORKOS_REDIRECT_URI must use the exact path ${WORKOS_CALLBACK_PATH}`);
+  }
+
+  return {
+    apiKey: values.apiKey!,
+    clientId: values.clientId!,
+    redirectUri: values.redirectUri!,
+  };
+}
+
+export function assertPublicBaseUrlIsApiHost(
+  publicBaseUrl: string,
+  siteHostSuffix: string | null,
+): void {
+  if (siteHostSuffix === null) return;
+  let publicBase: URL;
+  try {
+    publicBase = new URL(publicBaseUrl);
+  } catch {
+    throw new Error("SHAREPLAN_PUBLIC_BASE_URL must be an absolute URL");
+  }
+  if (siteLabelFromHost(publicBase.host, siteHostSuffix) !== null) {
+    throw new Error(
+      "SHAREPLAN_PUBLIC_BASE_URL cannot be a site host under SHAREPLAN_SITE_HOST_SUFFIX",
+    );
+  }
 }
 
 /**

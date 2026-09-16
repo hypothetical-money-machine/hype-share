@@ -11,6 +11,17 @@ export function isHostLabel(value: string): boolean {
   return HOST_LABEL_RE.test(value);
 }
 
+/**
+ * Return the single label before a configured suffix. Raw Host headers may
+ * include a port or trailing dot, so normalize those before matching.
+ */
+export function siteLabelFromHost(host: string, suffix: string): string | null {
+  const name = host.trim().toLowerCase().replace(/:\d+$/, "").replace(/\.$/, "");
+  if (!name.endsWith(`.${suffix}`)) return null;
+  const label = name.slice(0, -(suffix.length + 1));
+  return isHostLabel(label) ? label : null;
+}
+
 /** Labels that must stay free so they can never be claimed as a site slug. */
 export const RESERVED_HOST_LABELS = new Set([
   "www",

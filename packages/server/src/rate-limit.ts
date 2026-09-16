@@ -3,15 +3,23 @@ import type { DatabaseSync } from "node:sqlite";
 export const HOUR_MS = 3_600_000;
 export const DAY_MS = 86_400_000;
 
+export const RATE_LIMIT_WINDOWS = {
+  publish: HOUR_MS,
+  register: DAY_MS,
+  claim: HOUR_MS,
+} as const;
+
+export type RateLimitAction = keyof typeof RATE_LIMIT_WINDOWS;
+
 /** True if the caller is still inside the limit after consuming one. */
 export function consumeRate(
   db: DatabaseSync,
   bucket: string,
-  action: string,
-  windowMs: number,
+  action: RateLimitAction,
   limit: number,
   now = Date.now(),
 ): boolean {
+  const windowMs = RATE_LIMIT_WINDOWS[action];
   const windowStart = Math.floor(now / windowMs) * windowMs;
   db.exec("BEGIN IMMEDIATE");
   try {

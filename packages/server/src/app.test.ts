@@ -6,12 +6,14 @@ import type {
 } from "fastify";
 import net from "node:net";
 import type { DatabaseSync } from "node:sqlite";
-import { buildApp } from "./app.js";
+import { buildApp, type WorkOSAuthClient } from "./app.js";
 import type { Config } from "./config.js";
 import {
   createApiKeyRecord,
+  createClaimAuthFlow,
   createOpsKey,
   createUser,
+  getUser,
   hashApiKey,
   openDb,
   setUserTier,
@@ -21,6 +23,11 @@ import { createFakeS3, type FakeS3 } from "./testing/fake-s3.js";
 
 const TOKEN = "sp_test_token";
 const ADMIN = "admin-token";
+const WORKOS_CONFIG = {
+  apiKey: "sk_test",
+  clientId: "client_test",
+  redirectUri: "http://test.local/v1/auth/workos/callback",
+};
 
 interface Harness {
   app: FastifyInstance;
@@ -39,7 +46,10 @@ afterEach(async () => {
   }
 });
 
-async function setup(overrides: Partial<Config> = {}): Promise<Harness> {
+async function setup(
+  overrides: Partial<Config> = {},
+  workos?: WorkOSAuthClient,
+): Promise<Harness> {
   const config: Config = {
     host: "127.0.0.1",
     port: 0,
@@ -63,17 +73,69 @@ async function setup(overrides: Partial<Config> = {}): Promise<Harness> {
     registerPerDay: 10,
     versionRetention: 2,
     reapIntervalMs: 0,
+    workos: null,
     ...overrides,
   };
 
   const db = openDb(":memory:");
   const s3 = createFakeS3();
-  const app = await buildApp({ config, db, s3: s3.client, logger: false });
+  const app = await buildApp({ config, db, s3: s3.client, logger: false, workos });
   const { key } = createOpsKey(db, { name: "test", token: TOKEN });
 
   const harness: Harness = { app, db, s3, config, keyId: key.id };
   open.push(harness);
   return harness;
+}
+
+interface FakeWorkOS {
+  client: WorkOSAuthClient;
+  authorizationCalls: Parameters<
+    WorkOSAuthClient["userManagement"]["getAuthorizationUrlWithPKCE"]
+  >[0][];
+  authenticationCalls: Parameters<
+    WorkOSAuthClient["userManagement"]["authenticateWithCode"]
+  >[0][];
+  method: string | undefined;
+  emailVerified: boolean;
+  failAuthentication: boolean;
+}
+
+function createFakeWorkOS(method: string | undefined = "MagicAuth"): FakeWorkOS {
+  let flow = 0;
+  const fake: FakeWorkOS = {
+    authorizationCalls: [],
+    authenticationCalls: [],
+    method,
+    emailVerified: true,
+    failAuthentication: false,
+    client: undefined as unknown as WorkOSAuthClient,
+  };
+  fake.client = {
+    userManagement: {
+      getAuthorizationUrlWithPKCE: async (options) => {
+        fake.authorizationCalls.push(options);
+        flow += 1;
+        return {
+          url: `https://auth.test/authorize?flow=${flow}`,
+          state: `state_${flow}`,
+          codeVerifier: `verifier_${flow}`,
+        };
+      },
+      authenticateWithCode: async (options) => {
+        fake.authenticationCalls.push(options);
+        if (fake.failAuthentication) throw new Error("WorkOS unavailable");
+        return {
+          user: {
+            id: "user_workos",
+            email: "Human@Example.com",
+            emailVerified: fake.emailVerified,
+          },
+          authenticationMethod: fake.method,
+        };
+      },
+    },
+  };
+  return fake;
 }
 
 const auth = (token = TOKEN) => ({ authorization: `Bearer ${token}` });
@@ -86,6 +148,51 @@ function inject(
   return app.inject(opts);
 }
 
+function setCookieHeaders(res: LightMyRequestResponse): string[] {
+  const value = res.headers["set-cookie"];
+  if (value === undefined) return [];
+  return Array.isArray(value) ? value : [value];
+}
+
+function cookiePair(res: LightMyRequestResponse, name: string): string {
+  const line = setCookieHeaders(res).find((value) => value.startsWith(`${name}=`));
+  if (!line) throw new Error(`response did not set ${name}`);
+  return line.split(";", 1)[0]!;
+}
+
+async function beginClaim(
+  app: FastifyInstance,
+  claimPath: string,
+  cookiePrefix = "",
+): Promise<{
+  confirmation: LightMyRequestResponse;
+  start: LightMyRequestResponse;
+  callbackCookie: string;
+  browserNonce: string;
+}> {
+  const confirmation = await inject(app, { method: "GET", url: claimPath });
+  const confirmationCookie = cookiePair(
+    confirmation,
+    `${cookiePrefix}shareplan_claim_confirm`,
+  );
+  const start = await inject(app, {
+    method: "POST",
+    url: claimPath,
+    headers: {
+      cookie: confirmationCookie,
+      "content-type": "application/x-www-form-urlencoded",
+    },
+    payload: "",
+  });
+  const callbackCookie = cookiePair(start, `${cookiePrefix}shareplan_claim_callback`);
+  return {
+    confirmation,
+    start,
+    callbackCookie,
+    browserNonce: callbackCookie.slice(callbackCookie.indexOf("=") + 1),
+  };
+}
+
 function publish(
   app: FastifyInstance,
   body: object,
@@ -96,6 +203,19 @@ function publish(
     url: "/api/v1/sites",
     headers: auth(token),
     payload: body,
+  });
+}
+
+function register(
+  app: FastifyInstance,
+  name = "claude",
+  ip = "203.0.113.10",
+): Promise<LightMyRequestResponse> {
+  return inject(app, {
+    method: "POST",
+    url: "/api/v1/register",
+    payload: { name },
+    remoteAddress: ip,
   });
 }
 
@@ -638,19 +758,32 @@ describe("expiry", () => {
 
   it("reaps expired sites and their objects", async () => {
     const { app, db, s3, config } = await setup();
+    const now = Date.now();
     const live = (await publish(app, helloSite())).json<{ id: string }>();
     const dead = (await publish(app, { ...helloSite(), ttl: "1h" })).json<{
       id: string;
     }>();
     db.prepare(`UPDATE sites SET expires_at = ? WHERE id = ?`).run(
-      Date.now() - 1000,
+      now - 1000,
       dead.id,
     );
+    const abandoned = createUser(db, { tier: "free--", claimToken: "claim-token" });
+    createClaimAuthFlow(db, {
+      state: "expired-state",
+      browserNonce: "expired-browser-nonce",
+      userId: abandoned.id,
+      codeVerifier: "expired-verifier",
+      now: now - 1000,
+      ttlMs: 1,
+    });
 
-    const result = await reapExpiredSites({ config, db, s3: s3.client });
+    const result = await reapExpiredSites({ config, db, s3: s3.client }, now);
     expect(result.sites).toBe(1);
     expect(s3.keysUnder(`sites/${dead.id}/`)).toHaveLength(0);
     expect(s3.keysUnder(`sites/${live.id}/`)).toHaveLength(1);
+    expect(db.prepare(`SELECT count(*) AS count FROM claim_auth_flows`).get()).toEqual({
+      count: 0,
+    });
 
     const res = await inject(app, { method: "GET", url: `/s/${dead.id}/` });
     expect(res.statusCode).toBe(404);
@@ -1099,20 +1232,406 @@ describe("hostname serving", () => {
   });
 });
 
-describe("register and tiers", () => {
-  async function register(
-    app: FastifyInstance,
-    name = "claude",
-    ip = "203.0.113.10",
-  ) {
-    return inject(app, {
+describe("account claiming", () => {
+  it("returns 503 when AuthKit is not configured", async () => {
+    const { app } = await setup();
+    const created = (await register(app)).json<{ claimUrl: string }>();
+    const res = await inject(app, {
+      method: "GET",
+      url: new URL(created.claimUrl).pathname,
+    });
+
+    expect(res.statusCode).toBe(503);
+    expect(res.body).toContain("Account claiming is not configured");
+    expect(res.headers["cache-control"]).toBe("no-store");
+  });
+
+  it("rejects an invalid claim token without starting AuthKit", async () => {
+    const workos = createFakeWorkOS();
+    const { app } = await setup({ workos: WORKOS_CONFIG }, workos.client);
+    const res = await inject(app, {
+      method: "GET",
+      url: "/claim/aaaaaaaaaaaaaaaaaaaaaa",
+    });
+
+    expect(res.statusCode).toBe(404);
+    expect(workos.authorizationCalls).toHaveLength(0);
+  });
+
+  it("shows a confirmation page without creating an OAuth flow", async () => {
+    const workos = createFakeWorkOS();
+    const { app, db } = await setup({ workos: WORKOS_CONFIG }, workos.client);
+    const created = (await register(app)).json<{ claimUrl: string }>();
+    const claimPath = new URL(created.claimUrl).pathname;
+
+    const res = await inject(app, { method: "GET", url: claimPath });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toContain("Claim this agent account?");
+    expect(res.body).toContain("existing API key will keep access");
+    expect(res.body).toContain("<form method=\"post\">");
+    expect(res.headers["content-security-policy"]).toContain("form-action 'self'");
+    const cookie = setCookieHeaders(res).find((value) =>
+      value.startsWith("shareplan_claim_confirm="),
+    );
+    expect(cookie).toContain("HttpOnly");
+    expect(cookie).toContain("SameSite=Strict");
+    expect(workos.authorizationCalls).toHaveLength(0);
+    expect(db.prepare(`SELECT count(*) AS count FROM claim_auth_flows`).get()).toEqual({
+      count: 0,
+    });
+
+    const head = await inject(app, { method: "HEAD", url: claimPath });
+    expect(head.statusCode).toBe(404);
+    expect(workos.authorizationCalls).toHaveLength(0);
+  });
+
+  it("requires the confirmation cookie and binds it to the claim token", async () => {
+    const workos = createFakeWorkOS();
+    const { app } = await setup({ workos: WORKOS_CONFIG }, workos.client);
+    const first = (await register(app)).json<{ claimUrl: string }>();
+    const second = (await register(app)).json<{ claimUrl: string }>();
+    const firstPath = new URL(first.claimUrl).pathname;
+    const secondPath = new URL(second.claimUrl).pathname;
+
+    const missing = await inject(app, { method: "POST", url: firstPath });
+    expect(missing.statusCode).toBe(400);
+
+    const confirmation = await inject(app, { method: "GET", url: firstPath });
+    const wrongClaim = await inject(app, {
       method: "POST",
-      url: "/api/v1/register",
-      payload: { name },
-      remoteAddress: ip,
+      url: secondPath,
+      headers: { cookie: cookiePair(confirmation, "shareplan_claim_confirm") },
+    });
+    expect(wrongClaim.statusCode).toBe(400);
+    expect(workos.authorizationCalls).toHaveLength(0);
+  });
+
+  it("claims the existing user with an email code and keeps its API key working", async () => {
+    const workos = createFakeWorkOS("MagicAuth");
+    const { app, db } = await setup({ workos: WORKOS_CONFIG }, workos.client);
+    const created = (await register(app)).json<{
+      claimUrl: string;
+      token: string;
+      userId: string;
+    }>();
+    const claimPath = new URL(created.claimUrl).pathname;
+
+    const { confirmation, start, callbackCookie, browserNonce } = await beginClaim(
+      app,
+      claimPath,
+    );
+    expect(confirmation.statusCode).toBe(200);
+    expect(start.statusCode).toBe(302);
+    expect(start.headers.location).toBe("https://auth.test/authorize?flow=1");
+    expect(workos.authorizationCalls).toEqual([
+      {
+        clientId: WORKOS_CONFIG.clientId,
+        provider: "authkit",
+        redirectUri: WORKOS_CONFIG.redirectUri,
+        screenHint: "sign-up",
+      },
+    ]);
+    expect(
+      db.prepare(`SELECT state_hash, browser_nonce_hash FROM claim_auth_flows`).get(),
+    ).toEqual({
+      state_hash: hashApiKey("state_1"),
+      browser_nonce_hash: hashApiKey(browserNonce),
+    });
+    expect(browserNonce).not.toBe(hashApiKey(browserNonce));
+
+    const callback = await inject(app, {
+      method: "GET",
+      url: "/v1/auth/workos/callback?code=auth_code&state=state_1",
+      remoteAddress: "203.0.113.20",
+      headers: { cookie: callbackCookie, "user-agent": "claim-test" },
+    });
+    expect(callback.statusCode).toBe(200);
+    expect(callback.body).toContain("Account claimed");
+    expect(callback.headers["content-security-policy"]).toContain("frame-ancestors 'none'");
+    expect(
+      setCookieHeaders(callback).some(
+        (value) => value.startsWith("shareplan_claim_callback=;") && value.includes("Expires="),
+      ),
+    ).toBe(true);
+    expect(workos.authenticationCalls).toEqual([
+      {
+        clientId: WORKOS_CONFIG.clientId,
+        code: "auth_code",
+        codeVerifier: "verifier_1",
+        ipAddress: "203.0.113.20",
+        userAgent: "claim-test",
+      },
+    ]);
+
+    const user = getUser(db, created.userId)!;
+    expect(user.tier).toBe("free-");
+    expect(user.email).toBe("human@example.com");
+    expect(user.workos_user_id).toBe("user_workos");
+    expect(user.claim_token_hash).toBeNull();
+    expect(user.claimed_at).not.toBeNull();
+    expect((await publish(app, helloSite(), created.token)).statusCode).toBe(201);
+
+    expect((await inject(app, { method: "GET", url: claimPath })).statusCode).toBe(404);
+    const replay = await inject(app, {
+      method: "GET",
+      url: "/v1/auth/workos/callback?code=auth_code&state=state_1",
+      headers: { cookie: callbackCookie },
+    });
+    expect(replay.statusCode).toBe(400);
+    expect(workos.authenticationCalls).toHaveLength(1);
+  });
+
+  for (const method of ["GitHubOAuth", "GoogleOAuth"]) {
+    it(`upgrades a ${method} claim to free`, async () => {
+      const workos = createFakeWorkOS(method);
+      const { app, db } = await setup({ workos: WORKOS_CONFIG }, workos.client);
+      const created = (await register(app)).json<{ claimUrl: string; userId: string }>();
+      const { callbackCookie } = await beginClaim(
+        app,
+        new URL(created.claimUrl).pathname,
+      );
+
+      const callback = await inject(app, {
+        method: "GET",
+        url: "/v1/auth/workos/callback?code=auth_code&state=state_1",
+        headers: { cookie: callbackCookie },
+      });
+
+      expect(callback.statusCode).toBe(200);
+      expect(getUser(db, created.userId)?.tier).toBe("free");
     });
   }
 
+  it("does not claim with an unapproved or unverified login", async () => {
+    const workos = createFakeWorkOS("Password");
+    workos.emailVerified = false;
+    const { app, db } = await setup({ workos: WORKOS_CONFIG }, workos.client);
+    const created = (await register(app)).json<{ claimUrl: string; userId: string }>();
+    const { callbackCookie } = await beginClaim(
+      app,
+      new URL(created.claimUrl).pathname,
+    );
+
+    const callback = await inject(app, {
+      method: "GET",
+      url: "/v1/auth/workos/callback?code=auth_code&state=state_1",
+      headers: { cookie: callbackCookie },
+    });
+
+    expect(callback.statusCode).toBe(403);
+    expect(getUser(db, created.userId)?.tier).toBe("free--");
+    expect(getUser(db, created.userId)?.claim_token_hash).not.toBeNull();
+    expect(db.prepare(`SELECT count(*) AS count FROM claim_auth_flows`).get()).toEqual({
+      count: 0,
+    });
+  });
+
+  it("does not merge a claim into an existing human account", async () => {
+    const workos = createFakeWorkOS("GoogleOAuth");
+    const { app, db } = await setup({ workos: WORKOS_CONFIG }, workos.client);
+    const existing = createUser(db, { tier: "free" });
+    db.prepare(
+      `UPDATE users SET email = ?, workos_user_id = ?, claimed_at = ? WHERE id = ?`,
+    ).run("human@example.com", "user_workos", Date.now(), existing.id);
+    const created = (await register(app)).json<{ claimUrl: string; userId: string }>();
+    const { callbackCookie } = await beginClaim(
+      app,
+      new URL(created.claimUrl).pathname,
+    );
+
+    const callback = await inject(app, {
+      method: "GET",
+      url: "/v1/auth/workos/callback?code=auth_code&state=state_1",
+      headers: { cookie: callbackCookie },
+    });
+
+    expect(callback.statusCode).toBe(409);
+    expect(getUser(db, created.userId)?.tier).toBe("free--");
+    expect(getUser(db, existing.id)?.workos_user_id).toBe("user_workos");
+  });
+
+  it("checks state before sending a code to WorkOS", async () => {
+    const workos = createFakeWorkOS();
+    const { app } = await setup({ workos: WORKOS_CONFIG }, workos.client);
+    const res = await inject(app, {
+      method: "GET",
+      url: "/v1/auth/workos/callback?code=auth_code&state=made_up",
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(workos.authenticationCalls).toHaveLength(0);
+  });
+
+  it("clears a cancelled callback and removes its flow", async () => {
+    const workos = createFakeWorkOS();
+    const { app, db } = await setup({ workos: WORKOS_CONFIG }, workos.client);
+    const created = (await register(app)).json<{ claimUrl: string }>();
+    const { callbackCookie } = await beginClaim(
+      app,
+      new URL(created.claimUrl).pathname,
+    );
+
+    const cancelled = await inject(app, {
+      method: "GET",
+      url: "/v1/auth/workos/callback?error=access_denied&state=state_1",
+      headers: { cookie: callbackCookie },
+    });
+
+    expect(cancelled.statusCode).toBe(400);
+    expect(cancelled.body).toContain("Sign-in cancelled");
+    expect(workos.authenticationCalls).toHaveLength(0);
+    expect(db.prepare(`SELECT count(*) AS count FROM claim_auth_flows`).get()).toEqual({
+      count: 0,
+    });
+    expect(
+      setCookieHeaders(cancelled).some((value) =>
+        value.startsWith("shareplan_claim_callback=;"),
+      ),
+    ).toBe(true);
+  });
+
+  it("requires state and browser nonce without clearing an unrelated flow", async () => {
+    const workos = createFakeWorkOS();
+    const { app, db } = await setup({ workos: WORKOS_CONFIG }, workos.client);
+    const created = (await register(app)).json<{ claimUrl: string }>();
+    const { callbackCookie } = await beginClaim(
+      app,
+      new URL(created.claimUrl).pathname,
+    );
+
+    const missing = await inject(app, {
+      method: "GET",
+      url: "/v1/auth/workos/callback?code=auth_code&state=state_1",
+    });
+    const wrong = await inject(app, {
+      method: "GET",
+      url: "/v1/auth/workos/callback?code=auth_code&state=state_1",
+      headers: { cookie: "shareplan_claim_callback=wrong" },
+    });
+    const unrelated = await inject(app, {
+      method: "GET",
+      url: "/v1/auth/workos/callback?code=auth_code&state=made_up",
+      headers: { cookie: callbackCookie },
+    });
+
+    expect(missing.statusCode).toBe(400);
+    expect(wrong.statusCode).toBe(400);
+    expect(unrelated.statusCode).toBe(400);
+    expect(
+      setCookieHeaders(unrelated).some((value) =>
+        value.startsWith("shareplan_claim_callback=;"),
+      ),
+    ).toBe(false);
+    expect(db.prepare(`SELECT count(*) AS count FROM claim_auth_flows`).get()).toEqual({
+      count: 1,
+    });
+    expect(workos.authenticationCalls).toHaveLength(0);
+
+    const original = await inject(app, {
+      method: "GET",
+      url: "/v1/auth/workos/callback?code=auth_code&state=state_1",
+      headers: { cookie: callbackCookie },
+    });
+    expect(original.statusCode).toBe(200);
+  });
+
+  it("rejects an expired state before sending a code to WorkOS", async () => {
+    const workos = createFakeWorkOS();
+    const { app, db } = await setup({ workos: WORKOS_CONFIG }, workos.client);
+    const created = (await register(app)).json<{ claimUrl: string }>();
+    const { callbackCookie } = await beginClaim(
+      app,
+      new URL(created.claimUrl).pathname,
+    );
+    db.prepare(`UPDATE claim_auth_flows SET expires_at = ?`).run(Date.now() - 1);
+
+    const res = await inject(app, {
+      method: "GET",
+      url: "/v1/auth/workos/callback?code=auth_code&state=state_1",
+      headers: { cookie: callbackCookie },
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(workos.authenticationCalls).toHaveLength(0);
+  });
+
+  it("leaves the claim link usable when WorkOS fails", async () => {
+    const workos = createFakeWorkOS();
+    workos.failAuthentication = true;
+    const { app, db } = await setup({ workos: WORKOS_CONFIG }, workos.client);
+    const created = (await register(app)).json<{ claimUrl: string; userId: string }>();
+    const claimPath = new URL(created.claimUrl).pathname;
+    const { callbackCookie } = await beginClaim(app, claimPath);
+
+    const callback = await inject(app, {
+      method: "GET",
+      url: "/v1/auth/workos/callback?code=auth_code&state=state_1",
+      headers: { cookie: callbackCookie },
+    });
+
+    expect(callback.statusCode).toBe(502);
+    expect(getUser(db, created.userId)?.claim_token_hash).not.toBeNull();
+    expect(db.prepare(`SELECT count(*) AS count FROM claim_auth_flows`).get()).toEqual({
+      count: 0,
+    });
+    expect((await inject(app, { method: "GET", url: claimPath })).statusCode).toBe(200);
+  });
+
+  it("keeps one live flow per account and rate-limits flow starts", async () => {
+    const workos = createFakeWorkOS();
+    const { app, db } = await setup({ workos: WORKOS_CONFIG }, workos.client);
+    const created = (await register(app)).json<{ claimUrl: string }>();
+    const claimPath = new URL(created.claimUrl).pathname;
+
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const { start } = await beginClaim(app, claimPath);
+      expect(start.statusCode).toBe(302);
+      expect(db.prepare(`SELECT count(*) AS count FROM claim_auth_flows`).get()).toEqual({
+        count: 1,
+      });
+    }
+    const confirmation = await inject(app, { method: "GET", url: claimPath });
+    const limited = await inject(app, {
+      method: "POST",
+      url: claimPath,
+      headers: { cookie: cookiePair(confirmation, "shareplan_claim_confirm") },
+    });
+    expect(limited.statusCode).toBe(429);
+    expect(workos.authorizationCalls).toHaveLength(10);
+  });
+
+  it("uses Secure __Host cookies for an HTTPS public URL", async () => {
+    const workos = createFakeWorkOS();
+    const secureWorkos = {
+      ...WORKOS_CONFIG,
+      redirectUri: "https://test.local/v1/auth/workos/callback",
+    };
+    const { app } = await setup(
+      { publicBaseUrl: "https://test.local", workos: secureWorkos },
+      workos.client,
+    );
+    const created = (await register(app)).json<{ claimUrl: string }>();
+    const { confirmation, start } = await beginClaim(
+      app,
+      new URL(created.claimUrl).pathname,
+      "__Host-",
+    );
+
+    expect(
+      setCookieHeaders(confirmation).find((value) =>
+        value.startsWith("__Host-shareplan_claim_confirm="),
+      ),
+    ).toContain("Secure");
+    const callbackCookie = setCookieHeaders(start).find((value) =>
+      value.startsWith("__Host-shareplan_claim_callback="),
+    );
+    expect(callbackCookie).toContain("Secure");
+    expect(callbackCookie).toContain("SameSite=Lax");
+  });
+});
+
+describe("register and tiers", () => {
   it("returns a free-- token", async () => {
     const { app } = await setup();
     const res = await register(app);
