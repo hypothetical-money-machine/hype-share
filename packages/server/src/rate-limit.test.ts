@@ -39,6 +39,7 @@ describe("consumeRate", () => {
       publish: HOUR_MS,
       register: DAY_MS,
       claim: HOUR_MS,
+      owner_login: HOUR_MS,
     });
     const insert = db.prepare(
       `INSERT INTO rate_limits (bucket, action, window_start, count)
@@ -50,10 +51,10 @@ describe("consumeRate", () => {
       insert.run(`current-${action}`, action, current);
     }
 
-    expect(pruneRateLimits(db, now)).toBe(3);
+    expect(pruneRateLimits(db, now)).toBe(4);
     expect(
       db.prepare(`SELECT action FROM rate_limits ORDER BY action`).all(),
-    ).toEqual([{ action: "claim" }, { action: "publish" }, { action: "register" }]);
+    ).toEqual([{ action: "claim" }, { action: "owner_login" }, { action: "publish" }, { action: "register" }]);
     db.close();
   });
 });

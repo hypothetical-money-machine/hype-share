@@ -59,6 +59,7 @@ import {
   type UserRow,
 } from "./db.js";
 import { AuthError, requireAccount, requireAdmin } from "./auth.js";
+import { registerOwnerPortal } from "./owner.js";
 import { HttpError } from "./errors.js";
 import { hashIp, requestIp } from "./ip.js";
 import { consumeRate } from "./rate-limit.js";
@@ -185,6 +186,10 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     "application/x-www-form-urlencoded",
     { parseAs: "string" },
     (req, body, done) => {
+      if (req.method === "POST" && ["/owner/login", "/owner/logout"].includes(splitQuery(req.url).path)) {
+        done(null, Object.fromEntries(new URLSearchParams(body as string)));
+        return;
+      }
       const isClaimConfirmation =
         req.method === "POST" &&
         /^\/claim\/[A-Za-z0-9_-]{22}$/.test(splitQuery(req.url).path) &&
@@ -258,6 +263,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   });
 
   app.get("/healthz", async () => ({ ok: true }));
+  registerOwnerPortal(app, deps.config, deps.db);
 
   app.get("/", async (_req, reply) => {
     reply.type("text/html; charset=utf-8");
@@ -279,7 +285,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   <h1>shareplan</h1>
   <p>Small S3-backed microsite host for agents and humans.</p>
   <p>Publish with the CLI or <code>POST /api/v1/sites</code>. Sites live at <code>${siteUrlShape(deps.config)}</code>.</p>
-  <p><a href="/healthz">healthz</a> · <a href="/docs/agents">agent docs</a></p>
+  <p><a href="/healthz">healthz</a> · <a href="/docs/agents">agent docs</a> · <a href="/owner">owner portal</a></p>
 </body>
 </html>`;
   });
