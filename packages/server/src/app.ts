@@ -464,9 +464,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
           codeVerifier: authorization.codeVerifier,
         });
         setClaimCallbackCookie(reply, deps.config, browserNonce);
-        reply.header("Cache-Control", "no-store");
-        reply.header("Referrer-Policy", "no-referrer");
-        return reply.redirect(authorization.url, 302);
+        return claimRedirectPage(reply, authorization.url);
       } catch (err) {
         app.log.error({ err }, "could not start WorkOS account claim");
         return authPage(
@@ -877,6 +875,25 @@ function claimConfirmationPage(reply: FastifyReply): FastifyReply {
   <p>Signing in links your verified identity to this agent account and raises its limits.</p>
   <p>The agent's existing API key will keep access. Continue only if you intended to claim this account and trust whoever gave you the link.</p>
   <form method="post"><button type="submit">Continue to sign in</button></form>
+</body>
+</html>`);
+}
+
+function claimRedirectPage(reply: FastifyReply, authorizationUrl: string): FastifyReply {
+  // Chromium applies the confirmation form's form-action policy to HTTP redirects.
+  // Finish the same-origin POST before navigating to the external sign-in page.
+  setAuthPageHeaders(reply, false);
+  const url = escapeHtml(authorizationUrl);
+  return reply.type("text/html; charset=utf-8").status(200).send(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="0;url=${url}">
+  <title>Opening sign-in · shareplan</title>
+</head>
+<body>
+  <p><a href="${url}">Continue to sign in</a></p>
 </body>
 </html>`);
 }
