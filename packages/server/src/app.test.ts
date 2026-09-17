@@ -1307,6 +1307,24 @@ describe("account claiming", () => {
     expect(workos.authorizationCalls).toHaveLength(0);
   });
 
+  it("escapes the authorization URL in the browser redirect page", async () => {
+    const workos = createFakeWorkOS();
+    workos.client.userManagement.getAuthorizationUrlWithPKCE = async () => ({
+      url: 'https://auth.test/authorize?state=one&label="<sign-in>"',
+      state: "state_escape",
+      codeVerifier: "verifier_escape",
+    });
+    const { app } = await setup({ workos: WORKOS_CONFIG }, workos.client);
+    const created = (await register(app)).json<{ claimUrl: string }>();
+    const { start } = await beginClaim(app, new URL(created.claimUrl).pathname);
+
+    expect(start.statusCode).toBe(200);
+    const escaped = "https://auth.test/authorize?state=one&amp;label=&quot;&lt;sign-in&gt;&quot;";
+    expect(start.body).toContain(`content="0;url=${escaped}"`);
+    expect(start.body).toContain(`href="${escaped}"`);
+    expect(start.body).not.toContain("<sign-in>");
+  });
+
   it("claims the existing user with an email code and keeps its API key working", async () => {
     const workos = createFakeWorkOS("MagicAuth");
     const { app, db } = await setup({ workos: WORKOS_CONFIG }, workos.client);
@@ -1322,8 +1340,17 @@ describe("account claiming", () => {
       claimPath,
     );
     expect(confirmation.statusCode).toBe(200);
-    expect(start.statusCode).toBe(302);
-    expect(start.headers.location).toBe("https://auth.test/authorize?flow=1");
+    expect(start.statusCode).toBe(200);
+    expect(start.headers.location).toBeUndefined();
+    expect(start.body).toContain(
+      '<meta http-equiv="refresh" content="0;url=https://auth.test/authorize?flow=1">',
+    );
+    expect(start.body).toContain(
+      '<a href="https://auth.test/authorize?flow=1">Continue to sign in</a>',
+    );
+    expect(start.headers["content-security-policy"]).toContain("form-action 'none'");
+    expect(start.headers["cache-control"]).toBe("no-store");
+    expect(start.headers["referrer-policy"]).toBe("no-referrer");
     expect(workos.authorizationCalls).toEqual([
       {
         clientId: WORKOS_CONFIG.clientId,
@@ -1586,7 +1613,7 @@ describe("account claiming", () => {
 
     for (let attempt = 0; attempt < 10; attempt += 1) {
       const { start } = await beginClaim(app, claimPath);
-      expect(start.statusCode).toBe(302);
+      expect(start.statusCode).toBe(200);
       expect(db.prepare(`SELECT count(*) AS count FROM claim_auth_flows`).get()).toEqual({
         count: 1,
       });
