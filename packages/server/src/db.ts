@@ -240,6 +240,12 @@ export function upgrade(db: DatabaseSync): void {
     );
     CREATE INDEX IF NOT EXISTS idx_claim_auth_flows_expires
       ON claim_auth_flows(expires_at);
+
+    CREATE TABLE IF NOT EXISTS owner_sessions (
+      token_hash TEXT PRIMARY KEY,
+      admin_token_hash TEXT NOT NULL,
+      expires_at INTEGER NOT NULL
+    );
   `);
 
   addColumn(db, "claim_auth_flows", "browser_nonce_hash", "TEXT");

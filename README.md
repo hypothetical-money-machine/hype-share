@@ -125,6 +125,36 @@ Configuration notes:
 
 ---
 
+## Owner portal
+
+Open `/owner` on the API host and sign in with `SHAREPLAN_ADMIN_TOKEN`. This is
+service-owner access, separate from customer account claiming and `ops` publishing
+keys. The homepage includes a link to the portal.
+
+The dashboard shows customer accounts and claim rate, accounts by tier, active API
+keys, active and expired sites, upcoming expirations, retained version sizes, a
+30-day publishing chart, and the 20 most recently updated sites. Refresh reloads
+the database values. The authenticated `/api/v1/admin/stats` endpoint returns the
+same data as JSON using the owner session cookie.
+
+Counts reflect current database records. Deleting or reaping a site also removes
+its publishing history from the chart. File sizes are metadata estimates, not an
+S3 inventory or billing total. Visitor counts, bandwidth, and revenue are not yet
+collected.
+
+The portal requires `SHAREPLAN_SITE_HOST_SUFFIX` and an HTTPS
+`SHAREPLAN_PUBLIC_BASE_URL`. Uploaded HTML must have a different origin from the
+portal. HTTP is permitted on loopback for development; for example, use
+`http://127.0.0.1:8788` as the base URL and `sites.localhost` as the suffix. The
+portal is disabled in path-based serving mode.
+
+Sessions last eight hours and use host-only HttpOnly, SameSite=Strict cookies
+(Secure with a `__Host-` prefix on HTTPS). Session tokens are stored as hashes in
+SQLite. Sign out revokes the session, and restarting with a changed admin token
+invalidates existing sessions. Login allows ten attempts per IP per clock hour.
+Forms require the configured origin, and portal responses cannot be cached or
+embedded in frames. The browser never stores the admin token in local storage.
+
 ## CLI
 
 The CLI works identically against hosted `hype-share.com` or your own self-hosted server by setting `--url` or `SHAREPLAN_URL`.

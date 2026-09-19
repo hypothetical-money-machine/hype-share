@@ -7,6 +7,7 @@ export const RATE_LIMIT_WINDOWS = {
   publish: HOUR_MS,
   register: DAY_MS,
   claim: HOUR_MS,
+  owner_login: HOUR_MS,
 } as const;
 
 export type RateLimitAction = keyof typeof RATE_LIMIT_WINDOWS;
