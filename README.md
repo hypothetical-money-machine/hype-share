@@ -45,8 +45,9 @@ On `hype-share.com`, agents and humans follow a tiered account model. All publis
 
 - **Agents (`free--`)**: Call `POST /api/v1/register` or run `shareplan register`. No human credentials required. Receives an API key and a `claimUrl`. Rate limits use an HMAC hash of the client IP (10 registrations/day; 120 publishes or touches per hour).
 - **Claiming an account**: Opening the `claimUrl` shows what will happen before sign-in starts. After the human confirms, WorkOS AuthKit links an email (`free-`) or GitHub/Google login (`free`). The user row is upgraded in place and the agent's API key keeps working.
-- **Donations and paid**: `unlock` and `paid` tiers extend TTL and rate limits. `paid` is the only tier that can set permanent hosting (`"ttl": null`).
-- **Slugs and visibility**: Vanity slugs and public directory listings require `free` tier or higher. `free--` sites are unlisted and use random site IDs (`xk9f2m.hype-share.com`).
+- **Donations and paid**: `unlock` and `paid` tiers extend TTL and rate limits. Permanent hosting (`"ttl": null`) needs `paid`, `ops`, or a `paid` organization.
+- **Organizations**: an operator can create an organization with a tier and a join token. Registering with `--org-token` (or `SHAREPLAN_ORG_TOKEN`) puts the new key inside the organization; org admins can also mint keys without sharing the token. Members publish at the higher of their own tier and the organization's (never `ops`), and, unless their own tier is higher than the organization's, their publishes also count against one pooled hourly cap for the organization. Lowering an organization's tier gives an expiry at the new maximum to every permanent member site whose owner's own tier does not allow one (a personally `paid` member keeps permanent sites), drops vanity slugs below `free-`, and unlists public sites below `free`; the sweeper deletes them when that expiry passes.
+- **Slugs and visibility**: Vanity slugs require `free-` or higher. Public directory listings require `free` or higher. `free--` sites are unlisted and use random site IDs (`xk9f2m.hype-share.com`).
 - **Upload rules**: Allowed files are HTML and page assets (`html`, `htm`, `css`, `js`, `mjs`, `json`, `map`, `txt`, `md`, `png`, `jpg`, `jpeg`, `gif`, `webp`, `avif`, `svg`, `ico`, `woff`, `woff2`). Max 50 MiB and 200 files per site. Video, audio, pdf, zip, and wasm are rejected.
 
 | Tier | Proof | Default TTL | Max TTL | Touch/publish | Bytes/site |
@@ -57,6 +58,8 @@ On `hype-share.com`, agents and humans follow a tiered account model. All publis
 | `unlock` | donation | 1y | 1y | 1 200/h | 50 MiB |
 | `paid` | paid | none | none | 3 600/h | 50 MiB |
 
+Organization members: own tier or organization tier, whichever is higher.
+
 ---
 
 ## Running it yourself
@@ -66,9 +69,9 @@ Self-hosting gives you complete control over storage, authentication, and quotas
 ### Differences from the hosted service
 
 1. **Operator access (`ops` tier)**:
-   Self-hosted servers configure `SHAREPLAN_ADMIN_TOKEN`. Minting keys with this token (`shareplan create-key --admin-token ...`) creates an `ops` user. Operator keys skip public TTL maximums, can set `"ttl": null` for permanent sites, can assign any vanity slug, and are exempt from IP rate limits.
+   Self-hosted servers configure `SHAREPLAN_ADMIN_TOKEN`. Minting keys with this token (`shareplan create-key --admin-token ...`) creates an `ops` user. Operator keys skip public TTL maximums, can set `"ttl": null` for permanent sites, can assign any vanity slug, and are exempt from IP rate limits. Organizations are how an operator grants `unlock` or `paid` to a team without SQL (`shareplan create-org --tier paid`); `ops` stays user-level and is never granted by an organization.
 2. **Registration control**:
-   Setting `SHAREPLAN_IP_HASH_PEPPER` allows agents to self-register via `POST /api/v1/register` or `shareplan register` on your private server. If you omit the pepper, open registration is disabled (`503`), restricting site publishing only to keys minted by the operator.
+   Setting `SHAREPLAN_IP_HASH_PEPPER` allows agents to self-register via `POST /api/v1/register` or `shareplan register` on your private server. If you omit the pepper, open registration is disabled (`503`), restricting site publishing only to keys minted by the operator. Registration with a valid organization join token does not need the pepper. The token, not the address, is the credential, so creating an organization opts that team back in.
 3. **URL and domain structure**:
    - **With domain suffix**: Setting `SHAREPLAN_SITE_HOST_SUFFIX=share.example.com` serves sites at `https://<id>.share.example.com/` with origin isolation. Requires wildcard DNS and a TLS certificate.
    - **Without domain suffix (path-based)**: Leaving `SHAREPLAN_SITE_HOST_SUFFIX` unset serves sites under `/s/<id>/` on the API host (e.g. `http://127.0.0.1:8788/s/<id>/`). Suitable for local development or private LANs without wildcard DNS.
@@ -137,6 +140,10 @@ keys, active and expired sites, upcoming expirations, retained version sizes, a
 the database values. The authenticated `/api/v1/admin/stats` endpoint returns the
 same data as JSON using the owner session cookie.
 
+An Organizations panel lists each organization with its tier, member, site, and
+permanent-site counts; organization tiers are changed with the admin token, not
+from the portal.
+
 Counts reflect current database records. Deleting or reaping a site also removes
 its publishing history from the chart. File sizes are metadata estimates, not an
 S3 inventory or billing total. Visitor counts, bandwidth, and revenue are not yet
@@ -162,35 +169,56 @@ The CLI works identically against hosted `hype-share.com` or your own self-hoste
 ```bash
 # Account and authentication
 shareplan register --url <url> --name claude     # self-service registration
+shareplan register --url <url> --name claude --org-token org_...   # register inside an organization
 shareplan login --url <url> --token sp_xxx       # log in with an existing token
 shareplan whoami                                 # view current server and key
 
 # Publish and manage sites
 shareplan publish ./site --title "Q3 plan" --ttl 7d
+shareplan publish ./site --title "Q3 plan" --ttl none   # permanent (paid, ops, or a paid organization)
 shareplan publish ./site --site <id>             # update an existing site with a new version
 shareplan touch <id>                            # reset TTL to tier maximum
 shareplan ls                                    # list your sites
 shareplan info <id>                             # view site metadata
 shareplan rm <id>                               # delete site and purge storage
 
+# Organization (uses the saved key; admin subcommands need an org admin key)
+shareplan org show                              # your organization, tier, and role
+shareplan org join --org-token org_...          # join with an existing key; sites come along
+shareplan org members                           # list members, keys, and site counts
+shareplan org key --name deploy-bot --role member   # mint a member key without sharing the join token
+shareplan org set-role <user-id> admin
+shareplan org remove <user-id> --revoke-keys    # detach a member; their sites clamp to their own tier
+shareplan org revoke-key <key-id>
+shareplan org rotate-token --disable            # new join token, or turn joining off
+shareplan org sites                             # every member's sites, read-only
+
 # Operator commands (self-hosted only; requires SHAREPLAN_ADMIN_TOKEN)
 shareplan create-key --url <url> --admin-token <tok> --name agent
 shareplan list-keys  --url <url> --admin-token <tok>
 shareplan revoke-key <key-id> --url <url> --admin-token <tok>
+shareplan create-org --name <name> --tier paid --max-members 100 --publish-per-hour 3600 --url <url> --admin-token <tok>
+shareplan list-orgs --url <url> --admin-token <tok>
+shareplan show-org <org-id> --url <url> --admin-token <tok>
+shareplan set-org <org-id> --tier free --url <url> --admin-token <tok>   # --tier none withdraws the comp
+shareplan delete-org <org-id> --url <url> --admin-token <tok>
+shareplan rotate-org-token <org-id> --disable --url <url> --admin-token <tok>
+shareplan create-org-key <org-id> --name lead --role admin --url <url> --admin-token <tok>
+shareplan set-user-org <user-id> --org <org-id> --role member --url <url> --admin-token <tok>   # --org none detaches
 ```
 
 `shareplan publish` takes a directory or a single file:
 - `--title <title>`: site title
-- `--ttl <ttl>`: lifetime duration, e.g. `7d`, `12h` (clamped to tier max unless `ops` or `paid`)
+- `--ttl <ttl>`: lifetime duration, e.g. `7d`, `12h` (clamped to the effective tier's max; `ops`, `paid`, and members of a `paid` organization have no max), or `none` for permanent hosting (`paid`, `ops`, or a `paid` organization)
 - `--site <id>`: update an existing site with a new version
-- `--visibility <vis>`: `unlisted` (default), `public` (requires `free` tier, `paid`, or `ops`), or `private`
-- `--slug <slug>`: vanity hostname label (requires `free` tier, `paid`, or `ops`)
+- `--visibility <vis>`: `unlisted` (default), `public` (requires `free`, `unlock`, `paid`, or `ops`), or `private`
+- `--slug <slug>`: vanity hostname label (requires `free-`, `free`, `unlock`, `paid`, or `ops`)
 - `--note <note>`: optional description stored on the version record
 
 Single files wrap automatically: images get an image viewer page, HTML files become `index.html`, and text/data files get a download page.
 
 Stdout prints only the public site URL; metadata is printed to stderr.
-Environment variable overrides: `SHAREPLAN_URL`, `SHAREPLAN_TOKEN`.
+Environment variable overrides: `SHAREPLAN_URL`, `SHAREPLAN_TOKEN`, `SHAREPLAN_ORG_TOKEN` (register and `org join` only; never saved).
 
 ---
 
@@ -267,7 +295,7 @@ Response (`201`):
 
 | Method | Path | Auth | Purpose |
 |--------|------|------|---------|
-| `POST` | `/api/v1/register` | None | Register a `free--` account and mint an API key |
+| `POST` | `/api/v1/register` | None | Register a `free--` account and mint an API key (optionally into an organization with `orgToken`) |
 | `GET` | `/claim/:token` | Claim token | Confirm an agent account claim |
 | `POST` | `/claim/:token` | Claim token + browser cookie | Start WorkOS AuthKit |
 | `GET` | `/v1/auth/workos/callback` | WorkOS code | Complete an account claim |
@@ -277,6 +305,23 @@ Response (`201`):
 | `GET` | `/api/v1/sites` | Bearer token | List sites owned by the current user |
 | `GET` | `/api/v1/sites/:id` | Bearer token | Fetch site metadata |
 | `DELETE` | `/api/v1/sites/:id` | Bearer token | Delete a site and remove its files |
+| `GET` | `/api/v1/me` | Bearer token | Show the current user, effective tier, and organization |
+| `POST` | `/api/v1/org/join` | Bearer token | Join an organization with a join token (sites and key come along) |
+| `GET` | `/api/v1/org/members` | Bearer token (org admin) | List members with roles, tiers, keys, and site counts |
+| `POST` | `/api/v1/org/keys` | Bearer token (org admin) | Mint a key for a new member without sharing the join token |
+| `PUT` | `/api/v1/org/members/:userId` | Bearer token (org admin) | Change a member's role |
+| `DELETE` | `/api/v1/org/members/:userId` | Bearer token (org admin) | Remove a member, optionally revoking their keys (`?revokeKeys=true`); their sites clamp to their own tier |
+| `DELETE` | `/api/v1/org/keys/:keyId` | Bearer token (org admin) | Revoke a member's key |
+| `POST` | `/api/v1/org/join-token` | Bearer token (org admin) | Rotate or disable the join token |
+| `GET` | `/api/v1/org/sites` | Bearer token (org admin) | List every member's sites (read-only) |
+| `POST` | `/api/v1/admin/orgs` | Admin token | Create an organization; returns the join token once |
+| `GET` | `/api/v1/admin/orgs` | Admin token | List organizations with member and site counts |
+| `GET` | `/api/v1/admin/orgs/:id` | Admin token | Show an organization and its members |
+| `PUT` | `/api/v1/admin/orgs/:id` | Admin token | Rename, set the comp tier, member cap, or publish pool; a tier change clamps member sites |
+| `DELETE` | `/api/v1/admin/orgs/:id` | Admin token | Delete an organization; members are detached and clamped |
+| `POST` | `/api/v1/admin/orgs/:id/join-token` | Admin token | Rotate or disable the join token |
+| `POST` | `/api/v1/admin/orgs/:id/keys` | Admin token | Mint a member or admin key inside an organization |
+| `PUT` | `/api/v1/admin/users/:id/org` | Admin token | Attach a user to an organization, change their role, or detach them |
 | `GET` | `https://<id>.<suffix>/*` | Public / Bearer | Serve site files (`<id>` also accepts a slug) |
 
 Hosted sites live at `https://<id>.hype-share.com/`. A self-hosted server with
@@ -299,6 +344,7 @@ For self-hosted instances. See [`.env.example`](.env.example) and [`.env.prod.ex
 | `SHAREPLAN_IP_HASH_PEPPER` | HMAC pepper for register / `free--` IP limits |
 | `SHAREPLAN_TRUST_FORWARDED` | Trust `CF-Connecting-IP` / `X-Forwarded-For` behind a reverse proxy |
 | `SHAREPLAN_REGISTER_PER_DAY` | Max `POST /register` per IP hash per day, default 10 |
+| `SHAREPLAN_ORG_REGISTER_PER_DAY` | Max organization-token registers and org-admin key mints per organization per day, default 100 |
 | `SHAREPLAN_MAX_SITE_BYTES` | Max total bytes per site, default 50 MiB |
 | `SHAREPLAN_MAX_FILE_COUNT` | Max files per site, default 200 |
 | `SHAREPLAN_DEFAULT_TTL` | Default TTL for operator keys when unset |
@@ -322,6 +368,10 @@ Expired sites return `410` immediately; a background sweeper then deletes their
 objects and rows. Objects go first, so a failed delete retries next sweep rather
 than orphaning files.
 
+The sweeper also assigns an expiry to any permanent site whose owner's current
+tier no longer allows one (for example after a manual tier change), so no site
+stays permanent under a tier that forbids it.
+
 ## Security notes
 
 - Untrusted HTML is served with CSP, `X-Robots-Tag: noindex`, and `Referrer-Policy: no-referrer`.
@@ -334,6 +384,7 @@ than orphaning files.
   one site can reach another. Suitable for local dev, not for public hosting.
 - API keys are stored as SHA-256 hashes only. IP rate limits use HMAC-SHA256 with `SHAREPLAN_IP_HASH_PEPPER`.
 - Claim tokens, OAuth state, and the browser nonce are stored as SHA-256 hashes. The callback must return in the browser that confirmed the claim. A successful claim consumes the token and all pending flows for that account.
+- Organization join tokens are stored as SHA-256 hashes, rotate or disable instantly, and are bounded by the organization's member cap and daily register limit. When `SHAREPLAN_IP_HASH_PEPPER` is set, an invalid token spends a register slot from the caller's IP bucket; without a pepper it is a plain 401, like an invalid API key. Organization admins can see their members' claimed email addresses.
 - Zip/tar upload is not supported in v0.1 (JSON + directory CLI only).
 
 ## Packages

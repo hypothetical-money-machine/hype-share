@@ -71,6 +71,7 @@ async function setup(
     ipHashPepper: "test-pepper",
     trustForwarded: false,
     registerPerDay: 10,
+    orgRegisterPerDay: 100,
     versionRetention: 2,
     reapIntervalMs: 0,
     workos: null,

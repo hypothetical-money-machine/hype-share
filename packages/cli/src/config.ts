@@ -7,6 +7,9 @@ export interface CliConfig {
   token: string;
 }
 
+/** What the loader returns: the saved config plus the env-only org join token. */
+export type LoadedCliConfig = Partial<CliConfig> & { orgToken?: string };
+
 export function configPath(): string {
   const base =
     process.env.SHAREPLAN_CONFIG ??
@@ -14,10 +17,12 @@ export function configPath(): string {
   return base;
 }
 
-export function loadCliConfig(): Partial<CliConfig> {
-  const fromEnv: Partial<CliConfig> = {};
+export function loadCliConfig(): LoadedCliConfig {
+  const fromEnv: LoadedCliConfig = {};
   if (process.env.SHAREPLAN_URL) fromEnv.url = process.env.SHAREPLAN_URL.replace(/\/$/, "");
   if (process.env.SHAREPLAN_TOKEN) fromEnv.token = process.env.SHAREPLAN_TOKEN;
+  // The org join token is read from the environment only and never written to disk.
+  if (process.env.SHAREPLAN_ORG_TOKEN) fromEnv.orgToken = process.env.SHAREPLAN_ORG_TOKEN;
 
   const p = configPath();
   if (!existsSync(p)) return fromEnv;
@@ -27,16 +32,19 @@ export function loadCliConfig(): Partial<CliConfig> {
     return {
       url: fromEnv.url ?? raw.url?.replace(/\/$/, ""),
       token: fromEnv.token ?? raw.token,
+      ...(fromEnv.orgToken !== undefined ? { orgToken: fromEnv.orgToken } : {}),
     };
   } catch {
     return fromEnv;
   }
 }
 
+/** Writes url and token only, so an org join token can never end up in the file. */
 export function saveCliConfig(cfg: CliConfig): void {
   const p = configPath();
   mkdirSync(path.dirname(p), { recursive: true });
-  writeFileSync(p, JSON.stringify(cfg, null, 2) + "\n", { mode: 0o600 });
+  const persisted: CliConfig = { url: cfg.url, token: cfg.token };
+  writeFileSync(p, JSON.stringify(persisted, null, 2) + "\n", { mode: 0o600 });
 }
 
 export function requireConfig(): CliConfig {

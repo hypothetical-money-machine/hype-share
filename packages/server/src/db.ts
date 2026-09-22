@@ -2,7 +2,20 @@ import { DatabaseSync } from "node:sqlite";
 import { createHash, randomBytes } from "node:crypto";
 import { RESERVED_HOST_LABELS, type Visibility } from "@shareplan/core";
 import { RATE_LIMIT_WINDOWS, type RateLimitAction } from "./rate-limit.js";
-import { higherTier, type Tier } from "./tiers.js";
+import { HttpError } from "./errors.js";
+import {
+  clampStoredExpiry,
+  effectiveTier,
+  expiresAtFromTierTtl,
+  higherTier,
+  orgTier,
+  policyFor,
+  type OrgRole,
+  type OrgTier,
+  type Tier,
+  type TierPolicy,
+  UnknownTierError,
+} from "./tiers.js";
 
 export interface UserRow {
   id: string;
@@ -13,6 +26,32 @@ export interface UserRow {
   claim_token_hash: string | null;
   created_at: number;
   claimed_at: number | null;
+  org_id: string | null;
+  org_role: OrgRole | null;
+}
+
+export interface OrgRow {
+  id: string;
+  name: string;
+  comp_tier: string | null;
+  billing_tier: string | null;
+  stripe_customer_id: string | null;
+  join_token_hash: string | null;
+  max_members: number;
+  publish_per_hour: number | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface OrgMemberRow {
+  id: string;
+  tier: Tier;
+  org_role: OrgRole;
+  email: string | null;
+  created_at: number;
+  claimed_at: number | null;
+  sites: number;
+  keys: { id: string; name: string; created_at: number }[];
 }
 
 export interface ApiKeyRow {
@@ -71,7 +110,14 @@ const SITE_COLS = `id, owner_key_id, owner_user_id, slug, title, visibility, cur
        created_at, updated_at, expires_at, byte_size, file_count`;
 
 const USER_COLS = `id, tier, email, workos_user_id, stripe_customer_id, claim_token_hash,
-       created_at, claimed_at`;
+       created_at, claimed_at, org_id, org_role`;
+
+const ORG_COLS = `id, name, comp_tier, billing_tier, stripe_customer_id, join_token_hash,
+       max_members, publish_per_hour, created_at, updated_at`;
+
+/** SITE_COLS qualified for queries that join sites with users. */
+const ORG_SITE_COLS = `s.id, s.owner_key_id, s.owner_user_id, s.slug, s.title, s.visibility,
+       s.current_version_id, s.created_at, s.updated_at, s.expires_at, s.byte_size, s.file_count`;
 
 export function hashApiKey(token: string): string {
   return createHash("sha256").update(token, "utf8").digest("hex");
@@ -268,6 +314,33 @@ export function upgrade(db: DatabaseSync): void {
       PRAGMA user_version = 3;
     `);
   }
+
+  // orgs must exist before users.org_id references it: with foreign_keys ON the
+  // ALTER succeeds either way, but every later UPDATE users would fail.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS orgs (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      comp_tier TEXT CHECK (comp_tier IS NULL OR comp_tier <> 'ops'),
+      billing_tier TEXT CHECK (billing_tier IS NULL OR billing_tier <> 'ops'),
+      stripe_customer_id TEXT,
+      join_token_hash TEXT,
+      max_members INTEGER NOT NULL DEFAULT 100,
+      publish_per_hour INTEGER,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_orgs_join_token
+      ON orgs(join_token_hash) WHERE join_token_hash IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_orgs_stripe_customer
+      ON orgs(stripe_customer_id) WHERE stripe_customer_id IS NOT NULL;
+  `);
+  addColumn(db, "users", "org_id", "TEXT REFERENCES orgs(id)");
+  addColumn(db, "users", "org_role", "TEXT");
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_users_org ON users(org_id) WHERE org_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_sites_permanent ON sites(owner_user_id) WHERE expires_at IS NULL;
+  `);
 }
 
 /** Existing keys become operator users so self-host and Zima keep working. */
@@ -324,16 +397,24 @@ function newId(): string {
 
 export function createUser(
   db: DatabaseSync,
-  opts: { tier: Tier; claimToken?: string; now?: number },
+  opts: {
+    tier: Tier;
+    claimToken?: string;
+    now?: number;
+    orgId?: string | null;
+    orgRole?: OrgRole | null;
+  },
 ): UserRow {
   const id = newId();
   const created_at = opts.now ?? Date.now();
   const claim_token_hash = opts.claimToken ? hashApiKey(opts.claimToken) : null;
+  const org_id = opts.orgId ?? null;
+  const org_role = org_id === null ? null : (opts.orgRole ?? "member");
   db.prepare(
     `INSERT INTO users (id, tier, email, workos_user_id, stripe_customer_id,
-       claim_token_hash, created_at, claimed_at)
-     VALUES (?, ?, NULL, NULL, NULL, ?, ?, NULL)`,
-  ).run(id, opts.tier, claim_token_hash, created_at);
+       claim_token_hash, created_at, claimed_at, org_id, org_role)
+     VALUES (?, ?, NULL, NULL, NULL, ?, ?, NULL, ?, ?)`,
+  ).run(id, opts.tier, claim_token_hash, created_at, org_id, org_role);
   return {
     id,
     tier: opts.tier,
@@ -343,6 +424,8 @@ export function createUser(
     claim_token_hash,
     created_at,
     claimed_at: null,
+    org_id,
+    org_role,
   };
 }
 
@@ -566,13 +649,14 @@ export function findApiKeyByToken(db: DatabaseSync, token: string): ApiKeyRow | 
   return row ?? null;
 }
 
-export function listApiKeys(db: DatabaseSync): ApiKeyRow[] {
+export function listApiKeys(db: DatabaseSync): (ApiKeyRow & { org_id: string | null })[] {
   return db
     .prepare(
-      `SELECT id, user_id, name, key_hash, created_at, revoked_at
-       FROM api_keys ORDER BY created_at DESC`,
+      `SELECT k.id, k.user_id, k.name, k.key_hash, k.created_at, k.revoked_at, u.org_id
+       FROM api_keys k LEFT JOIN users u ON u.id = k.user_id
+       ORDER BY k.created_at DESC`,
     )
-    .all() as unknown as ApiKeyRow[];
+    .all() as unknown as (ApiKeyRow & { org_id: string | null })[];
 }
 
 /** Revoke a key by id. Returns false if it was unknown or already revoked. */
@@ -768,4 +852,527 @@ export function deleteSite(db: DatabaseSync, id: string): boolean {
 
 export function isExpired(site: SiteRow, now = Date.now()): boolean {
   return site.expires_at !== null && site.expires_at <= now;
+}
+
+/**
+ * BEGIN IMMEDIATE / COMMIT / ROLLBACK around fn. Never nest: consumeRate opens
+ * its own, so routes spend their buckets before calling anything that uses this.
+ */
+export function transaction<T>(db: DatabaseSync, fn: () => T): T {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const result = fn();
+    db.exec("COMMIT");
+    return result;
+  } catch (err) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // already closed / no transaction
+    }
+    throw err;
+  }
+}
+
+export function createOrg(
+  db: DatabaseSync,
+  opts: {
+    name: string;
+    compTier: OrgTier | null;
+    maxMembers?: number;
+    publishPerHour?: number | null;
+    joinToken: string;
+    now?: number;
+  },
+): OrgRow {
+  const now = opts.now ?? Date.now();
+  const row: OrgRow = {
+    id: newId(),
+    name: opts.name,
+    comp_tier: opts.compTier,
+    billing_tier: null,
+    stripe_customer_id: null,
+    join_token_hash: hashApiKey(opts.joinToken),
+    max_members: opts.maxMembers ?? 100,
+    publish_per_hour: opts.publishPerHour ?? null,
+    created_at: now,
+    updated_at: now,
+  };
+  db.prepare(
+    `INSERT INTO orgs (${ORG_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    row.id,
+    row.name,
+    row.comp_tier,
+    row.billing_tier,
+    row.stripe_customer_id,
+    row.join_token_hash,
+    row.max_members,
+    row.publish_per_hour,
+    row.created_at,
+    row.updated_at,
+  );
+  return row;
+}
+
+export function getOrg(db: DatabaseSync, id: string): OrgRow | null {
+  const row = db
+    .prepare(`SELECT ${ORG_COLS} FROM orgs WHERE id = ?`)
+    .get(id) as OrgRow | undefined;
+  return row ?? null;
+}
+
+/** A disabled org has a NULL hash, which never equals the presented one. */
+export function findOrgByJoinToken(db: DatabaseSync, token: string): OrgRow | null {
+  const row = db
+    .prepare(`SELECT ${ORG_COLS} FROM orgs WHERE join_token_hash = ?`)
+    .get(hashApiKey(token)) as OrgRow | undefined;
+  return row ?? null;
+}
+
+export function listOrgs(db: DatabaseSync): OrgRow[] {
+  return db
+    .prepare(`SELECT ${ORG_COLS} FROM orgs ORDER BY created_at, id`)
+    .all() as unknown as OrgRow[];
+}
+
+export function countOrgMembers(db: DatabaseSync, orgId: string): number {
+  const row = db
+    .prepare(`SELECT COUNT(*) AS n FROM users WHERE org_id = ?`)
+    .get(orgId) as { n: number };
+  return Number(row.n);
+}
+
+export function listOrgMembers(db: DatabaseSync, orgId: string): OrgMemberRow[] {
+  const members = db
+    .prepare(
+      `SELECT u.id, u.tier, u.org_role, u.email, u.created_at, u.claimed_at,
+              (SELECT COUNT(*) FROM sites s WHERE s.owner_user_id = u.id) AS sites
+       FROM users u WHERE u.org_id = ? ORDER BY u.created_at, u.id`,
+    )
+    .all(orgId) as unknown as Omit<OrgMemberRow, "keys">[];
+  if (members.length === 0) return [];
+  const keys = db
+    .prepare(
+      `SELECT k.id, k.user_id, k.name, k.created_at
+       FROM api_keys k JOIN users u ON u.id = k.user_id
+       WHERE u.org_id = ? AND k.revoked_at IS NULL
+       ORDER BY k.created_at, k.id`,
+    )
+    .all(orgId) as unknown as { id: string; user_id: string; name: string; created_at: number }[];
+  const byUser = new Map<string, OrgMemberRow["keys"]>();
+  for (const k of keys) {
+    const list = byUser.get(k.user_id) ?? [];
+    list.push({ id: k.id, name: k.name, created_at: k.created_at });
+    byUser.set(k.user_id, list);
+  }
+  return members.map((m) => ({ ...m, keys: byUser.get(m.id) ?? [] }));
+}
+
+export function countOrgSites(
+  db: DatabaseSync,
+  orgId: string,
+): { total: number; permanent: number } {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS total, COALESCE(SUM(s.expires_at IS NULL), 0) AS permanent
+       FROM sites s JOIN users u ON u.id = s.owner_user_id
+       WHERE u.org_id = ?`,
+    )
+    .get(orgId) as { total: number; permanent: number };
+  return { total: Number(row.total), permanent: Number(row.permanent) };
+}
+
+export function listSitesForOrg(db: DatabaseSync, orgId: string): SiteRow[] {
+  return db
+    .prepare(
+      `SELECT ${ORG_SITE_COLS}
+       FROM sites s JOIN users u ON u.id = s.owner_user_id
+       WHERE u.org_id = ? ORDER BY s.updated_at DESC, s.id`,
+    )
+    .all(orgId) as unknown as SiteRow[];
+}
+
+/** Null disables joining; the previous token stops matching immediately. */
+export function setOrgJoinToken(
+  db: DatabaseSync,
+  id: string,
+  token: string | null,
+  now: number,
+): boolean {
+  const result = db
+    .prepare(`UPDATE orgs SET join_token_hash = ?, updated_at = ? WHERE id = ?`)
+    .run(token === null ? null : hashApiKey(token), now, id);
+  return (result.changes ?? 0) > 0;
+}
+
+export interface OrgPatch {
+  name?: string;
+  comp_tier?: OrgTier | null;
+  billing_tier?: OrgTier | null;
+  stripe_customer_id?: string | null;
+  max_members?: number;
+  publish_per_hour?: number | null;
+}
+
+const ORG_PATCH_COLS = [
+  "name",
+  "comp_tier",
+  "billing_tier",
+  "stripe_customer_id",
+  "max_members",
+  "publish_per_hour",
+] as const;
+
+export interface ClampSummary {
+  users: number;
+  sites: number;
+  skipped: number;
+}
+
+/**
+ * Write the given columns; a tier change (either column, any value) clamps
+ * every member's sites in the same transaction. Slice 6 calls this with the
+ * billing fields.
+ */
+export function updateOrg(
+  db: DatabaseSync,
+  id: string,
+  patch: OrgPatch,
+  now: number,
+): { org: OrgRow; clamped: ClampSummary } | null {
+  return transaction(db, () => {
+    if (getOrg(db, id) === null) return null;
+    const sets: string[] = [];
+    const values: (string | number | null)[] = [];
+    for (const col of ORG_PATCH_COLS) {
+      const value = patch[col];
+      if (value === undefined) continue;
+      sets.push(`${col} = ?`);
+      values.push(value);
+    }
+    sets.push("updated_at = ?");
+    values.push(now);
+    db.prepare(`UPDATE orgs SET ${sets.join(", ")} WHERE id = ?`).run(...values, id);
+    const tierChanged = patch.comp_tier !== undefined || patch.billing_tier !== undefined;
+    const clamped = tierChanged
+      ? clampSitesForUsers(db, memberIds(db, id), now)
+      : { users: 0, sites: 0, skipped: 0 };
+    return { org: getOrg(db, id)!, clamped };
+  });
+}
+
+/** Detach every member, clamp them to their own tiers, then drop the row. */
+export function deleteOrg(db: DatabaseSync, id: string, now: number): ClampSummary | null {
+  return transaction(db, () => {
+    const org = getOrg(db, id);
+    if (org === null) return null;
+    if (org.billing_tier !== null || org.stripe_customer_id !== null) {
+      throw new HttpError(
+        409,
+        "org_billed",
+        "organization has billing state; cancel it in Stripe first",
+      );
+    }
+    const members = memberIds(db, id);
+    db.prepare(`UPDATE users SET org_id = NULL, org_role = NULL WHERE org_id = ?`).run(id);
+    const clamped = clampSitesForUsers(db, members, now);
+    db.prepare(`DELETE FROM orgs WHERE id = ?`).run(id);
+    return clamped;
+  });
+}
+
+function memberIds(db: DatabaseSync, orgId: string): string[] {
+  return (
+    db.prepare(`SELECT id FROM users WHERE org_id = ? ORDER BY created_at, id`).all(orgId) as {
+      id: string;
+    }[]
+  ).map((r) => r.id);
+}
+
+function assertOrgHasRoom(db: DatabaseSync, org: OrgRow): void {
+  if (countOrgMembers(db, org.id) >= org.max_members) {
+    throw new HttpError(403, "org_full", "organization has reached its member limit");
+  }
+}
+
+/** A new free-- user inside the org plus its first key, capped by max_members. */
+export function createOrgMember(
+  db: DatabaseSync,
+  opts: {
+    org: OrgRow;
+    name: string;
+    token: string;
+    role: OrgRole;
+    claimToken: string;
+    now?: number;
+  },
+): { user: UserRow; key: ApiKeyRow } {
+  return transaction(db, () => {
+    assertOrgHasRoom(db, opts.org);
+    const user = createUser(db, {
+      tier: "free--",
+      claimToken: opts.claimToken,
+      orgId: opts.org.id,
+      orgRole: opts.role,
+      now: opts.now,
+    });
+    const key = createApiKeyRecord(db, {
+      name: opts.name,
+      token: opts.token,
+      userId: user.id,
+      now: opts.now,
+    });
+    return { user, key };
+  });
+}
+
+/** Attach, change role, or detach (org null). The user's sites are clamped either way. */
+export function setUserOrg(
+  db: DatabaseSync,
+  user: UserRow,
+  org: OrgRow | null,
+  role: OrgRole | null,
+  now: number,
+): { effectiveTier: Tier; clampedSites: number } {
+  return transaction(db, () => {
+    if (org !== null && user.org_id !== org.id) assertOrgHasRoom(db, org);
+    db.prepare(`UPDATE users SET org_id = ?, org_role = ? WHERE id = ?`).run(
+      org === null ? null : org.id,
+      org === null ? null : (role ?? "member"),
+      user.id,
+    );
+    const clampedSites = clampSitesForUser(db, getUser(db, user.id)!, now);
+    return { effectiveTier: effectiveTier(user.tier, orgTier(org)), clampedSites };
+  });
+}
+
+function otherAdminCount(db: DatabaseSync, orgId: string, userId: string): number {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM users
+       WHERE org_id = ? AND org_role = 'admin' AND id <> ?`,
+    )
+    .get(orgId, userId) as { n: number };
+  return Number(row.n);
+}
+
+/**
+ * Detach a member and clamp their sites; with revokeKeys, also revoke every
+ * active key they hold, after the detach so the last-admin check runs first.
+ * Null when the user is not in this org.
+ */
+export function removeOrgMember(
+  db: DatabaseSync,
+  orgId: string,
+  userId: string,
+  now: number,
+  opts: { revokeKeys?: boolean } = {},
+): { clampedSites: number; revokedKeys: number } | null {
+  return transaction(db, () => {
+    const target = getUser(db, userId);
+    if (target === null || target.org_id !== orgId) return null;
+    if (target.org_role === "admin" && otherAdminCount(db, orgId, userId) === 0) {
+      throw new HttpError(409, "last_admin", "an organization needs at least one admin");
+    }
+    db.prepare(`UPDATE users SET org_id = NULL, org_role = NULL WHERE id = ?`).run(userId);
+    const clampedSites = clampSitesForUser(db, getUser(db, userId)!, now);
+    let revokedKeys = 0;
+    if (opts.revokeKeys) {
+      const result = db
+        .prepare(`UPDATE api_keys SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL`)
+        .run(now, userId);
+      revokedKeys = Number(result.changes ?? 0);
+    }
+    return { clampedSites, revokedKeys };
+  });
+}
+
+/** False when the user is not in this org. Demoting the only admin throws 409. */
+export function setOrgMemberRole(
+  db: DatabaseSync,
+  orgId: string,
+  userId: string,
+  role: OrgRole,
+): boolean {
+  return transaction(db, () => {
+    const target = getUser(db, userId);
+    if (target === null || target.org_id !== orgId) return false;
+    if (
+      role === "member" &&
+      target.org_role === "admin" &&
+      otherAdminCount(db, orgId, userId) === 0
+    ) {
+      throw new HttpError(409, "last_admin", "an organization needs at least one admin");
+    }
+    db.prepare(`UPDATE users SET org_role = ? WHERE id = ? AND org_id = ?`).run(
+      role,
+      userId,
+      orgId,
+    );
+    return true;
+  });
+}
+
+/** Revoke a key only if its user is in the org. False if unknown, revoked, or outside. */
+export function revokeOrgMemberKey(
+  db: DatabaseSync,
+  orgId: string,
+  keyId: string,
+  now: number,
+): boolean {
+  const result = db
+    .prepare(
+      `UPDATE api_keys SET revoked_at = ?
+       WHERE id = ? AND revoked_at IS NULL
+         AND user_id IN (SELECT id FROM users WHERE org_id = ?)`,
+    )
+    .run(now, keyId, orgId);
+  return (result.changes ?? 0) > 0;
+}
+
+/**
+ * Bring one user's stored sites in line with a policy: rows only, never S3,
+ * updated_at untouched (the user did not touch the site). Returns the number
+ * of distinct sites changed. No transaction of its own.
+ */
+export function clampSitesToPolicy(
+  db: DatabaseSync,
+  ownerUserId: string,
+  policy: TierPolicy,
+  now: number,
+): number {
+  const touched = new Set<string>();
+  const collect = (rows: unknown[]): void => {
+    for (const row of rows as { id: string }[]) touched.add(row.id);
+  };
+  if (!policy.allowNullTtl) {
+    const cap = clampStoredExpiry(policy, null, now);
+    collect(
+      db
+        .prepare(
+          `UPDATE sites SET expires_at = ? WHERE owner_user_id = ? AND expires_at IS NULL
+           RETURNING id`,
+        )
+        .all(cap, ownerUserId),
+    );
+  }
+  if (policy.maxTtl !== null) {
+    const max = expiresAtFromTierTtl(policy.maxTtl, now)!;
+    collect(
+      db
+        .prepare(
+          `UPDATE sites SET expires_at = ? WHERE owner_user_id = ? AND expires_at > ?
+           RETURNING id`,
+        )
+        .all(max, ownerUserId, max),
+    );
+  }
+  if (!policy.slugs) {
+    collect(
+      db
+        .prepare(
+          `UPDATE sites SET slug = NULL WHERE owner_user_id = ? AND slug IS NOT NULL
+           RETURNING id`,
+        )
+        .all(ownerUserId),
+    );
+  }
+  if (!policy.publicVisibility) {
+    collect(
+      db
+        .prepare(
+          `UPDATE sites SET visibility = 'unlisted'
+           WHERE owner_user_id = ? AND visibility = 'public'
+           RETURNING id`,
+        )
+        .all(ownerUserId),
+    );
+  }
+  return touched.size;
+}
+
+/** Clamp one user against their current effective tier. Throws on an unknown own tier. */
+function clampSitesForUser(db: DatabaseSync, user: UserRow, now: number): number {
+  const org = user.org_id === null ? null : getOrg(db, user.org_id);
+  return clampSitesToPolicy(db, user.id, policyFor(effectiveTier(user.tier, orgTier(org))), now);
+}
+
+/**
+ * Recompute each user's effective tier from current rows and clamp. Correct
+ * whichever column moved (own tier, org tier, or membership). A user whose
+ * own tier is unknown is skipped and counted, so one edited row never blocks
+ * the whole org. No transaction of its own.
+ */
+export function clampSitesForUsers(
+  db: DatabaseSync,
+  userIds: string[],
+  now: number,
+): ClampSummary {
+  let users = 0;
+  let sites = 0;
+  let skipped = 0;
+  for (const id of userIds) {
+    const user = getUser(db, id);
+    if (user === null) continue;
+    try {
+      sites += clampSitesForUser(db, user, now);
+    } catch (err) {
+      if (!(err instanceof UnknownTierError)) throw err;
+      skipped += 1;
+      continue;
+    }
+    users += 1;
+  }
+  return { users, sites, skipped };
+}
+
+/**
+ * Backstop for tier edits made outside the API: any permanent site whose
+ * owner's current effective tier forbids a NULL expiry gets now + maxTtl. An
+ * unknown own tier is skipped and logged rather than aborting the sweep.
+ */
+export function reconcilePermanentSites(
+  db: DatabaseSync,
+  now: number,
+  log?: { warn(msg: string): void },
+): { clamped: number; skipped: number } {
+  return transaction(db, () => {
+    const rows = db
+      .prepare(
+        `SELECT s.id, s.owner_user_id, u.tier AS user_tier, o.comp_tier, o.billing_tier
+         FROM sites s
+         JOIN users u ON u.id = s.owner_user_id
+         LEFT JOIN orgs o ON o.id = u.org_id
+         WHERE s.expires_at IS NULL`,
+      )
+      .all() as unknown as {
+      id: string;
+      owner_user_id: string;
+      user_tier: string;
+      comp_tier: string | null;
+      billing_tier: string | null;
+    }[];
+    const assign = db.prepare(
+      `UPDATE sites SET expires_at = ? WHERE id = ? AND expires_at IS NULL`,
+    );
+    let clamped = 0;
+    let skipped = 0;
+    for (const row of rows) {
+      let policy: TierPolicy;
+      try {
+        policy = policyFor(effectiveTier(row.user_tier as Tier, orgTier(row)));
+      } catch (err) {
+        skipped += 1;
+        log?.warn(
+          `reap: skipped permanent site ${row.id}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        continue;
+      }
+      if (policy.allowNullTtl) continue;
+      const result = assign.run(clampStoredExpiry(policy, null, now), row.id);
+      clamped += Number(result.changes ?? 0);
+    }
+    return { clamped, skipped };
+  });
 }

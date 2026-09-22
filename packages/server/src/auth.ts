@@ -3,11 +3,14 @@ import type { DatabaseSync } from "node:sqlite";
 import { timingSafeEqual } from "node:crypto";
 import {
   findApiKeyByToken,
+  getOrg,
   getUser,
   hashApiKey,
   type ApiKeyRow,
+  type OrgRow,
   type UserRow,
 } from "./db.js";
+import { effectiveTier, orgTier, type Tier } from "./tiers.js";
 
 export class AuthError extends Error {
   override readonly name = "AuthError";
@@ -39,16 +42,37 @@ export function requireApiKey(db: DatabaseSync, req: FastifyRequest): ApiKeyRow 
   return key;
 }
 
-export function requireAccount(
-  db: DatabaseSync,
-  req: FastifyRequest,
-): { key: ApiKeyRow; user: UserRow } {
+/** Resolved once per request; tier is the effective tier (own or org, whichever is higher). */
+export interface Account {
+  key: ApiKeyRow;
+  user: UserRow;
+  org: OrgRow | null;
+  tier: Tier;
+}
+
+export function requireAccount(db: DatabaseSync, req: FastifyRequest): Account {
   const key = requireApiKey(db, req);
   const user = getUser(db, key.user_id);
   if (!user) {
     throw new AuthError(401, "unauthorized", "invalid API key");
   }
-  return { key, user };
+  const org = user.org_id === null ? null : getOrg(db, user.org_id);
+  return { key, user, org, tier: effectiveTier(user.tier, orgTier(org)) };
+}
+
+/** Org-admin routes. The org comes from the caller's own row, never from the URL. */
+export function requireOrgAdmin(
+  db: DatabaseSync,
+  req: FastifyRequest,
+): Account & { org: OrgRow } {
+  const account = requireAccount(db, req);
+  if (account.org === null) {
+    throw new AuthError(404, "no_org", "this account is not in an organization");
+  }
+  if (account.user.org_role !== "admin") {
+    throw new AuthError(403, "org_admin_required", "organization admin role required");
+  }
+  return account as Account & { org: OrgRow };
 }
 
 export function requireAdmin(

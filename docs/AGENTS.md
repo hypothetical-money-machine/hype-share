@@ -23,6 +23,17 @@ export SHAREPLAN_URL=https://hype-share.com
 export SHAREPLAN_TOKEN=sp_...
 ```
 
+### Joining an organization
+
+If your team gave you an organization join token, register with it and the key publishes at the team's tier:
+
+```bash
+export SHAREPLAN_ORG_TOKEN=org_...
+npx shareplan register --url https://hype-share.com --name claude-ci
+```
+
+(`--org-token org_...` also works.) The response's `effectiveTier` is the tier that applies. `shareplan whoami` and `GET /api/v1/me` show it later. The token is never written to the config file.
+
 ### Self-hosted (running your own server)
 
 When using a self-hosted or private shareplan server:
@@ -81,9 +92,12 @@ POST /api/v1/register
 Content-Type: application/json
 
 {
-  "name": "claude"
+  "name": "claude",
+  "orgToken": "org_..."
 }
 ```
+
+`orgToken` is optional. When present it must be a valid organization join token, and the new key is created inside that organization.
 
 Response (`201`):
 
@@ -94,13 +108,18 @@ Response (`201`):
   "name": "claude",
   "token": "sp_9f2m...",
   "tier": "free--",
+  "effectiveTier": "paid",
+  "org": { "id": "3f9a1c2b7d4e5f60", "name": "SkySlope", "tier": "paid", "role": "member" },
   "claimUrl": "https://hype-share.com/claim/AbCdEfGhIjKlMnOpQrStUv",
   "createdAt": "2026-09-13T22:00:00.000Z"
 }
 ```
 
+Without `orgToken` the response carries `"effectiveTier": "free--"` and `"org": null`.
+
 Registration is rate limited to 10 successful requests per day per hashed IP address.
 Save the returned `token`; the server stores only a SHA-256 hash.
+An unknown or rotated token returns `401 invalid_org_token`; a full organization returns `403 org_full`.
 
 ### Create a site
 
@@ -153,7 +172,10 @@ Resets `expiresAt` to the tier maximum (30 days from now for `free--`). Sites th
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| `POST` | `/api/v1/register` | Register an agent key (`free--` tier) |
+| `POST` | `/api/v1/register` | Register an agent key (`free--` tier), optionally inside an organization with `orgToken` |
+| `GET` | `/api/v1/me` | Show your user id, tier, effective tier, and organization |
+| `POST` | `/api/v1/org/join` | Join an organization with a join token using an existing key |
+| `POST` | `/api/v1/org/keys` | Mint a key for a new member (org admins only) |
 | `POST` | `/api/v1/sites` | Publish a new site |
 | `PUT` | `/api/v1/sites/:id` | Publish a new version of an existing site |
 | `POST` | `/api/v1/sites/:id/touch` | Reset TTL to the tier maximum (site owner only) |
@@ -167,7 +189,7 @@ Always use the `url` from the response rather than constructing one:
 - On self-hosted servers with `SHAREPLAN_SITE_HOST_SUFFIX`, sites are served at `https://<id>.<suffix>/`.
 - On self-hosted servers without a host suffix, sites are served at `http://<host>:<port>/s/<id>/` on the API host.
 
-On `PUT`, omitting `ttl` preserves the current expiry. Only `paid` or `ops` tier accounts may set `"ttl": null` for permanent hosting.
+On `PUT`, omitting `ttl` preserves the current expiry. Only accounts whose `effectiveTier` is `paid` or `ops` (your own tier, or a `paid` organization) may set `"ttl": null` for permanent hosting.
 
 ## Limits and account tiers
 
@@ -177,7 +199,7 @@ On `PUT`, omitting `ttl` preserves the current expiry. Only `paid` or `ops` tier
 - **File structure**: Multi-file uploads require an `index.html`. Single files wrap automatically.
 - **Site size**: 50 MiB total byte size, maximum 200 files.
 - **TTL**: Default 7d, maximum 30d. Setting `ttl: null` returns `400 ttl_not_allowed`.
-- **Slugs**: Vanity slugs are not allowed on `free--` (requires `free` or higher). Returns `400 slug_not_allowed`.
+- **Slugs**: Vanity slugs are not allowed on `free--` (requires `free-` or higher). Returns `400 slug_not_allowed`.
 - **Visibility**: `unlisted` by default. `public` returns `400 visibility_not_allowed`. `private` sites require owner API key to access.
 - **Rate limits**: 120 publish/touch requests per hour per user and per IP hash. 10 registers per day per IP hash.
 
@@ -185,6 +207,12 @@ On `PUT`, omitting `ttl` preserves the current expiry. Only `paid` or `ops` tier
 
 - **Operator keys (`ops` tier)**: No TTL maximum cap, permanent hosting (`"ttl": null`) allowed, vanity slugs allowed, exempt from IP rate limits.
 - **Registered keys (`free--` tier)**: Same default 7d / max 30d TTL rules as hosted, unless custom server limits are configured.
+
+### Organization members
+
+- **Limits**: Follow `effectiveTier`, the higher of your own tier and the organization's. `GET /api/v1/me` shows both.
+- **Rate limits**: Publishes and touches count against your own hourly cap, and also against the organization's pooled hourly cap when the organization's tier is the one you publish on (a member whose own tier is higher than the organization's skips the pool). A `429` whose message says `organization publish limit reached` means the pool is spent; wait for the next clock hour.
+- **Tier changes**: If the organization's tier is lowered, your permanent sites gain an expiry at the new maximum unless your own tier is `paid`, and vanity slugs or public listing may be dropped.
 
 ## Example prompt
 

@@ -6,6 +6,7 @@ import {
   listExpiredSites,
   pruneClaimAuthFlows,
   pruneRateLimits,
+  reconcilePermanentSites,
 } from "./db.js";
 import { deleteSiteObjects } from "./storage.js";
 
@@ -34,6 +35,17 @@ export async function reapExpiredSites(
 ): Promise<{ sites: number; objects: number }> {
   pruneRateLimits(deps.db, now);
   pruneClaimAuthFlows(deps.db, now);
+  // Guarded so a reconcile failure never blocks expired-site deletion.
+  try {
+    const { clamped } = reconcilePermanentSites(deps.db, now, deps.log);
+    if (clamped > 0) {
+      deps.log?.info(
+        `reap: assigned expiry to ${clamped} permanent site(s) whose tier no longer allows it`,
+      );
+    }
+  } catch (err) {
+    deps.log?.warn(`reap: reconcile failed: ${errMessage(err)}`);
+  }
   const expired = listExpiredSites(deps.db, now);
   let sites = 0;
   let objects = 0;
