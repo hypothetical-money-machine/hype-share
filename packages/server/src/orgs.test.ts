@@ -523,6 +523,38 @@ describe("register with an org token", () => {
     expect(raised.statusCode).toBe(200);
     expect((await registerWithToken(app, joinToken, "c")).statusCode).toBe(201);
   });
+
+  it("a full org spends no register slot on either path", async () => {
+    const { app, db } = await setup();
+    const { org, joinToken } = await createOrg(app, {
+      name: "Small",
+      compTier: "paid",
+      maxMembers: 2,
+    });
+    const lead = await mintAdmin(app, org.id);
+    expect((await registerWithToken(app, joinToken, "a")).statusCode).toBe(201);
+    const bucket = () =>
+      db
+        .prepare(`SELECT count FROM rate_limits WHERE bucket = ? AND action = 'register'`)
+        .all(`org:${org.id}`);
+    expect(bucket()).toEqual([{ count: 1 }]);
+    const before = userCount(db);
+
+    const viaToken = await registerWithToken(app, joinToken, "b");
+    expect(viaToken.statusCode).toBe(403);
+    expect(errorCode(viaToken)).toBe("org_full");
+    const viaAdmin = await inject(app, {
+      method: "POST",
+      url: "/api/v1/org/keys",
+      headers: auth(lead.token),
+      payload: { name: "b" },
+    });
+    expect(viaAdmin.statusCode).toBe(403);
+    expect(errorCode(viaAdmin)).toBe("org_full");
+    expect(viaAdmin.json<ApiError>().error).toEqual(viaToken.json<ApiError>().error);
+    expect(bucket()).toEqual([{ count: 1 }]);
+    expect(userCount(db)).toBe(before);
+  });
 });
 
 describe("publishing as an org member", () => {
@@ -854,6 +886,39 @@ describe("operator: attach and detach users", () => {
     expect(full.statusCode).toBe(403);
     expect(errorCode(full)).toBe("org_full");
     expect(getUser(db, plain.userId)!.org_id).toBeNull();
+  });
+
+  it("never detaches or demotes the only admin", async () => {
+    const { app, db } = await setup();
+    const { org, joinToken } = await createOrg(app);
+    const lead = await mintAdmin(app, org.id);
+    const url = `/api/v1/admin/users/${lead.userId}/org`;
+    const before = getUser(db, lead.userId);
+
+    for (const body of [{ orgId: null }, { orgId: org.id, role: "member" }, { orgId: org.id }]) {
+      const res = await admin(app, "PUT", url, body);
+      expect(res.statusCode, JSON.stringify(body)).toBe(409);
+      expect(errorCode(res)).toBe("last_admin");
+      expect(getUser(db, lead.userId)).toEqual(before);
+    }
+    const same = await admin(app, "PUT", url, { orgId: org.id, role: "admin" });
+    expect(same.statusCode).toBe(200);
+    expect(same.json<{ role: string }>().role).toBe("admin");
+
+    const member = await joinAsMember(app, joinToken);
+    const promoted = await admin(app, "PUT", `/api/v1/admin/users/${member.userId}/org`, {
+      orgId: org.id,
+      role: "admin",
+    });
+    expect(promoted.statusCode).toBe(200);
+    const demoted = await admin(app, "PUT", url, { orgId: org.id });
+    expect(demoted.statusCode).toBe(200);
+    expect(demoted.json<{ role: string }>().role).toBe("member");
+    expect(getUser(db, lead.userId)!.org_role).toBe("member");
+    expect((await admin(app, "PUT", url, { orgId: org.id, role: "admin" })).statusCode).toBe(200);
+    const detached = await admin(app, "PUT", url, { orgId: null });
+    expect(detached.statusCode).toBe(200);
+    expect(getUser(db, lead.userId)).toMatchObject({ org_id: null, org_role: null });
   });
 });
 

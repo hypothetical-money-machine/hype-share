@@ -31,6 +31,7 @@ import {
   touchSite,
   updateOrg,
   updateSite,
+  type ClampCounts,
   type MintedKey,
   type OrgAdmin,
   type OrgMember,
@@ -556,12 +557,7 @@ program
   .action(async (orgId: string, opts: AdminOptions) => {
     try {
       const { clamped } = await deleteOrg(opts.url, opts.adminToken, orgId);
-      const parts = [
-        plural(clamped.users, "user", "detached"),
-        plural(clamped.sites, "site", "clamped"),
-      ];
-      if (clamped.skipped > 0) parts.push(plural(clamped.skipped, "user", "skipped"));
-      console.log(`deleted ${orgId} (${parts.join(", ")})`);
+      console.log(deletedLine(orgId, clamped));
     } catch (e) {
       fail(e);
     }
@@ -750,6 +746,16 @@ export function removedLine(result: RemovedMember): string {
     plural(result.revokedKeys, "key", "revoked"),
   ];
   return `removed ${result.userId} (${parts.join(", ")})`;
+}
+
+/** Every member is detached, including those skipped for an unknown own tier. */
+export function deletedLine(orgId: string, clamped: ClampCounts): string {
+  const parts = [
+    plural(clamped.users + clamped.skipped, "user", "detached"),
+    plural(clamped.sites, "site", "clamped"),
+  ];
+  if (clamped.skipped > 0) parts.push(plural(clamped.skipped, "user", "skipped"));
+  return `deleted ${orgId} (${parts.join(", ")})`;
 }
 
 function registerLine(created: RegisterResponse): string {

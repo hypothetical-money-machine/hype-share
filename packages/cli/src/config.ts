@@ -7,9 +7,6 @@ export interface CliConfig {
   token: string;
 }
 
-/** What the loader returns: the saved config plus the env-only org join token. */
-export type LoadedCliConfig = Partial<CliConfig> & { orgToken?: string };
-
 export function configPath(): string {
   const base =
     process.env.SHAREPLAN_CONFIG ??
@@ -17,12 +14,10 @@ export function configPath(): string {
   return base;
 }
 
-export function loadCliConfig(): LoadedCliConfig {
-  const fromEnv: LoadedCliConfig = {};
+export function loadCliConfig(): Partial<CliConfig> {
+  const fromEnv: Partial<CliConfig> = {};
   if (process.env.SHAREPLAN_URL) fromEnv.url = process.env.SHAREPLAN_URL.replace(/\/$/, "");
   if (process.env.SHAREPLAN_TOKEN) fromEnv.token = process.env.SHAREPLAN_TOKEN;
-  // The org join token is read from the environment only and never written to disk.
-  if (process.env.SHAREPLAN_ORG_TOKEN) fromEnv.orgToken = process.env.SHAREPLAN_ORG_TOKEN;
 
   const p = configPath();
   if (!existsSync(p)) return fromEnv;
@@ -32,7 +27,6 @@ export function loadCliConfig(): LoadedCliConfig {
     return {
       url: fromEnv.url ?? raw.url?.replace(/\/$/, ""),
       token: fromEnv.token ?? raw.token,
-      ...(fromEnv.orgToken !== undefined ? { orgToken: fromEnv.orgToken } : {}),
     };
   } catch {
     return fromEnv;

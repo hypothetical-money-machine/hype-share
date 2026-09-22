@@ -396,7 +396,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
         throw new HttpError(401, "invalid_org_token", "invalid organization join token");
       }
       // The token is the credential, so the org's daily bucket replaces the IP one.
-      consumeOrgRegister(deps.db, deps.config, org.id);
+      consumeOrgRegister(deps.db, deps.config, org);
       return reply
         .status(201)
         .send(mintOrgMember(deps.db, deps.config, org, body.name, "member"));

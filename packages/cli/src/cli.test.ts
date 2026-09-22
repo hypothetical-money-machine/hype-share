@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   buildPublishBody,
+  deletedLine,
   isCliEntrypoint,
   printable,
   removedLine,
@@ -104,6 +105,20 @@ describe("removedLine", () => {
   });
 });
 
+describe("deletedLine", () => {
+  it("counts skipped members as detached, since the server detaches every member", () => {
+    expect(deletedLine("org_1", { users: 4, sites: 6, skipped: 1 })).toBe(
+      "deleted org_1 (detached 5 users, clamped 6 sites, skipped 1 user)",
+    );
+  });
+
+  it("omits the skipped part when nobody was skipped", () => {
+    expect(deletedLine("org_1", { users: 1, sites: 0, skipped: 0 })).toBe(
+      "deleted org_1 (detached 1 user, clamped 0 sites)",
+    );
+  });
+});
+
 describe("org token and the config file", () => {
   const saved = {
     SHAREPLAN_CONFIG: process.env.SHAREPLAN_CONFIG,
@@ -129,20 +144,12 @@ describe("org token and the config file", () => {
     return file;
   }
 
-  it("reads SHAREPLAN_ORG_TOKEN from the environment only", () => {
+  it("leaves SHAREPLAN_ORG_TOKEN out of the loaded config; commands read it themselves", () => {
     const file = configFile();
     delete process.env.SHAREPLAN_URL;
     delete process.env.SHAREPLAN_TOKEN;
     process.env.SHAREPLAN_ORG_TOKEN = "org_" + "a".repeat(43);
     writeFileSync(file, JSON.stringify({ url: "https://x.test", token: "sp_saved" }));
-    const cfg = loadCliConfig();
-    expect(cfg).toEqual({
-      url: "https://x.test",
-      token: "sp_saved",
-      orgToken: "org_" + "a".repeat(43),
-    });
-
-    delete process.env.SHAREPLAN_ORG_TOKEN;
     expect(loadCliConfig()).toEqual({ url: "https://x.test", token: "sp_saved" });
   });
 
@@ -152,10 +159,9 @@ describe("org token and the config file", () => {
     saveCliConfig({ url: "https://x.test", token: "sp_new" });
     expect(readFileSync(file, "utf8")).not.toContain("org_");
 
-    // Even a loaded config carrying orgToken is written back without it.
-    const loaded = loadCliConfig();
-    expect(loaded.orgToken).toBe("org_" + "b".repeat(43));
-    saveCliConfig(loaded as CliConfig);
+    // A config object carrying extra fields is written back as url and token only.
+    const widened = { url: "https://x.test", token: "sp_new", orgToken: "org_" + "b".repeat(43) };
+    saveCliConfig(widened as CliConfig);
     const raw = readFileSync(file, "utf8");
     expect(raw).not.toContain("org_");
     expect(JSON.parse(raw)).toEqual({ url: "https://x.test", token: "sp_new" });

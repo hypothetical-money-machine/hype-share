@@ -10,6 +10,7 @@ import {
   higherTier,
   orgTier,
   policyFor,
+  TIER_POLICIES,
   type OrgRole,
   type OrgTier,
   type Tier,
@@ -1090,7 +1091,7 @@ function memberIds(db: DatabaseSync, orgId: string): string[] {
   ).map((r) => r.id);
 }
 
-function assertOrgHasRoom(db: DatabaseSync, org: OrgRow): void {
+export function assertOrgHasRoom(db: DatabaseSync, org: OrgRow): void {
   if (countOrgMembers(db, org.id) >= org.max_members) {
     throw new HttpError(403, "org_full", "organization has reached its member limit");
   }
@@ -1127,7 +1128,11 @@ export function createOrgMember(
   });
 }
 
-/** Attach, change role, or detach (org null). The user's sites are clamped either way. */
+/**
+ * Attach, change role, or detach (org null). The user's sites are clamped
+ * either way. Throws 409 when the write would leave the user's current org
+ * without an admin.
+ */
 export function setUserOrg(
   db: DatabaseSync,
   user: UserRow,
@@ -1137,9 +1142,14 @@ export function setUserOrg(
 ): { effectiveTier: Tier; clampedSites: number } {
   return transaction(db, () => {
     if (org !== null && user.org_id !== org.id) assertOrgHasRoom(db, org);
+    const nextRole = org === null ? null : (role ?? "member");
+    const staysAdmin = org !== null && org.id === user.org_id && nextRole === "admin";
+    if (user.org_id !== null && user.org_role === "admin" && !staysAdmin) {
+      assertNotLastAdmin(db, user.org_id, user.id);
+    }
     db.prepare(`UPDATE users SET org_id = ?, org_role = ? WHERE id = ?`).run(
       org === null ? null : org.id,
-      org === null ? null : (role ?? "member"),
+      nextRole,
       user.id,
     );
     const clampedSites = clampSitesForUser(db, getUser(db, user.id)!, now);
@@ -1157,6 +1167,13 @@ function otherAdminCount(db: DatabaseSync, orgId: string, userId: string): numbe
   return Number(row.n);
 }
 
+/** Throws 409 when userId is the only admin of orgId. */
+function assertNotLastAdmin(db: DatabaseSync, orgId: string, userId: string): void {
+  if (otherAdminCount(db, orgId, userId) === 0) {
+    throw new HttpError(409, "last_admin", "an organization needs at least one admin");
+  }
+}
+
 /**
  * Detach a member and clamp their sites; with revokeKeys, also revoke every
  * active key they hold, after the detach so the last-admin check runs first.
@@ -1172,9 +1189,7 @@ export function removeOrgMember(
   return transaction(db, () => {
     const target = getUser(db, userId);
     if (target === null || target.org_id !== orgId) return null;
-    if (target.org_role === "admin" && otherAdminCount(db, orgId, userId) === 0) {
-      throw new HttpError(409, "last_admin", "an organization needs at least one admin");
-    }
+    if (target.org_role === "admin") assertNotLastAdmin(db, orgId, userId);
     db.prepare(`UPDATE users SET org_id = NULL, org_role = NULL WHERE id = ?`).run(userId);
     const clampedSites = clampSitesForUser(db, getUser(db, userId)!, now);
     let revokedKeys = 0;
@@ -1198,12 +1213,8 @@ export function setOrgMemberRole(
   return transaction(db, () => {
     const target = getUser(db, userId);
     if (target === null || target.org_id !== orgId) return false;
-    if (
-      role === "member" &&
-      target.org_role === "admin" &&
-      otherAdminCount(db, orgId, userId) === 0
-    ) {
-      throw new HttpError(409, "last_admin", "an organization needs at least one admin");
+    if (role === "member" && target.org_role === "admin") {
+      assertNotLastAdmin(db, orgId, userId);
     }
     db.prepare(`UPDATE users SET org_role = ? WHERE id = ? AND org_id = ?`).run(
       role,
@@ -1331,28 +1342,41 @@ export function clampSitesForUsers(
  * Backstop for tier edits made outside the API: any permanent site whose
  * owner's current effective tier forbids a NULL expiry gets now + maxTtl. An
  * unknown own tier is skipped and logged rather than aborting the sweep.
+ *
+ * Rows that can never be clamped (an owner, or an org tier column, on a tier
+ * that allows a NULL expiry) are left out of the scan, which runs outside a
+ * transaction; one is opened only when a row needs resolving.
  */
 export function reconcilePermanentSites(
   db: DatabaseSync,
   now: number,
   log?: { warn(msg: string): void },
 ): { clamped: number; skipped: number } {
+  const permanentTiers = (Object.keys(TIER_POLICIES) as Tier[]).filter(
+    (tier) => TIER_POLICIES[tier].allowNullTtl,
+  );
+  const permanentOrgTiers = permanentTiers.filter((tier) => tier !== "ops");
+  const placeholders = (list: string[]): string => list.map(() => "?").join(", ");
+  const rows = db
+    .prepare(
+      `SELECT s.id, s.owner_user_id, u.tier AS user_tier, o.comp_tier, o.billing_tier
+       FROM sites s
+       JOIN users u ON u.id = s.owner_user_id
+       LEFT JOIN orgs o ON o.id = u.org_id
+       WHERE s.expires_at IS NULL
+         AND u.tier NOT IN (${placeholders(permanentTiers)})
+         AND (o.comp_tier IS NULL OR o.comp_tier NOT IN (${placeholders(permanentOrgTiers)}))
+         AND (o.billing_tier IS NULL OR o.billing_tier NOT IN (${placeholders(permanentOrgTiers)}))`,
+    )
+    .all(...permanentTiers, ...permanentOrgTiers, ...permanentOrgTiers) as unknown as {
+    id: string;
+    owner_user_id: string;
+    user_tier: string;
+    comp_tier: string | null;
+    billing_tier: string | null;
+  }[];
+  if (rows.length === 0) return { clamped: 0, skipped: 0 };
   return transaction(db, () => {
-    const rows = db
-      .prepare(
-        `SELECT s.id, s.owner_user_id, u.tier AS user_tier, o.comp_tier, o.billing_tier
-         FROM sites s
-         JOIN users u ON u.id = s.owner_user_id
-         LEFT JOIN orgs o ON o.id = u.org_id
-         WHERE s.expires_at IS NULL`,
-      )
-      .all() as unknown as {
-      id: string;
-      owner_user_id: string;
-      user_tier: string;
-      comp_tier: string | null;
-      billing_tier: string | null;
-    }[];
     const assign = db.prepare(
       `UPDATE sites SET expires_at = ? WHERE id = ? AND expires_at IS NULL`,
     );

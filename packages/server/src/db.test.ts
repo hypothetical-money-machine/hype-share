@@ -523,16 +523,45 @@ describe("membership", () => {
     const o = org(db, { maxMembers: 1 });
     const a = plainUser(db, "free--");
     const b = plainUser(db, "free");
-    expect(setUserOrg(db, a.user, o, "admin", now)).toEqual({
+    expect(setUserOrg(db, a.user, o, "member", now)).toEqual({
       effectiveTier: "paid",
       clampedSites: 0,
     });
-    expect(getUser(db, a.user.id)).toMatchObject({ org_id: o.id, org_role: "admin" });
+    expect(getUser(db, a.user.id)).toMatchObject({ org_id: o.id, org_role: "member" });
     expectHttpError(caught(() => setUserOrg(db, b.user, o, "member", now)), 403, "org_full");
     expect(getUser(db, b.user.id)?.org_id).toBeNull();
     // A role change inside the same org does not count against the cap.
-    expect(setUserOrg(db, getUser(db, a.user.id)!, o, "member", now).effectiveTier).toBe("paid");
-    expect(getUser(db, a.user.id)?.org_role).toBe("member");
+    expect(setUserOrg(db, getUser(db, a.user.id)!, o, "admin", now).effectiveTier).toBe("paid");
+    expect(getUser(db, a.user.id)?.org_role).toBe("admin");
+    expectNoOpenTransaction(db);
+    db.close();
+  });
+
+  it("setUserOrg keeps one admin on detach, demotion, and a move", () => {
+    const db = openDb(":memory:");
+    const o = org(db);
+    const other = org(db, { name: "Other" });
+    const lead = member(db, o, "admin");
+    const current = () => getUser(db, lead.user.id)!;
+
+    for (const [target, role] of [
+      [null, null],
+      [o, "member"],
+      [o, null],
+      [other, "admin"],
+    ] as const) {
+      expectHttpError(caught(() => setUserOrg(db, current(), target, role, now)), 409, "last_admin");
+      expect(current()).toMatchObject({ org_id: o.id, org_role: "admin" });
+    }
+    expect(setUserOrg(db, current(), o, "admin", now).effectiveTier).toBe("paid");
+    expect(current().org_role).toBe("admin");
+
+    member(db, o, "admin");
+    expect(setUserOrg(db, current(), o, "member", now).effectiveTier).toBe("paid");
+    expect(current().org_role).toBe("member");
+    expect(setOrgMemberRole(db, o.id, lead.user.id, "admin")).toBe(true);
+    expect(setUserOrg(db, current(), null, null, now).effectiveTier).toBe("free--");
+    expect(current()).toMatchObject({ org_id: null, org_role: null });
     expectNoOpenTransaction(db);
     db.close();
   });
@@ -751,6 +780,34 @@ describe("reconcilePermanentSites", () => {
     expect(reconcilePermanentSites(db, now)).toEqual({ clamped: 0, skipped: 1 });
     db.prepare(`UPDATE users SET tier = 'paid' WHERE id = ?`).run(gold.user.id);
     expect(reconcilePermanentSites(db, now)).toEqual({ clamped: 0, skipped: 0 });
+    expectNoOpenTransaction(db);
+    db.close();
+  });
+
+  it("leaves rows that can never be clamped out of the scan and opens no transaction", () => {
+    const db = openDb(":memory:");
+    const comped = org(db);
+    const billed = org(db, { name: "Billed", compTier: null });
+    db.prepare(`UPDATE orgs SET billing_tier = 'paid' WHERE id = ?`).run(billed.id);
+    siteRow(db, "ops", createOpsKey(db, { name: "ops", token: "sp_ops", now }));
+    siteRow(db, "paid", plainUser(db, "paid"));
+    siteRow(db, "comp", member(db, comped));
+    siteRow(db, "billing", member(db, getOrg(db, billed.id)!));
+
+    // Inside an outer transaction any BEGIN the sweep attempts would throw.
+    db.exec("BEGIN");
+    expect(reconcilePermanentSites(db, now)).toEqual({ clamped: 0, skipped: 0 });
+    db.exec("ROLLBACK");
+
+    siteRow(db, "free", plainUser(db, "free--"));
+    db.exec("BEGIN");
+    expect(() => reconcilePermanentSites(db, now)).toThrow(/within a transaction/);
+    db.exec("ROLLBACK");
+    expect(reconcilePermanentSites(db, now)).toEqual({ clamped: 1, skipped: 0 });
+    expect(getSite(db, "free")?.expires_at).toBe(now + 30 * DAY);
+    for (const id of ["ops", "paid", "comp", "billing"]) {
+      expect(getSite(db, id)?.expires_at, id).toBeNull();
+    }
     expectNoOpenTransaction(db);
     db.close();
   });

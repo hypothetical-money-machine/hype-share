@@ -5,6 +5,7 @@ import { z } from "zod";
 import { createApiKey, type SiteListItem } from "@shareplan/core";
 import type { Config } from "./config.js";
 import {
+  assertOrgHasRoom,
   countOrgMembers,
   countOrgSites,
   createOrg,
@@ -218,9 +219,14 @@ function requireOrg(db: DatabaseSync, id: string): OrgRow {
   return org;
 }
 
-/** The org's daily register bucket, shared by token registration and admin minting. */
-export function consumeOrgRegister(db: DatabaseSync, config: Config, orgId: string): void {
-  if (!consumeRate(db, `org:${orgId}`, "register", config.orgRegisterPerDay)) {
+/**
+ * The org's daily register bucket, shared by token registration and admin
+ * minting. A full org is refused before the bucket is charged so the attempt
+ * costs no slot; createOrgMember repeats the check inside its transaction.
+ */
+export function consumeOrgRegister(db: DatabaseSync, config: Config, org: OrgRow): void {
+  assertOrgHasRoom(db, org);
+  if (!consumeRate(db, `org:${org.id}`, "register", config.orgRegisterPerDay)) {
     throw new HttpError(429, "rate_limited", "too many registrations for this organization");
   }
 }
@@ -280,7 +286,7 @@ export function registerOrgRoutes(app: FastifyInstance, deps: OrgRouteDeps): voi
   app.post("/api/v1/org/keys", async (req, reply) => {
     const account = requireOrgAdmin(db, req);
     const body = mintKeySchema.parse(req.body ?? {});
-    consumeOrgRegister(db, config, account.org.id);
+    consumeOrgRegister(db, config, account.org);
     return reply.status(201).send(mintOrgMember(db, config, account.org, body.name, body.role));
   });
 
