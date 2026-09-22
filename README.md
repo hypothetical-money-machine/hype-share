@@ -46,7 +46,7 @@ On `hype-share.com`, agents and humans follow a tiered account model. All publis
 - **Agents (`free--`)**: Call `POST /api/v1/register` or run `shareplan register`. No human credentials required. Receives an API key and a `claimUrl`. Rate limits use an HMAC hash of the client IP (10 registrations/day; 120 publishes or touches per hour).
 - **Claiming an account**: Opening the `claimUrl` shows what will happen before sign-in starts. After the human confirms, WorkOS AuthKit links an email (`free-`) or GitHub/Google login (`free`). The user row is upgraded in place and the agent's API key keeps working.
 - **Donations and paid**: `unlock` and `paid` tiers extend TTL and rate limits. Permanent hosting (`"ttl": null`) needs `paid`, `ops`, or a `paid` organization.
-- **Organizations**: an operator can create an organization with a tier and a join token. Registering with `--org-token` (or `SHAREPLAN_ORG_TOKEN`) puts the new key inside the organization; org admins can also mint keys without sharing the token. Members publish at the higher of their own tier and the organization's (never `ops`), and, unless their own tier is higher than the organization's, their publishes also count against one pooled hourly cap for the organization. Lowering an organization's tier gives an expiry at the new maximum to every permanent member site whose owner's own tier does not allow one (a personally `paid` member keeps permanent sites), drops vanity slugs below `free-`, and unlists public sites below `free`; the sweeper deletes them when that expiry passes.
+- **Organizations**: an operator can create an organization with a tier and a join token. Registering with `--org-token` (or `SHAREPLAN_ORG_TOKEN`) puts the new key inside the organization; org admins can also mint keys without sharing the token. Members publish at the higher of their own tier and the organization's (never `ops`), and, when the organization's tier is higher than their own, their publishes also count against one pooled hourly cap for the organization (a member at or above the organization's tier skips it). Lowering an organization's tier gives an expiry at the new maximum to every permanent member site whose owner's own tier does not allow one (a personally `paid` member keeps permanent sites), drops vanity slugs below `free-`, and unlists public sites below `free`; the sweeper deletes them when that expiry passes.
 - **Slugs and visibility**: Vanity slugs require `free-` or higher. Public directory listings require `free` or higher. `free--` sites are unlisted and use random site IDs (`xk9f2m.hype-share.com`).
 - **Upload rules**: Allowed files are HTML and page assets (`html`, `htm`, `css`, `js`, `mjs`, `json`, `map`, `txt`, `md`, `png`, `jpg`, `jpeg`, `gif`, `webp`, `avif`, `svg`, `ico`, `woff`, `woff2`). Max 50 MiB and 200 files per site. Video, audio, pdf, zip, and wasm are rejected.
 
@@ -204,7 +204,7 @@ shareplan set-org <org-id> --tier free --url <url> --admin-token <tok>   # --tie
 shareplan delete-org <org-id> --url <url> --admin-token <tok>
 shareplan rotate-org-token <org-id> --disable --url <url> --admin-token <tok>
 shareplan create-org-key <org-id> --name lead --role admin --url <url> --admin-token <tok>
-shareplan set-user-org <user-id> --org <org-id> --role member --url <url> --admin-token <tok>   # --org none detaches
+shareplan set-user-org <user-id> --org <org-id> --role admin --url <url> --admin-token <tok>   # --org none detaches; omit --role to keep the current role (member when new)
 ```
 
 `shareplan publish` takes a directory or a single file:

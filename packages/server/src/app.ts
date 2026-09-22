@@ -363,7 +363,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       "## Limits and tiers",
       "- free-- (registered / hosted): 7d default TTL, 30d max, unlisted, no vanity slugs",
       "- ops (self-hosted operator key): no TTL maximum cap, permanent hosting (ttl: null) and slugs allowed",
-      "- organization members: limits follow effectiveTier, the higher of your own tier and the organization's; publishes also count against the organization's pooled hourly cap when you publish on the organization's tier (skipped when your own tier is higher)",
+      "- organization members: limits follow effectiveTier, the higher of your own tier and the organization's; publishes also count against the organization's pooled hourly cap when the organization's tier is higher than your own (a member at or above the organization's tier skips it)",
       "- Files: HTML, CSS, JS, JSON, text, markdown, images, fonts (up to 50 MiB, 200 files)",
       "",
     ].join("\n");

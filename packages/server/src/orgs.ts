@@ -93,7 +93,7 @@ const updateOrgSchema = z
 
 const setUserOrgSchema = z.object({
   orgId: z.string().min(1).nullable(),
-  role: roleSchema.default("member"),
+  role: roleSchema.optional(),
 });
 
 export interface OrgRouteDeps {
@@ -104,14 +104,14 @@ export interface OrgRouteDeps {
 
 /**
  * The pooled org publish bucket, or null when the member publishes on their
- * own plan: no org, an ops user, a tier-less org, or an own tier above the
- * org's.
+ * own plan: no org, an ops user, a tier-less org, or an own tier at or above
+ * the org's. The pool applies only when the org lifts the member.
  */
 export function orgPublishPool(account: Account): { orgId: string; limit: number } | null {
   const org = account.org;
   if (org === null || account.user.tier === "ops") return null;
   const t = orgTier(org);
-  if (t === null || TIER_RANK[t] < TIER_RANK[account.user.tier]) return null;
+  if (t === null || TIER_RANK[t] <= TIER_RANK[account.user.tier]) return null;
   return { orgId: org.id, limit: org.publish_per_hour ?? policyFor(t).publishPerHour };
 }
 
@@ -433,7 +433,9 @@ export function registerOrgRoutes(app: FastifyInstance, deps: OrgRouteDeps): voi
         );
       }
     }
-    const role = org === null ? null : body.role;
+    // Role omitted on an attach keeps the current role inside the same org.
+    const currentRole = org !== null && user.org_id === org.id ? user.org_role : null;
+    const role = org === null ? null : (body.role ?? currentRole ?? "member");
     const result = setUserOrg(db, user, org, role, Date.now());
     return reply.send({
       userId: user.id,

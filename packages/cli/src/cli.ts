@@ -608,8 +608,8 @@ program
   .requiredOption("--url <url>", "shareplan base URL")
   .requiredOption("--admin-token <token>", "admin token")
   .requiredOption("--org <org-id>", "organization id, or none to detach")
-  .option("--role <role>", "admin | member", parseOrgRole, "member")
-  .action(async (userId: string, opts: AdminOptions & { org: string; role: OrgRole }) => {
+  .option("--role <role>", "admin | member (omitted keeps the current role)", parseOrgRole)
+  .action(async (userId: string, opts: AdminOptions & { org: string; role?: OrgRole }) => {
     try {
       const orgId = opts.org === "none" ? null : opts.org;
       const result = await setUserOrg(opts.url, opts.adminToken, userId, orgId, opts.role);

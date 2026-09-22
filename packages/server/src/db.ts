@@ -1152,7 +1152,7 @@ export function setUserOrg(
       nextRole,
       user.id,
     );
-    const clampedSites = clampSitesForUser(db, getUser(db, user.id)!, now);
+    const clampedSites = clampSitesForUser(db, getUser(db, user.id)!, now) ?? 0;
     return { effectiveTier: effectiveTier(user.tier, orgTier(org)), clampedSites };
   });
 }
@@ -1191,7 +1191,7 @@ export function removeOrgMember(
     if (target === null || target.org_id !== orgId) return null;
     if (target.org_role === "admin") assertNotLastAdmin(db, orgId, userId);
     db.prepare(`UPDATE users SET org_id = NULL, org_role = NULL WHERE id = ?`).run(userId);
-    const clampedSites = clampSitesForUser(db, getUser(db, userId)!, now);
+    const clampedSites = clampSitesForUser(db, getUser(db, userId)!, now) ?? 0;
     let revokedKeys = 0;
     if (opts.revokeKeys) {
       const result = db
@@ -1303,10 +1303,21 @@ export function clampSitesToPolicy(
   return touched.size;
 }
 
-/** Clamp one user against their current effective tier. Throws on an unknown own tier. */
-function clampSitesForUser(db: DatabaseSync, user: UserRow, now: number): number {
+/**
+ * Clamp one user against their current effective tier. Null when the user's
+ * own tier is unknown: the clamp is skipped so a membership change on an
+ * edited row still goes through.
+ */
+function clampSitesForUser(db: DatabaseSync, user: UserRow, now: number): number | null {
   const org = user.org_id === null ? null : getOrg(db, user.org_id);
-  return clampSitesToPolicy(db, user.id, policyFor(effectiveTier(user.tier, orgTier(org))), now);
+  let policy: TierPolicy;
+  try {
+    policy = policyFor(effectiveTier(user.tier, orgTier(org)));
+  } catch (err) {
+    if (!(err instanceof UnknownTierError)) throw err;
+    return null;
+  }
+  return clampSitesToPolicy(db, user.id, policy, now);
 }
 
 /**
@@ -1326,14 +1337,13 @@ export function clampSitesForUsers(
   for (const id of userIds) {
     const user = getUser(db, id);
     if (user === null) continue;
-    try {
-      sites += clampSitesForUser(db, user, now);
-    } catch (err) {
-      if (!(err instanceof UnknownTierError)) throw err;
+    const clamped = clampSitesForUser(db, user, now);
+    if (clamped === null) {
       skipped += 1;
       continue;
     }
     users += 1;
+    sites += clamped;
   }
   return { users, sites, skipped };
 }
@@ -1382,20 +1392,25 @@ export function reconcilePermanentSites(
     );
     let clamped = 0;
     let skipped = 0;
+    const unknownOwners = new Set<string>();
     for (const row of rows) {
       let policy: TierPolicy;
       try {
         policy = policyFor(effectiveTier(row.user_tier as Tier, orgTier(row)));
       } catch (err) {
+        if (!(err instanceof UnknownTierError)) throw err;
         skipped += 1;
-        log?.warn(
-          `reap: skipped permanent site ${row.id}: ${err instanceof Error ? err.message : String(err)}`,
-        );
+        unknownOwners.add(row.owner_user_id);
         continue;
       }
       if (policy.allowNullTtl) continue;
       const result = assign.run(clampStoredExpiry(policy, null, now), row.id);
       clamped += Number(result.changes ?? 0);
+    }
+    if (skipped > 0) {
+      log?.warn(
+        `reap: skipped ${skipped} permanent site(s) owned by ${unknownOwners.size} user(s) with an unknown tier: ${[...unknownOwners].join(", ")}`,
+      );
     }
     return { clamped, skipped };
   });

@@ -383,7 +383,7 @@ export function setUserOrg(
   adminToken: string,
   userId: string,
   orgId: string | null,
-  role: OrgRole,
+  role?: OrgRole,
 ): Promise<{
   userId: string;
   orgId: string | null;

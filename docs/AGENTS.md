@@ -211,7 +211,7 @@ On `PUT`, omitting `ttl` preserves the current expiry. Only accounts whose `effe
 ### Organization members
 
 - **Limits**: Follow `effectiveTier`, the higher of your own tier and the organization's. `GET /api/v1/me` shows both.
-- **Rate limits**: Publishes and touches count against your own hourly cap, and also against the organization's pooled hourly cap when the organization's tier is the one you publish on (a member whose own tier is higher than the organization's skips the pool). A `429` whose message says `organization publish limit reached` means the pool is spent; wait for the next clock hour.
+- **Rate limits**: Publishes and touches count against your own hourly cap, and also against the organization's pooled hourly cap when the organization's tier is higher than your own (a member at or above the organization's tier skips the pool). A `429` whose message says `organization publish limit reached` means the pool is spent; wait for the next clock hour.
 - **Tier changes**: If the organization's tier is lowered, your permanent sites gain an expiry at the new maximum unless your own tier is `paid`, and vanity slugs or public listing may be dropped.
 
 ## Example prompt

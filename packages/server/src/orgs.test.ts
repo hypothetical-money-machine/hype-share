@@ -637,6 +637,20 @@ describe("publishing as an org member", () => {
     expect(rows).toEqual([]);
   });
 
+  it("a member at the org's own tier skips the pool", async () => {
+    const { app, db } = await setup();
+    const { org } = await createOrg(app, { name: "Free", compTier: "free", publishPerHour: 1 });
+    const user = createUser(db, { tier: "free--" });
+    setUserTier(db, user.id, "free");
+    createApiKeyRecord(db, { name: "free", token: "sp_free", userId: user.id });
+    const attach = await admin(app, "PUT", `/api/v1/admin/users/${user.id}/org`, { orgId: org.id });
+    expect(attach.statusCode).toBe(200);
+    expect((await publish(app, helloSite(), "sp_free")).statusCode).toBe(201);
+    expect((await publish(app, helloSite(), "sp_free")).statusCode).toBe(201);
+    const rows = db.prepare(`SELECT bucket FROM rate_limits WHERE bucket LIKE 'org:%'`).all();
+    expect(rows).toEqual([]);
+  });
+
   it("never lowers a member below their own tier", async () => {
     const { app, db } = await setup();
     const { org } = await createOrg(app, { name: "Low", compTier: "free-" });
@@ -895,7 +909,7 @@ describe("operator: attach and detach users", () => {
     const url = `/api/v1/admin/users/${lead.userId}/org`;
     const before = getUser(db, lead.userId);
 
-    for (const body of [{ orgId: null }, { orgId: org.id, role: "member" }, { orgId: org.id }]) {
+    for (const body of [{ orgId: null }, { orgId: org.id, role: "member" }]) {
       const res = await admin(app, "PUT", url, body);
       expect(res.statusCode, JSON.stringify(body)).toBe(409);
       expect(errorCode(res)).toBe("last_admin");
@@ -911,7 +925,7 @@ describe("operator: attach and detach users", () => {
       role: "admin",
     });
     expect(promoted.statusCode).toBe(200);
-    const demoted = await admin(app, "PUT", url, { orgId: org.id });
+    const demoted = await admin(app, "PUT", url, { orgId: org.id, role: "member" });
     expect(demoted.statusCode).toBe(200);
     expect(demoted.json<{ role: string }>().role).toBe("member");
     expect(getUser(db, lead.userId)!.org_role).toBe("member");
@@ -919,6 +933,27 @@ describe("operator: attach and detach users", () => {
     const detached = await admin(app, "PUT", url, { orgId: null });
     expect(detached.statusCode).toBe(200);
     expect(getUser(db, lead.userId)).toMatchObject({ org_id: null, org_role: null });
+  });
+
+  it("keeps the current role when role is omitted", async () => {
+    const { app, db } = await setup();
+    const { org } = await createOrg(app);
+    const lead = await mintAdmin(app, org.id);
+
+    const kept = await admin(app, "PUT", `/api/v1/admin/users/${lead.userId}/org`, {
+      orgId: org.id,
+    });
+    expect(kept.statusCode).toBe(200);
+    expect(kept.json<{ role: string }>().role).toBe("admin");
+    expect(getUser(db, lead.userId)!.org_role).toBe("admin");
+
+    const plain = (await register(app)).json<Minted>();
+    const attached = await admin(app, "PUT", `/api/v1/admin/users/${plain.userId}/org`, {
+      orgId: org.id,
+    });
+    expect(attached.statusCode).toBe(200);
+    expect(attached.json<{ role: string }>().role).toBe("member");
+    expect(getUser(db, plain.userId)!.org_role).toBe("member");
   });
 });
 

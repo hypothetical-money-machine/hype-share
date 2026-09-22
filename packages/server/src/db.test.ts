@@ -37,7 +37,7 @@ import {
   type UserRow,
 } from "./db.js";
 import { HttpError } from "./errors.js";
-import { policyFor, UnknownTierError, type OrgRole, type Tier } from "./tiers.js";
+import { policyFor, type OrgRole, type Tier } from "./tiers.js";
 
 type Db = ReturnType<typeof openDb>;
 
@@ -489,11 +489,13 @@ describe("updateOrg", () => {
     expect(getSite(db, "a1")?.expires_at).toBe(now + 30 * DAY);
     expect(getSite(db, "b1")?.expires_at).toBeNull();
 
-    // A single-user operation on the edited row still surfaces the bad tier.
-    expect(caught(() => removeOrgMember(db, o.id, b.user.id, now))).toBeInstanceOf(
-      UnknownTierError,
-    );
-    expect(getUser(db, b.user.id)?.org_id).toBe(o.id);
+    // A single-user operation on the edited row skips the clamp and goes through.
+    expect(removeOrgMember(db, o.id, b.user.id, now)).toEqual({ clampedSites: 0, revokedKeys: 0 });
+    expect(getUser(db, b.user.id)).toMatchObject({ org_id: null, org_role: null });
+    expect(getSite(db, "b1")?.expires_at).toBeNull();
+    expect(setUserOrg(db, getUser(db, b.user.id)!, o, "admin", now).clampedSites).toBe(0);
+    expect(getUser(db, b.user.id)).toMatchObject({ org_id: o.id, org_role: "admin" });
+    expect(getSite(db, "b1")?.expires_at).toBeNull();
 
     expect(deleteOrg(db, o.id, now)).toEqual({ users: 1, sites: 0, skipped: 1 });
     expect(getUser(db, b.user.id)).toMatchObject({ org_id: null, org_role: null });
@@ -775,7 +777,8 @@ describe("reconcilePermanentSites", () => {
       expect(getSite(db, id)?.expires_at, id).toBeNull();
     }
     expect(warnings).toHaveLength(1);
-    expect(warnings[0]).toMatch(/gold/);
+    expect(warnings[0]).toContain("skipped 1 permanent site(s) owned by 1 user(s)");
+    expect(warnings[0]).toContain(gold.user.id);
 
     expect(reconcilePermanentSites(db, now)).toEqual({ clamped: 0, skipped: 1 });
     db.prepare(`UPDATE users SET tier = 'paid' WHERE id = ?`).run(gold.user.id);

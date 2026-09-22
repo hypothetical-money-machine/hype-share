@@ -192,7 +192,7 @@ Publish and touch consume up to three buckets, all action `publish`, hourly wind
 |---|---|---|---|
 | 1 | `ip:<hmac>` | `policyFor(account.tier).publishPerHour` | only if the effective policy has `ipPublishLimit` (`free--` alone); a member whose org tier is above `free--` never hits it, since the org lifts the effective tier out of `free--`. A `free--` org lifts nothing, so its `free--` members still consume this bucket |
 | 2 | `user:<user.id>` | `policyFor(account.tier).publishPerHour` | always |
-| 3 | `org:<org.id>` | `org.publish_per_hour ?? policyFor(orgTier).publishPerHour` | the org has a tier, the user is not `ops`, and the org tier ranks at or above the user's own tier (a personally paid member of a free org publishes on their own plan and skips the pool) |
+| 3 | `org:<org.id>` | `org.publish_per_hour ?? policyFor(orgTier).publishPerHour` | the org has a tier, the user is not `ops`, and the org tier ranks above the user's own tier (a member at or above the org tier, such as a personally paid member of a free org, publishes on their own plan and skips the pool) |
 
 User before org, so a runaway agent that is already over its own cap never touches the shared pool. The org refusal message is `organization publish limit reached`.
 
