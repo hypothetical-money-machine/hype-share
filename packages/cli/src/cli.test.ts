@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "n
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
+  buildCreateOrgBody,
   buildPublishBody,
   deletedLine,
   isCliEntrypoint,
@@ -54,6 +55,23 @@ describe("buildPublishBody", () => {
     expect(() => buildPublishBody(files, { visibility: "bogus" })).toThrow(
       /invalid --visibility "bogus"/,
     );
+  });
+});
+
+describe("buildCreateOrgBody", () => {
+  it("rejects --publish-per-hour without --tier client-side", () => {
+    expect(() => buildCreateOrgBody({ name: "SkySlope", publishPerHour: 5 })).toThrow(
+      /--publish-per-hour needs --tier/,
+    );
+  });
+
+  it("sends the pool with its tier and omits absent options", () => {
+    expect(buildCreateOrgBody({ name: "SkySlope", tier: "paid", publishPerHour: 5 })).toEqual({
+      name: "SkySlope",
+      compTier: "paid",
+      publishPerHour: 5,
+    });
+    expect(buildCreateOrgBody({ name: "SkySlope" })).toEqual({ name: "SkySlope" });
   });
 });
 

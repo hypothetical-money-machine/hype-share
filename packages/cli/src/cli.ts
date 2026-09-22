@@ -32,6 +32,7 @@ import {
   updateOrg,
   updateSite,
   type ClampCounts,
+  type CreateOrgBody,
   type MintedKey,
   type OrgAdmin,
   type OrgMember,
@@ -443,21 +444,9 @@ program
   .option("--max-members <n>", "member cap (default 100)", parsePositiveInt)
   .option("--publish-per-hour <n>", "pooled publish limit per hour (default: tier's limit)", parsePositiveInt)
   .action(
-    async (
-      opts: AdminOptions & {
-        name: string;
-        tier?: OrgTier;
-        maxMembers?: number;
-        publishPerHour?: number;
-      },
-    ) => {
+    async (opts: AdminOptions & CreateOrgOptions) => {
       try {
-        const created = await createOrg(opts.url, opts.adminToken, {
-          name: opts.name,
-          ...(opts.tier !== undefined ? { compTier: opts.tier } : {}),
-          ...(opts.maxMembers !== undefined ? { maxMembers: opts.maxMembers } : {}),
-          ...(opts.publishPerHour !== undefined ? { publishPerHour: opts.publishPerHour } : {}),
-        });
+        const created = await createOrg(opts.url, opts.adminToken, buildCreateOrgBody(opts));
         const o = created.org;
         console.log(created.joinToken);
         console.error(
@@ -659,6 +648,26 @@ export function buildPublishBody(
   }
 
   return body;
+}
+
+interface CreateOrgOptions {
+  name: string;
+  tier?: OrgTier;
+  maxMembers?: number;
+  publishPerHour?: number;
+}
+
+/** A pool on a tier-less org is stored but never applied, so refuse it before the request. */
+export function buildCreateOrgBody(opts: CreateOrgOptions): CreateOrgBody {
+  if (opts.publishPerHour !== undefined && opts.tier === undefined) {
+    throw new Error("--publish-per-hour needs --tier");
+  }
+  return {
+    name: opts.name,
+    ...(opts.tier !== undefined ? { compTier: opts.tier } : {}),
+    ...(opts.maxMembers !== undefined ? { maxMembers: opts.maxMembers } : {}),
+    ...(opts.publishPerHour !== undefined ? { publishPerHour: opts.publishPerHour } : {}),
+  };
 }
 
 /** The flag wins over SHAREPLAN_ORG_TOKEN; an empty value counts as unset. */

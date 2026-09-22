@@ -162,7 +162,10 @@ function cookiePair(res: LightMyRequestResponse, name: string): string {
 }
 
 /** Confirm, start, and complete the fake WorkOS claim for a claim URL. */
-async function completeClaimFlow(app: FastifyInstance, claimUrl: string): Promise<void> {
+async function completeClaimFlow(
+  app: FastifyInstance,
+  claimUrl: string,
+): Promise<LightMyRequestResponse> {
   const claimPath = new URL(claimUrl).pathname;
   const confirmation = await inject(app, { method: "GET", url: claimPath });
   const confirmationCookie = cookiePair(confirmation, "shareplan_claim_confirm");
@@ -184,6 +187,7 @@ async function completeClaimFlow(app: FastifyInstance, claimUrl: string): Promis
     headers: { cookie: callbackCookie },
   });
   expect(callback.statusCode).toBe(200);
+  return callback;
 }
 
 function publish(
@@ -393,6 +397,18 @@ describe("operator: create and validate orgs", () => {
     const empty = await admin(app, "PUT", `/api/v1/admin/orgs/${org.id}`, {});
     expect(empty.statusCode).toBe(400);
     expect(errorCode(empty)).toBe("validation_error");
+  });
+
+  it("needs a tier to accept a publish pool on create", async () => {
+    const { app, db } = await setup();
+    const bare = await admin(app, "POST", "/api/v1/admin/orgs", { name: "X", publishPerHour: 5 });
+    expect(bare.statusCode).toBe(400);
+    expect(errorCode(bare)).toBe("validation_error");
+    expect(bare.json<ApiError>().error.message).toContain("publishPerHour needs a tier");
+    expect(db.prepare(`SELECT COUNT(*) AS n FROM orgs`).get()).toEqual({ n: 0 });
+
+    const { org } = await createOrg(app, { name: "X", compTier: "free", publishPerHour: 5 });
+    expect(org).toMatchObject({ tier: "free", compTier: "free", publishPerHour: 5 });
   });
 });
 
@@ -1396,6 +1412,17 @@ describe("claiming an org member", () => {
     const shown = await admin(app, "GET", `/api/v1/admin/orgs/${org.id}`);
     const row = shown.json<{ members: Member[] }>().members.find((m) => m.userId === member.userId)!;
     expect(row).toMatchObject({ tier: "free-", effectiveTier: "paid", email: "human@example.com" });
+  });
+
+  it("reports the effective tier on the claim page", async () => {
+    const workos = createFakeWorkOS("MagicAuth");
+    const { app, db } = await setup({ workos: WORKOS_CONFIG }, workos.client);
+    const { joinToken } = await createOrg(app);
+    const member = await joinAsMember(app, joinToken);
+
+    const page = await completeClaimFlow(app, member.claimUrl);
+    expect(page.body).toContain("now has paid limits");
+    expect(getUser(db, member.userId)!.tier).toBe("free-");
   });
 });
 

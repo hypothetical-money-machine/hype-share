@@ -40,6 +40,7 @@ import {
   findOrgByJoinToken,
   findUserByClaimToken,
   getClaimAuthFlow,
+  getOrg,
   getSite,
   getSiteByIdOrSlug,
   getSiteBySlug,
@@ -72,6 +73,8 @@ import {
 import { consumeRate } from "./rate-limit.js";
 import {
   clampStoredExpiry,
+  effectiveTier,
+  orgTier,
   policyFor,
   resolveTierExpiry,
   tierForAuthenticationMethod,
@@ -604,11 +607,15 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
           email: authentication.user.email,
           authenticatedTier,
         });
+        const effective = effectiveTier(
+          user.tier,
+          orgTier(user.org_id === null ? null : getOrg(deps.db, user.org_id)),
+        );
         return authPage(
           reply,
           200,
           "Account claimed",
-          `The agent's existing API key now has ${user.tier} limits.`,
+          `The agent's existing API key now has ${effective} limits.`,
         );
       } catch (err) {
         deleteClaimAuthFlow(deps.db, query.state, browserNonce);

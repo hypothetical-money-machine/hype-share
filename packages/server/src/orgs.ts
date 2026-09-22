@@ -73,12 +73,16 @@ const joinTokenSchema = z.object({
 
 const setRoleSchema = z.object({ role: roleSchema });
 
-const createOrgSchema = z.object({
-  name: z.string().min(1).max(100),
-  compTier: z.string().nullable().default(null),
-  maxMembers: z.number().int().min(1).max(10000).default(100),
-  publishPerHour: z.number().int().min(1).nullable().default(null),
-});
+const createOrgSchema = z
+  .object({
+    name: z.string().min(1).max(100),
+    compTier: z.string().nullable().default(null),
+    maxMembers: z.number().int().min(1).max(10000).default(100),
+    publishPerHour: z.number().int().min(1).nullable().default(null),
+  })
+  .refine((body) => body.publishPerHour === null || body.compTier !== null, {
+    message: "publishPerHour needs a tier",
+  });
 
 const updateOrgSchema = z
   .object({

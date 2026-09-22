@@ -117,8 +117,9 @@ const ORG_COLS = `id, name, comp_tier, billing_tier, stripe_customer_id, join_to
        max_members, publish_per_hour, created_at, updated_at`;
 
 /** SITE_COLS qualified for queries that join sites with users. */
-const ORG_SITE_COLS = `s.id, s.owner_key_id, s.owner_user_id, s.slug, s.title, s.visibility,
-       s.current_version_id, s.created_at, s.updated_at, s.expires_at, s.byte_size, s.file_count`;
+const ORG_SITE_COLS = SITE_COLS.split(",")
+  .map((col) => `s.${col.trim()}`)
+  .join(", ");
 
 export function hashApiKey(token: string): string {
   return createHash("sha256").update(token, "utf8").digest("hex");
