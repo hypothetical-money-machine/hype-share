@@ -1,5 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
-import { TIER_POLICIES } from "./tiers.js";
+import { TIER_POLICIES, effectiveTier, orgTier, type Tier } from "./tiers.js";
 
 const DAY = 86_400_000;
 
@@ -40,7 +40,31 @@ export function getOwnerStats(db: DatabaseSync, now = Date.now()) {
     updated_at AS updatedAt, expires_at AS expiresAt FROM sites ORDER BY updated_at DESC, id LIMIT 20`).all() as {
       id: string; title: string | null; visibility: string; byteSize: number; updatedAt: number; expiresAt: number | null;
     }[];
-  return { generatedAt: new Date(now).toISOString(), accounts, sites, versions, keys, tiers, visibility, activity, recentSites };
+  // Org output never carries join_token_hash or member emails; the tier chart above stays own tiers only.
+  const orgTotals = db.prepare(`SELECT COUNT(*) AS total,
+    COALESCE(SUM(join_token_hash IS NOT NULL), 0) AS joinEnabled FROM orgs`).get() as { total: number; joinEnabled: number };
+  const orgMembers = db.prepare(`SELECT u.tier, o.comp_tier, o.billing_tier FROM users u
+    JOIN orgs o ON o.id = u.org_id WHERE u.tier <> 'ops'`).all() as { tier: Tier; comp_tier: string | null; billing_tier: string | null }[];
+  // Resolved in JS so an unknown own tier counts as not elevated rather than failing the whole page.
+  const elevated = orgMembers.filter(m => effectiveTier(m.tier, orgTier(m)) !== m.tier).length;
+  const orgRows = db.prepare(`SELECT o.id, o.name, o.comp_tier AS compTier, o.billing_tier AS billingTier,
+    o.max_members AS maxMembers, o.publish_per_hour AS publishPerHour, o.join_token_hash IS NOT NULL AS joinEnabled,
+    o.created_at AS createdAt,
+    (SELECT COUNT(*) FROM users u WHERE u.org_id = o.id) AS members,
+    (SELECT COUNT(*) FROM sites s JOIN users u ON u.id = s.owner_user_id WHERE u.org_id = o.id) AS sites,
+    (SELECT COUNT(*) FROM sites s JOIN users u ON u.id = s.owner_user_id WHERE u.org_id = o.id AND s.expires_at IS NULL) AS permanent
+    FROM orgs o ORDER BY members DESC, o.created_at, o.id LIMIT 20`).all() as {
+      id: string; name: string; compTier: string | null; billingTier: string | null; maxMembers: number;
+      publishPerHour: number | null; joinEnabled: number; createdAt: number; members: number; sites: number; permanent: number;
+    }[];
+  const orgList = orgRows.map(o => ({ ...o, tier: orgTier({ comp_tier: o.compTier, billing_tier: o.billingTier }) }));
+  return {
+    generatedAt: new Date(now).toISOString(),
+    accounts: { ...accounts, inOrg: orgMembers.length },
+    sites, versions, keys, tiers, visibility, activity, recentSites,
+    orgs: { ...orgTotals, members: orgMembers.length, elevated },
+    orgList,
+  };
 }
 
 export type OwnerStats = ReturnType<typeof getOwnerStats>;

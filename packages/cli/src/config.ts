@@ -33,10 +33,12 @@ export function loadCliConfig(): Partial<CliConfig> {
   }
 }
 
+/** Writes url and token only, so an org join token can never end up in the file. */
 export function saveCliConfig(cfg: CliConfig): void {
   const p = configPath();
   mkdirSync(path.dirname(p), { recursive: true });
-  writeFileSync(p, JSON.stringify(cfg, null, 2) + "\n", { mode: 0o600 });
+  const persisted: CliConfig = { url: cfg.url, token: cfg.token };
+  writeFileSync(p, JSON.stringify(persisted, null, 2) + "\n", { mode: 0o600 });
 }
 
 export function requireConfig(): CliConfig {

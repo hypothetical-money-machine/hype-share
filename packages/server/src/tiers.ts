@@ -71,7 +71,7 @@ export const TIER_POLICIES: Record<Tier, TierPolicy> = {
   },
 };
 
-const TIER_RANK: Record<Tier, number> = {
+export const TIER_RANK: Record<Tier, number> = {
   "free--": 0,
   "free-": 1,
   free: 2,
@@ -83,6 +83,40 @@ const TIER_RANK: Record<Tier, number> = {
 /** Return the stronger tier so a successful login never lowers an account. */
 export function higherTier(current: Tier, authenticated: Tier): Tier {
   return TIER_RANK[current] >= TIER_RANK[authenticated] ? current : authenticated;
+}
+
+export type OrgTier = Exclude<Tier, "ops">;
+export type OrgRole = "admin" | "member";
+export const ORG_TIERS = ["free--", "free-", "free", "unlock", "paid"] as const satisfies readonly OrgTier[];
+
+export function isOrgTier(value: string): value is OrgTier {
+  return isTier(value) && value !== "ops";
+}
+
+/**
+ * What an org contributes: the higher of comp and billing; null when it holds
+ * neither. Garbage or 'ops' in either column contributes nothing.
+ */
+export function orgTier(
+  org: { comp_tier: string | null; billing_tier: string | null } | null,
+): OrgTier | null {
+  if (org === null) return null;
+  const comp = org.comp_tier !== null && isOrgTier(org.comp_tier) ? org.comp_tier : null;
+  const billing =
+    org.billing_tier !== null && isOrgTier(org.billing_tier) ? org.billing_tier : null;
+  if (comp === null) return billing;
+  if (billing === null) return comp;
+  return higherTier(comp, billing) as OrgTier;
+}
+
+/**
+ * An org lifts a member, never lowers one, and never reaches ops. An unknown
+ * own tier is returned as-is so policyFor still throws UnknownTierError.
+ */
+export function effectiveTier(user: Tier, org: Tier | null): Tier {
+  if (user === "ops" || !isTier(user)) return user;
+  if (org === null || !isOrgTier(org)) return user;
+  return higherTier(user, org);
 }
 
 /** AuthKit methods accepted for a human account claim. */

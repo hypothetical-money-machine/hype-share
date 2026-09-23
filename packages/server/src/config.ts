@@ -36,6 +36,8 @@ export interface Config {
   /** Trust CF-Connecting-IP / X-Forwarded-For. Off unless behind a known proxy. */
   trustForwarded: boolean;
   registerPerDay: number;
+  /** Org-token registers and org-admin key mints per organization per day. */
+  orgRegisterPerDay: number;
   /** How many versions of a site keep their objects in S3. */
   versionRetention: number;
   /** How often to sweep expired sites, in ms. 0 disables the sweeper. */
@@ -121,6 +123,7 @@ export function loadConfig(envSource: NodeJS.ProcessEnv = process.env): Config {
     ipHashPepper: env("SHAREPLAN_IP_HASH_PEPPER") ?? null,
     trustForwarded: envBool("SHAREPLAN_TRUST_FORWARDED", false),
     registerPerDay: Math.max(1, envInt("SHAREPLAN_REGISTER_PER_DAY", 10)),
+    orgRegisterPerDay: Math.max(1, envInt("SHAREPLAN_ORG_REGISTER_PER_DAY", 100)),
     versionRetention: Math.max(1, envInt("SHAREPLAN_VERSION_RETENTION", 2)),
     reapIntervalMs: Math.max(0, envInt("SHAREPLAN_REAP_INTERVAL_SEC", 300)) * 1000,
     workos,

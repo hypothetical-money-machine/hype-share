@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   assertPublicBaseUrlIsApiHost,
+  loadConfig,
   normalizeSiteHostSuffix,
   normalizeWorkOSConfig,
   WORKOS_CALLBACK_PATH,
@@ -123,5 +124,18 @@ describe("assertPublicBaseUrlIsApiHost", () => {
     expect(() =>
       assertPublicBaseUrlIsApiHost("https://api.example.com", null),
     ).not.toThrow();
+  });
+});
+
+describe("loadConfig", () => {
+  const base = { SHAREPLAN_DATA_DIR: "/tmp" };
+
+  it("reads the org register limit with a default of 100 and a floor of 1", () => {
+    expect(loadConfig(base).orgRegisterPerDay).toBe(100);
+    expect(loadConfig({ ...base, SHAREPLAN_ORG_REGISTER_PER_DAY: "5" }).orgRegisterPerDay).toBe(5);
+    expect(loadConfig({ ...base, SHAREPLAN_ORG_REGISTER_PER_DAY: "0" }).orgRegisterPerDay).toBe(1);
+    expect(() => loadConfig({ ...base, SHAREPLAN_ORG_REGISTER_PER_DAY: "x" })).toThrow(
+      /must be a number/,
+    );
   });
 });

@@ -37,8 +37,10 @@ import {
   completeClaim,
   deleteClaimAuthFlow,
   deleteSite,
+  findOrgByJoinToken,
   findUserByClaimToken,
   getClaimAuthFlow,
+  getOrg,
   getSite,
   getSiteByIdOrSlug,
   getSiteBySlug,
@@ -54,22 +56,31 @@ import {
   updateSiteExpiry,
   updateSiteSlug,
   updateSiteVersion,
-  type ApiKeyRow,
   type SiteRow,
-  type UserRow,
 } from "./db.js";
-import { AuthError, requireAccount, requireAdmin } from "./auth.js";
+import { AuthError, requireAccount, requireAdmin, type Account } from "./auth.js";
 import { registerOwnerPortal } from "./owner.js";
 import { HttpError } from "./errors.js";
 import { hashIp, requestIp } from "./ip.js";
+import {
+  consumeOrgRegister,
+  createKeySchema,
+  mintOrgMember,
+  ORG_TOKEN_RE,
+  orgPublishPool,
+  registerOrgRoutes,
+} from "./orgs.js";
 import { consumeRate } from "./rate-limit.js";
 import {
   clampStoredExpiry,
+  effectiveTier,
+  orgTier,
   policyFor,
   resolveTierExpiry,
   tierForAuthenticationMethod,
   TtlPolicyError,
   UnknownTierError,
+  type Tier,
   type TierPolicy,
 } from "./tiers.js";
 import { FileError, ensureIndexHtml, prepareFiles } from "./files.js";
@@ -104,8 +115,11 @@ const updateSiteSchema = createSiteSchema.partial().extend({
   files: z.array(fileInputSchema).min(1),
 });
 
-const createKeySchema = z.object({
-  name: z.string().min(1).max(100).default("default"),
+const registerSchema = createKeySchema.extend({
+  orgToken: z
+    .string()
+    .regex(ORG_TOKEN_RE, "orgToken must be an organization join token")
+    .optional(),
 });
 
 const CLAIM_TOKEN_RE = /^[A-Za-z0-9_-]{22}$/;
@@ -264,6 +278,11 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 
   app.get("/healthz", async () => ({ ok: true }));
   registerOwnerPortal(app, deps.config, deps.db);
+  registerOrgRoutes(app, {
+    config: deps.config,
+    db: deps.db,
+    toListItem: (row) => toListItem(deps.config, row),
+  });
 
   app.get("/", async (_req, reply) => {
     reply.type("text/html; charset=utf-8");
@@ -305,6 +324,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       "",
       "Returns `token` (`sp_...`), `claimUrl`, and account metadata. Rate-limited to 10/day per IP hash.",
       "",
+      "Optional `\"orgToken\"`: an organization join token; the key then publishes at the organization's tier.",
+      "",
       "## Auth",
       "`Authorization: Bearer sp_...`",
       "",
@@ -337,6 +358,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       "## CLI",
       "```bash",
       "shareplan register --url <url> --name <name>",
+      "shareplan register --url <url> --name <name> --org-token org_...",
       "shareplan publish ./site --title \"plan\" --ttl 7d",
       "shareplan touch <id>",
       "```",
@@ -344,33 +366,46 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       "## Limits and tiers",
       "- free-- (registered / hosted): 7d default TTL, 30d max, unlisted, no vanity slugs",
       "- ops (self-hosted operator key): no TTL maximum cap, permanent hosting (ttl: null) and slugs allowed",
+      "- organization members: limits follow effectiveTier, the higher of your own tier and the organization's; publishes also count against the organization's pooled hourly cap when the organization's tier is higher than your own (a member at or above the organization's tier skips it)",
       "- Files: HTML, CSS, JS, JSON, text, markdown, images, fonts (up to 50 MiB, 200 files)",
       "",
     ].join("\n");
   });
 
   app.post("/api/v1/register", async (req, reply) => {
+    // Parsed before any bucket is spent, so a malformed body costs nothing.
+    const body = registerSchema.parse(req.body ?? {});
     const pepper = deps.config.ipHashPepper;
-    if (!pepper) {
-      throw new AuthError(
-        503,
-        "rate_limit_unconfigured",
-        "SHAREPLAN_IP_HASH_PEPPER is not set",
-      );
+    const consumeIpRegister = (): void => {
+      if (!pepper) {
+        throw new AuthError(
+          503,
+          "rate_limit_unconfigured",
+          "SHAREPLAN_IP_HASH_PEPPER is not set",
+        );
+      }
+      const ipBucket = `ip:${hashIp(requestIp(req), pepper)}`;
+      if (!consumeRate(deps.db, ipBucket, "register", deps.config.registerPerDay)) {
+        throw new HttpError(429, "rate_limited", "too many registrations from this address");
+      }
+    };
+
+    if (body.orgToken !== undefined) {
+      const org = findOrgByJoinToken(deps.db, body.orgToken);
+      if (org === null) {
+        // Probing a token costs the same as registering; without a pepper it
+        // is a plain 401, like an invalid sp_ key on any authenticated route.
+        if (pepper) consumeIpRegister();
+        throw new HttpError(401, "invalid_org_token", "invalid organization join token");
+      }
+      // The token is the credential, so the org's daily bucket replaces the IP one.
+      consumeOrgRegister(deps.db, deps.config, org);
+      return reply
+        .status(201)
+        .send(mintOrgMember(deps.db, deps.config, org, body.name, "member"));
     }
-    const body = createKeySchema.parse(req.body ?? {});
-    const ip = requestIp(req);
-    const ipBucket = `ip:${hashIp(ip, pepper)}`;
-    if (
-      !consumeRate(
-        deps.db,
-        ipBucket,
-        "register",
-        deps.config.registerPerDay,
-      )
-    ) {
-      throw new HttpError(429, "rate_limited", "too many registrations from this address");
-    }
+
+    consumeIpRegister();
     const claimToken = randomBytes(16).toString("base64url");
     const user = createUser(deps.db, {
       tier: "free--",
@@ -388,6 +423,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       name: row.name,
       token,
       tier: user.tier,
+      effectiveTier: user.tier,
+      org: null,
       claimUrl: `${deps.config.publicBaseUrl}/claim/${claimToken}`,
       createdAt: new Date(row.created_at).toISOString(),
     });
@@ -570,11 +607,15 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
           email: authentication.user.email,
           authenticatedTier,
         });
+        const effective = effectiveTier(
+          user.tier,
+          orgTier(user.org_id === null ? null : getOrg(deps.db, user.org_id)),
+        );
         return authPage(
           reply,
           200,
           "Account claimed",
-          `The agent's existing API key now has ${user.tier} limits.`,
+          `The agent's existing API key now has ${effective} limits.`,
         );
       } catch (err) {
         deleteClaimAuthFlow(deps.db, query.state, browserNonce);
@@ -616,6 +657,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     const keys = listApiKeys(deps.db).map((k) => ({
       id: k.id,
       name: k.name,
+      userId: k.user_id,
+      orgId: k.org_id,
       createdAt: new Date(k.created_at).toISOString(),
       revokedAt: k.revoked_at ? new Date(k.revoked_at).toISOString() : null,
     }));
@@ -635,31 +678,31 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 
   // --- Sites API ---
   app.post("/api/v1/sites", async (req, reply) => {
-    const { key, user } = requireAccount(deps.db, req);
+    const account = requireAccount(deps.db, req);
     const body = createSiteSchema.parse(req.body);
-    const site = await publishNewSite(ctx, key, user, body, req);
+    const site = await publishNewSite(ctx, account, body, req);
     return reply.status(201).send(site);
   });
 
   app.put("/api/v1/sites/:id", async (req, reply) => {
-    const { key, user } = requireAccount(deps.db, req);
+    const account = requireAccount(deps.db, req);
     const { id } = req.params as { id: string };
     const body = updateSiteSchema.parse(req.body);
     const existing = getSite(deps.db, id);
-    if (!existing || existing.owner_user_id !== user.id) {
+    if (!existing || existing.owner_user_id !== account.user.id) {
       return reply.status(404).send({
         error: { code: "not_found", message: "site not found" },
       });
     }
-    const site = await publishVersion(ctx, existing, user, body, req);
+    const site = await publishVersion(ctx, existing, account, body, req);
     return reply.send(site);
   });
 
   app.post("/api/v1/sites/:id/touch", async (req, reply) => {
-    const { user } = requireAccount(deps.db, req);
+    const account = requireAccount(deps.db, req);
     const { id } = req.params as { id: string };
     const existing = getSite(deps.db, id);
-    if (!existing || existing.owner_user_id !== user.id) {
+    if (!existing || existing.owner_user_id !== account.user.id) {
       return reply.status(404).send({
         error: { code: "not_found", message: "site not found" },
       });
@@ -667,8 +710,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     if (isExpired(existing)) {
       throw new HttpError(410, "site_expired", "site expired");
     }
-    consumePublishQuota(ctx, req, user);
-    const policy = policyForUser(user, ctx.config);
+    consumePublishQuota(ctx, req, account);
+    const policy = policyForTier(account.tier, ctx.config);
     const now = Date.now();
     let expiresAt: number | null;
     if (existing.expires_at === null && policy.allowNullTtl) {
@@ -992,16 +1035,22 @@ function decodePath(path: string): string | null {
   }
 }
 
-function policyForUser(user: UserRow, config: Config): TierPolicy {
-  const policy = policyFor(user.tier);
-  if (user.tier === "ops" && config.defaultTtl) {
+/** Policy for an effective tier; effectiveTier only yields ops for ops users. */
+function policyForTier(tier: Tier, config: Config): TierPolicy {
+  const policy = policyFor(tier);
+  if (tier === "ops" && config.defaultTtl) {
     return { ...policy, defaultTtl: config.defaultTtl };
   }
   return policy;
 }
 
-function consumePublishQuota(ctx: Ctx, req: FastifyRequest, user: UserRow): void {
-  const policy = policyForUser(user, ctx.config);
+/**
+ * Up to three hourly publish buckets, first refusal wins: ip (free-- only),
+ * user, then the org pool. User before org so an agent already over its own
+ * cap never touches the shared pool.
+ */
+function consumePublishQuota(ctx: Ctx, req: FastifyRequest, account: Account): void {
+  const policy = policyForTier(account.tier, ctx.config);
   if (policy.ipPublishLimit) {
     const pepper = ctx.config.ipHashPepper;
     if (!pepper) {
@@ -1017,17 +1066,21 @@ function consumePublishQuota(ctx: Ctx, req: FastifyRequest, user: UserRow): void
       throw new HttpError(429, "rate_limited", "too many publishes from this address");
     }
   }
-  const userBucket = `user:${user.id}`;
+  const userBucket = `user:${account.user.id}`;
   if (!consumeRate(ctx.db, userBucket, "publish", policy.publishPerHour)) {
     throw new HttpError(429, "rate_limited", "too many publishes");
+  }
+  const pool = orgPublishPool(account);
+  if (pool !== null && !consumeRate(ctx.db, `org:${pool.orgId}`, "publish", pool.limit)) {
+    throw new HttpError(429, "rate_limited", "organization publish limit reached");
   }
 }
 
 function assertTierPublish(
-  user: UserRow,
+  tier: Tier,
   body: { slug?: string; visibility?: Visibility },
 ): void {
-  const policy = policyFor(user.tier);
+  const policy = policyFor(tier);
   if (body.slug !== undefined && !policy.slugs) {
     throw new HttpError(400, "slug_not_allowed", "this tier cannot set a vanity slug");
   }
@@ -1056,14 +1109,13 @@ function applyStoredTierLimits(
 
 async function publishNewSite(
   ctx: Ctx,
-  key: ApiKeyRow,
-  user: UserRow,
+  account: Account,
   body: z.infer<typeof createSiteSchema>,
   req: FastifyRequest,
 ): Promise<SiteResponse> {
-  assertTierPublish(user, body);
-  consumePublishQuota(ctx, req, user);
-  const policy = policyForUser(user, ctx.config);
+  assertTierPublish(account.tier, body);
+  consumePublishQuota(ctx, req, account);
+  const policy = policyForTier(account.tier, ctx.config);
   let files = prepareFiles(body.files, ctx.config);
   files = ensureIndexHtml(files);
 
@@ -1084,8 +1136,8 @@ async function publishNewSite(
 
   insertSite(ctx.db, {
     id: siteId,
-    owner_key_id: key.id,
-    owner_user_id: user.id,
+    owner_key_id: account.key.id,
+    owner_user_id: account.user.id,
     slug: body.slug ?? null,
     title: body.title ?? null,
     visibility,
@@ -1112,13 +1164,13 @@ async function publishNewSite(
 async function publishVersion(
   ctx: Ctx,
   existing: SiteRow,
-  user: UserRow,
+  account: Account,
   body: z.infer<typeof updateSiteSchema>,
   req: FastifyRequest,
 ): Promise<SiteResponse> {
-  assertTierPublish(user, body);
-  consumePublishQuota(ctx, req, user);
-  const policy = policyForUser(user, ctx.config);
+  assertTierPublish(account.tier, body);
+  consumePublishQuota(ctx, req, account);
+  const policy = policyForTier(account.tier, ctx.config);
   let files = prepareFiles(body.files, ctx.config);
   files = ensureIndexHtml(files);
 
