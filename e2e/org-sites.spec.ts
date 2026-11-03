@@ -266,3 +266,66 @@ test("a viewer outside the linked WorkOS organization gets 403 and no site cooki
   expect(harness.requests.some(r => r.path === "/__shareplan/session")).toBe(false);
   expect(harness.db.prepare("SELECT COUNT(*) AS n FROM viewer_sessions").get()).toEqual({ n: 0 });
 });
+
+for (const transfer of [false, true]) {
+  test(`sign-out ends both sites after overlapping two-tab sign-ins (${transfer ? "second callback sees the first session" : "neither callback sees an apex session"})`, async ({ context, harness }) => {
+    const publishOrg = linkOrg(harness);
+    const a = await publishOrg("Overlap A");
+    const b = await publishOrg("Overlap B");
+    const tabA = await context.newPage();
+    const tabB = await context.newPage();
+    let releaseA!: () => void;
+    let releaseB!: () => void;
+    const gateA = new Promise<void>(resolve => { releaseA = resolve; });
+    const gateB = new Promise<void>(resolve => { releaseB = resolve; });
+    // For the original race, hold both exchanges until both callback requests
+    // have arrived without an apex cookie. For transfer, complete A first.
+    if (!transfer) {
+      const authenticate = harness.authkit.client.userManagement.authenticateWithCode;
+      let arrived = 0;
+      let releaseExchanges!: () => void;
+      const exchanges = new Promise<void>(resolve => { releaseExchanges = resolve; });
+      harness.authkit.client.userManagement.authenticateWithCode = async options => {
+        if (++arrived === 2) releaseExchanges();
+        await exchanges;
+        return authenticate(options);
+      };
+    }
+    harness.authkit.authorizeGate = gateA;
+    harness.authkit.setNextIdentity(sso());
+    const navA = tabA.goto(a.url);
+    await expect.poll(() => harness.requests.filter(r => r.path === "/authorize").length).toBe(1);
+    harness.authkit.authorizeGate = gateB;
+    harness.authkit.setNextIdentity(sso());
+    const navB = tabB.goto(b.url);
+    await expect.poll(() => harness.requests.filter(r => r.path === "/authorize").length).toBe(2);
+    releaseA();
+    if (transfer) {
+      await navA;
+      await expect(tabA.getByRole("heading", { name: "Overlap A home" })).toBeVisible();
+    }
+    releaseB();
+    await Promise.all([navA, navB]);
+    await expect(tabA.getByRole("heading", { name: "Overlap A home" })).toBeVisible();
+    await expect(tabB.getByRole("heading", { name: "Overlap B home" })).toBeVisible();
+    const callbacks = harness.requests.filter(r => r.path === "/v1/auth/workos/view/callback");
+    expect(callbacks).toHaveLength(2);
+    expect(callbacks[0]!.cookie).not.toContain(`${VIEW_COOKIE}=`);
+    if (transfer) expect(callbacks[1]!.cookie).toContain(`${VIEW_COOKIE}=`);
+    else expect(callbacks[1]!.cookie).not.toContain(`${VIEW_COOKIE}=`);
+    expect(harness.db.prepare("SELECT COUNT(*) AS n FROM viewer_sessions").get()).toEqual({ n: 2 });
+    expect(harness.db.prepare("SELECT COUNT(*) AS n FROM viewer_sessions WHERE revoked_at IS NULL").get()).toEqual({ n: transfer ? 1 : 2 });
+    expect(harness.db.prepare("SELECT COUNT(DISTINCT viewer_token_hash) AS n FROM site_sessions").get()).toEqual({ n: transfer ? 1 : 2 });
+    const before = await Promise.all([tabA, tabB].map(p => p.evaluate(async () => (await fetch("/")).status)));
+    expect(before).toEqual([200, 200]);
+    const logoutPage = await context.newPage();
+    await logoutPage.goto(`${APEX}/v1/view/`);
+    await logoutPage.getByRole("button", { name: "Sign out" }).click();
+    await expect(logoutPage).toHaveURL(`${APEX}/`);
+    const after = await Promise.all([tabA, tabB].map(p => p.evaluate(async () => (await fetch("/")).status)));
+    expect(after).toEqual([401, 401]);
+    expect(harness.db.prepare("SELECT COUNT(*) AS n FROM viewer_sessions WHERE revoked_at IS NULL").get()).toEqual({ n: 0 });
+    expect(await cookie(context, a.url, SITE_COOKIE)).toBeDefined();
+    expect(await cookie(context, b.url, SITE_COOKIE)).toBeDefined();
+  });
+}
