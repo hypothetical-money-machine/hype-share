@@ -437,6 +437,27 @@ export function upgrade(db: DatabaseSync): void {
       UPDATE sites SET ${CLEAR_AUDIENCE} WHERE audience_org_id = OLD.id;
     END;
   `);
+  // Site handoff: a single-use grant code that becomes one site host's cookie.
+  // Both are stored hashed; the row dies with its viewer session or its site.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS site_sessions (
+      code_hash TEXT PRIMARY KEY,
+      code_expires_at INTEGER NOT NULL,
+      used_at INTEGER,
+      token_hash TEXT,
+      viewer_token_hash TEXT NOT NULL REFERENCES viewer_sessions(token_hash) ON DELETE CASCADE,
+      site_id TEXT NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+      nonce_hash TEXT NOT NULL,
+      return_path TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_site_sessions_token
+      ON site_sessions(token_hash) WHERE token_hash IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_site_sessions_viewer ON site_sessions(viewer_token_hash);
+    CREATE INDEX IF NOT EXISTS idx_site_sessions_site ON site_sessions(site_id);
+    CREATE INDEX IF NOT EXISTS idx_site_sessions_expires ON site_sessions(expires_at);
+  `);
 }
 
 /** Existing keys become operator users so self-host and Zima keep working. */

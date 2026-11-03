@@ -24,6 +24,8 @@ export interface ObservedRequest {
   fetchMode: string | undefined;
   fetchDest: string | undefined;
   cookie: string;
+  /** Set once the response has been sent. */
+  status?: number;
 }
 
 async function startHarness() {
@@ -57,13 +59,15 @@ async function startHarness() {
     await app.ready();
     server.on("request", (req, res) => {
       const host = req.headers.host ?? "";
-      requests.push({
+      const observed: ObservedRequest = {
         host, path: new URL(req.url!, APEX).pathname, method: req.method!,
         origin: req.headers.origin, fetchSite: req.headers["sec-fetch-site"] as string | undefined,
         fetchMode: req.headers["sec-fetch-mode"] as string | undefined,
         fetchDest: req.headers["sec-fetch-dest"] as string | undefined,
         cookie: req.headers.cookie ?? "",
-      });
+      };
+      requests.push(observed);
+      res.on("finish", () => { observed.status = res.statusCode; });
       if (host === new URL(AUTHKIT_ORIGIN).host) return authkit.handle(req, res);
       if (host !== new URL(APEX).host && !SITE_HOST.test(host)) {
         res.writeHead(421).end();

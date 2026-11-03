@@ -5,6 +5,7 @@ import Fastify, {
   type FastifyReply,
   type FastifyRequest,
 } from "fastify";
+import { STATUS_CODES } from "node:http";
 import type { DatabaseSync } from "node:sqlite";
 import type { S3Client } from "@aws-sdk/client-s3";
 import fastifyCookie from "@fastify/cookie";
@@ -68,6 +69,14 @@ import { AuthError, requireAccount, requireAdmin, type Account } from "./auth.js
 import { claimRedirectPage, escapeHtml, setAuthPageHeaders } from "./auth-pages.js";
 import { siteScheme, siteUrl } from "./site-url.js";
 import { registerViewerRoutes } from "./viewer.js";
+import {
+  authorizeOrgSite,
+  ORG_HTML_CSP,
+  ORG_SVG_CSP,
+  setOrgSiteHeaders,
+  SITE_HTML_CSP,
+  SITE_SVG_CSP,
+} from "./site-access.js";
 import { registerOwnerPortal } from "./owner.js";
 import { HttpError } from "./errors.js";
 import { hashIp, requestIp } from "./ip.js";
@@ -199,7 +208,34 @@ interface Ctx extends AppDeps {
 
 export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   const app = Fastify({
-    logger: deps.logger ?? true,
+    // Handoff codes, OAuth state and site-nonce hashes ride in query strings;
+    // keep them out of request logs. Cookies are never logged.
+    logger: (deps.logger ?? true)
+      ? {
+          serializers: {
+            req: (req: FastifyRequest) => ({
+              method: req.method,
+              url: redactQuerySecrets(req.url),
+              host: req.host,
+              remoteAddress: req.ip,
+              remotePort: req.socket?.remotePort,
+            }),
+          },
+        }
+      : false,
+    // The router answers malformed URLs before any hook runs. Keep Fastify's
+    // own body, but give org sites their headers on these errors too.
+    frameworkErrors: (error, req, raw) => {
+      const reply = raw as unknown as FastifyReply;
+      const suffix = deps.config.siteHostSuffix;
+      const label = suffix === null ? null : siteLabelFromHost(req.headers.host ?? "", suffix);
+      const site = label === null || RESERVED_HOST_LABELS.has(label) ? null : getSiteByIdOrSlug(deps.db, label);
+      if (site !== null && honouredAudience(deps.db, site) !== null) setOrgSiteHeaders(reply);
+      const statusCode = error.statusCode ?? 500;
+      void reply.code(statusCode).type("application/json").send(JSON.stringify({
+        error: STATUS_CODES[statusCode] ?? "Error", code: error.code, message: error.message, statusCode,
+      }));
+    },
     // One hop: the socket peer, or the address the immediate proxy added.
     // `true` would trust every X-Forwarded-For entry, including the client's.
     trustProxy: deps.config.trustForwarded ? 1 : false,
@@ -347,7 +383,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       "",
       "Optional `\"orgToken\"`: an organization join token; the key then publishes at the organization's tier.",
       "",
-      "Viewer sign-in and sign-out: [/v1/view/](/v1/view/). Org sites remain owner-key-only until the site handoff ships. See PLAN.md, Org-private viewing.",
+      "`\"visibility\": \"org\"` sites open in a browser only after an SSO sign-in to the owner's linked WorkOS organization; the owner's key still reads them. Viewer sign-in and sign-out: [/v1/view/](/v1/view/). See PLAN.md, Org-private viewing.",
       "",
       "## Auth",
       "`Authorization: Bearer sp_...`",
@@ -796,6 +832,9 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     app.addHook("onRequest", async (req, reply) => {
       const label = siteLabelFromHost(req.headers.host ?? "", suffix);
       if (label === null) return;
+      // Org sites carry their headers on every response, these errors included.
+      const early = RESERVED_HOST_LABELS.has(label) ? null : getSiteByIdOrSlug(deps.db, label);
+      if (early !== null && honouredAudience(deps.db, early) !== null) setOrgSiteHeaders(reply);
       if (req.method !== "GET" && req.method !== "HEAD") {
         reply.header("Allow", "GET, HEAD");
         await reply.status(405).send({
@@ -1018,6 +1057,11 @@ function clearClaimCallbackCookie(reply: FastifyReply, config: Config): void {
     secure: claimCookiesAreSecure(config),
     path: "/",
   });
+}
+
+/** A request URL with the values of code, state and n replaced, for logs. */
+export function redactQuerySecrets(url: string): string {
+  return url.replace(/([?&](?:code|state|n)=)[^&#]*/gi, "$1[redacted]");
 }
 
 /** Request URL split at the "?", with the query keeping its "?" (or ""). */
@@ -1480,11 +1524,16 @@ async function serveSitePath(
     await reply.status(404).send({ error: { code: "not_found", message: "site not found" } });
     return;
   }
+  const audience = honouredAudience(ctx.db, site);
+  if (audience !== null) setOrgSiteHeaders(reply);
   if (isExpired(site)) {
     await reply.status(410).send({ error: { code: "gone", message: "site expired" } });
     return;
   }
-  if (site.visibility === "private") {
+  if (audience !== null) {
+    // Path mode never enables browser viewing, so there it is bearer-only.
+    if (!(await authorizeOrgSite(ctx.config, ctx.db, req, reply, site, audience, relPath))) return;
+  } else if (site.visibility === "private") {
     // Require API key of owner for private sites (v1 simple)
     try {
       const { user } = requireAccount(ctx.db, req);
@@ -1538,29 +1587,14 @@ async function serveSitePath(
   reply.header("Content-Type", ct);
   setSiteHeaders(reply, site);
 
+  const isSvg = ct.startsWith("image/svg") || path.toLowerCase().endsWith(".svg");
   if (isHtmlPath(path) || ct.startsWith("text/html")) {
     // Permissive enough for LLM demo HTML with inline scripts/styles
-    reply.header(
-      "Content-Security-Policy",
-      [
-        "default-src 'self'",
-        "img-src 'self' data: blob:",
-        "media-src 'self' blob:",
-        "style-src 'self' 'unsafe-inline'",
-        "script-src 'self' 'unsafe-inline'",
-        "font-src 'self' data:",
-        "connect-src 'self'",
-        "frame-ancestors 'none'",
-        "base-uri 'self'",
-        "form-action 'self'",
-      ].join("; "),
-    );
-  } else if (ct.startsWith("image/svg") || path.toLowerCase().endsWith(".svg")) {
-    reply.header(
-      "Content-Security-Policy",
-      "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; sandbox",
-    );
+    reply.header("Content-Security-Policy", audience !== null ? ORG_HTML_CSP : SITE_HTML_CSP);
+  } else if (isSvg) {
+    reply.header("Content-Security-Policy", audience !== null ? ORG_SVG_CSP : SITE_SVG_CSP);
   }
+  // Every other org response keeps ORG_HTML_CSP from setOrgSiteHeaders.
 
   await reply.send(obj.body);
 }

@@ -53,6 +53,8 @@ export class FakeAuthKit {
   readonly authorizationParams: Record<string, string>[] = [];
   readonly authenticationCalls: AuthenticationOptions[] = [];
   readonly logoutCalls: { sessionId: string; returnTo?: string }[] = [];
+  /** While set, /authorize answers only once it resolves (Playwright routes skip redirect hops). */
+  authorizeGate: Promise<void> | null = null;
   private nextIdentity: FakeIdentity | undefined;
   private readonly authorizations = new Map<string, Authorization>();
   private readonly codes = new Map<string, Authorization>();
@@ -110,6 +112,17 @@ export class FakeAuthKit {
 
   handle(req: IncomingMessage, res: ServerResponse): void {
     const url = new URL(req.url!, AUTHKIT_ORIGIN);
+    if (req.method === "GET" && url.pathname === "/logout") {
+      // Ends the fake AuthKit session and returns to the registered apex root.
+      const returnTo = url.searchParams.get("return_to");
+      if (!this.logoutCalls.some(call => call.sessionId === url.searchParams.get("session_id")) ||
+          !returnTo || new URL(returnTo).pathname !== "/") {
+        res.writeHead(400).end("Unknown fake AuthKit logout request");
+        return;
+      }
+      res.writeHead(302, { location: returnTo, "cache-control": "no-store" }).end();
+      return;
+    }
     const state = url.searchParams.get("state") ?? "";
     const authorization = this.authorizations.get(state);
     if (req.method !== "GET" || !authorization || url.href !== authorization.url) {
@@ -122,6 +135,8 @@ export class FakeAuthKit {
     const callback = new URL(url.searchParams.get("redirect_uri")!);
     callback.searchParams.set("code", code);
     callback.searchParams.set("state", state);
-    res.writeHead(302, { location: callback.href, "cache-control": "no-store" }).end();
+    const respond = () => res.writeHead(302, { location: callback.href, "cache-control": "no-store" }).end();
+    if (this.authorizeGate) void this.authorizeGate.then(respond);
+    else respond();
   }
 }

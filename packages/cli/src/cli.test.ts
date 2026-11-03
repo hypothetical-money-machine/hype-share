@@ -5,8 +5,10 @@ import path from "node:path";
 import {
   buildCreateOrgBody,
   buildPublishBody,
+  buildRevokeViewersBody,
   deletedLine,
   isCliEntrypoint,
+  parseWorkosOrg,
   parseWorkosOrgOrNone,
   printable,
   removedLine,
@@ -83,6 +85,20 @@ describe("buildCreateOrgBody", () => {
     expect(buildCreateOrgBody({ name: "SkySlope", workosOrg: "none" })).toEqual({
       name: "SkySlope",
     });
+  });
+});
+
+describe("buildRevokeViewersBody", () => {
+  it("sends exactly one selector, with --workos-org as the WorkOS org id", () => {
+    expect(buildRevokeViewersBody({ email: "a@skyslope.com" })).toEqual({ email: "a@skyslope.com" });
+    expect(buildRevokeViewersBody({ workosUser: "user_01H" })).toEqual({ workosUserId: "user_01H" });
+    expect(buildRevokeViewersBody({ workosOrg: "org_01H" })).toEqual({ orgId: "org_01H" });
+  });
+
+  it("refuses none or several selectors client-side", () => {
+    expect(() => buildRevokeViewersBody({})).toThrow(/exactly one/);
+    expect(() => buildRevokeViewersBody({ email: "a@b", workosOrg: "org_01H" })).toThrow(/exactly one/);
+    expect(() => parseWorkosOrg("none")).toThrow(/WorkOS organization id/);
   });
 });
 

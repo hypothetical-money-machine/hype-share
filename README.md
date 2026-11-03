@@ -47,6 +47,7 @@ On `hype-share.com`, agents and humans get tiered accounts. All publishing uses 
 - **Claiming an account.** Opening the `claimUrl` shows what will happen before sign-in starts. After the human confirms, WorkOS AuthKit links an email (`free-`) or GitHub/Google login (`free`). The server upgrades the user row in place, and the agent's API key keeps working.
 - **Donations and paid.** The `unlock` and `paid` tiers extend TTL and rate limits. Permanent hosting (`"ttl": null`) needs `paid`, `ops`, or a `paid` organization.
 - **Organizations.** An operator can create an organization with a tier and a join token. Registering with `--org-token` (or `SHAREPLAN_ORG_TOKEN`) puts the new key inside the organization. Organization admins can also mint keys without sharing the token. Members publish at the higher of their own tier and the organization's, never `ops`. When the organization's tier is higher than a member's own, that member's publishes also count against one pooled hourly cap for the organization. A member at or above the organization's tier skips the pool. Lowering an organization's tier sets an expiry at the new maximum on every permanent member site, unless the owner's own tier allows permanent sites. A personally `paid` member keeps permanent sites. If a member's effective tier falls below `free-`, the change also removes their vanity slugs. If it falls below `free`, their public sites become unlisted. The sweeper deletes the newly expiring sites when that expiry passes.
+- **Org-private sites.** With `"visibility": "org"`, a member of an organization linked to a WorkOS organization publishes a site that opens in a browser only after an SSO sign-in to that WorkOS organization. The owner's key still reads it. Viewers sign out at `/v1/view/`; operators sign them out with `shareplan revoke-viewers`. See [Org-private viewing](PLAN.md#org-private-viewing).
 - **Slugs and visibility.** Vanity slugs require `free-` or higher. Public directory listings require `free` or higher. `free--` sites are unlisted and use random site IDs (`xk9f2m.hype-share.com`).
 - **Upload rules.** Allowed files are HTML and page assets (`html`, `htm`, `css`, `js`, `mjs`, `json`, `map`, `txt`, `md`, `png`, `jpg`, `jpeg`, `gif`, `webp`, `avif`, `svg`, `ico`, `woff`, `woff2`). A site can hold at most 50 MiB and 200 files. The server rejects video, audio, pdf, zip, and wasm.
 
@@ -205,13 +206,14 @@ shareplan delete-org <org-id> --url <url> --admin-token <tok>
 shareplan rotate-org-token <org-id> --disable --url <url> --admin-token <tok>
 shareplan create-org-key <org-id> --name lead --role admin --url <url> --admin-token <tok>
 shareplan set-user-org <user-id> --org <org-id> --role admin --url <url> --admin-token <tok>   # --org none detaches; omit --role to keep the current role; a newly attached user defaults to member
+shareplan revoke-viewers --email <email> --url <url> --admin-token <tok>   # or --workos-user <id> / --workos-org <org_...>; signs org-site viewers out on their next request
 ```
 
 `shareplan publish` takes a directory or a single file:
 - `--title <title>`: site title
 - `--ttl <ttl>`: lifetime duration, e.g. `7d` or `12h`. The server clamps it to the effective tier's maximum; `ops`, `paid`, and members of a `paid` organization have none. `none` means permanent hosting and needs `paid`, `ops`, or a `paid` organization.
 - `--site <id>`: update an existing site with a new version
-- `--visibility <vis>`: `unlisted` (default), `public` (requires `free`, `unlock`, `paid`, or `ops`), or `private`
+- `--visibility <vis>`: `unlisted` (default), `public` (requires `free`, `unlock`, `paid`, or `ops`), `private`, or `org` (new sites only, no slug; needs an organization linked to WorkOS)
 - `--slug <slug>`: vanity hostname label (requires `free-`, `free`, `unlock`, `paid`, or `ops`)
 - `--note <note>`: optional description stored on the version record
 
@@ -322,7 +324,9 @@ Response (`201`):
 | `POST` | `/api/v1/admin/orgs/:id/join-token` | Admin token | Rotate or disable the join token |
 | `POST` | `/api/v1/admin/orgs/:id/keys` | Admin token | Mint a member or admin key inside an organization |
 | `PUT` | `/api/v1/admin/users/:id/org` | Admin token | Attach a user to an organization, change their role, or detach them |
-| `GET` | `https://<id>.<suffix>/*` | Public / Bearer | Serve site files (`<id>` also accepts a slug) |
+| `POST` | `/api/v1/admin/viewer-sessions/revoke` | Admin token | Sign out org-site viewers by `email`, `workosUserId` or WorkOS `orgId` |
+| `GET` | `/v1/view/` | Viewer cookie | Show the signed-in viewer and the sign-out form |
+| `GET` | `https://<id>.<suffix>/*` | Public / Bearer / site cookie | Serve site files (`<id>` also accepts a slug); `org` sites take the owner's key or a viewer's site cookie |
 
 The hosted service serves sites at `https://<id>.hype-share.com/`. A self-hosted
 server with `SHAREPLAN_SITE_HOST_SUFFIX` uses the same URL pattern. Without a suffix, the server

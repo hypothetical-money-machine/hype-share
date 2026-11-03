@@ -404,3 +404,19 @@ export function setUserOrg(
     { orgId, role },
   );
 }
+
+/** Exactly one selector; orgId is the WorkOS organization id (org_...). */
+export type RevokeViewersBody = { email: string } | { workosUserId: string } | { orgId: string };
+
+export function revokeViewers(
+  baseUrl: string,
+  adminToken: string,
+  body: RevokeViewersBody,
+): Promise<{ revoked: number }> {
+  return request(
+    adminCfg(baseUrl, adminToken),
+    "POST",
+    "/api/v1/admin/viewer-sessions/revoke",
+    body,
+  );
+}
