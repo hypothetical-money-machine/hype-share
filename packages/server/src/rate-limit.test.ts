@@ -39,6 +39,7 @@ describe("consumeRate", () => {
       publish: HOUR_MS,
       register: DAY_MS,
       claim: HOUR_MS,
+      viewer_start: HOUR_MS,
       owner_login: HOUR_MS,
       org_join: HOUR_MS,
     });
@@ -52,7 +53,7 @@ describe("consumeRate", () => {
       insert.run(`current-${action}`, action, current);
     }
 
-    expect(pruneRateLimits(db, now)).toBe(5);
+    expect(pruneRateLimits(db, now)).toBe(6);
     expect(
       db.prepare(`SELECT action FROM rate_limits ORDER BY action`).all(),
     ).toEqual([
@@ -61,6 +62,7 @@ describe("consumeRate", () => {
       { action: "owner_login" },
       { action: "publish" },
       { action: "register" },
+      { action: "viewer_start" },
     ]);
     db.close();
   });
