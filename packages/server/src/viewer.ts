@@ -14,7 +14,7 @@ import { consumeRate } from "./rate-limit.js";
 import { siteUrl } from "./site-url.js";
 import {
   consumeViewerAuthFlow, getViewerSession, getViewerSessionByHash, insertSiteGrant,
-  insertViewerAuthFlow, insertViewerSession, revokeViewerSession, revokeViewerSessions,
+  insertViewerAuthFlow, insertViewerSession, replaceViewerSession, revokeViewerSession, revokeViewerSessions,
   type ViewerSession,
 } from "./viewer-db.js";
 
@@ -241,7 +241,9 @@ export function registerViewerRoutes(
       insertViewerSession(db, session);
       // This cookie replaces any earlier session in this browser (e.g. another org's).
       const replaced = req.cookies[cookieName];
-      if (replaced) revokeViewerSession(db, hashApiKey(replaced), now);
+      // Same person, same org: its site sessions and pending grants move to the
+      // new session first, so a second tab's sign-in can't strand the first's.
+      if (replaced) replaceViewerSession(db, hashApiKey(replaced), session, now);
       reply.setCookie(cookieName, token, { ...cookieOptions, maxAge: Math.floor((session.expires_at - now) / 1000) });
       return mintViewerGrant(db, config, reply, {
         session, site, returnPath: flow.return_path, siteNonceHash: flow.site_nonce_hash,

@@ -307,6 +307,49 @@ describe("org site handoff", () => {
     }
   });
 
+  it.each([
+    ["the same viewer", "user_workos", 302, 200],
+    ["a different viewer", "user_someone_else", 403, 401],
+  ])("when %s signs in again in this browser before the first tab redeems", async (_name, userId, redeem, serve) => {
+    const h = await setup();
+    const tab1 = await h.get(new URL("/report.html", h.siteA.url).href, { headers: NAV });
+    const nonce = pair(tab1, NONCE_COOKIE);
+    const tab2 = await h.get(new URL("/docs/", h.siteA.url).href, { headers: NAV, cookie: nonce });
+    const s1 = await h.get(tab1.headers.location as string, { headers: NAV });
+    const s2 = await h.get(tab2.headers.location as string, { headers: NAV });
+    const g1 = await h.get(`${BASE}${VIEW_CALLBACK_PATH}?code=c1&state=state_1`, { cookie: flowPair(s1) });
+    const v1 = pair(g1, VIEW_COOKIE);
+    const r1early = await h.get(g1.headers.location as string, { cookie: nonce, headers: NAV });
+    const early = pair(r1early, SITE_COOKIE);
+    // Tab 1 has a second grant in flight when tab 2's callback replaces its session.
+    const again = await h.get(new URL("/report.html", h.siteA.url).href, { headers: NAV, cookie: nonce });
+    const pending = await h.get(again.headers.location as string, { cookie: v1, headers: NAV });
+    expect(pending.headers.location).toContain("/__shareplan/session");
+    h.workos.response.user.id = userId;
+    h.workos.claims.sub = userId;
+    const g2 = await h.get(`${BASE}${VIEW_CALLBACK_PATH}?code=c2&state=state_2`, { cookie: `${flowPair(s2)}; ${v1}` });
+    expect(g2.statusCode).toBe(302);
+    expect(viewerSessions(h).find((v) => v.token_hash === hashApiKey(value(v1)))!.revoked_at).toBe(NOW);
+    const r1 = await h.get(pending.headers.location as string, { cookie: nonce, headers: NAV });
+    expect(r1.statusCode).toBe(redeem);
+    expect((await h.get(h.siteA.url, { cookie: early })).statusCode).toBe(serve);
+    const r2 = await h.get(g2.headers.location as string, { cookie: nonce, headers: NAV });
+    expect(r2.statusCode).toBe(302);
+    const v2Hash = hashApiKey(value(pair(g2, VIEW_COOKIE)));
+    // Carried sessions never outlive the session that minted them.
+    for (const row of siteSessions(h).filter((r) => r.viewer_token_hash === v2Hash)) {
+      expect(row.expires_at).toBeLessThanOrEqual(NOW + 8 * 60 * 60 * 1000);
+    }
+    // Signing out the new session ends everything this browser holds.
+    await h.get(`${BASE}/v1/view/logout`, {
+      method: "POST", cookie: pair(g2, VIEW_COOKIE),
+      headers: { origin: BASE, "content-type": "application/x-www-form-urlencoded" }, payload: "",
+    });
+    for (const cookie of [early, pair(r2, SITE_COOKIE)]) {
+      expect((await h.get(h.siteA.url, { cookie })).statusCode).toBe(401);
+    }
+  });
+
   it("refuses a reused, expired, wrong-host, wrong-nonce, missing-nonce or malformed code with 400", async () => {
     const h = await setup();
     const prepare = async (siteUrl: string) => {

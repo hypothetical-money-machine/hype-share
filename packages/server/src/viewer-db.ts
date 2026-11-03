@@ -81,6 +81,25 @@ export function revokeViewerSession(db: DatabaseSync, tokenHash: string, now = D
     .run(now, tokenHash);
 }
 
+/**
+ * A new sign-in replaces this browser's earlier viewer session. If both are
+ * the same WorkOS user in the same WorkOS org, the earlier session's site
+ * sessions and unredeemed grants move to the new one, never outliving the
+ * earlier expiry; otherwise they die with it. Then the earlier one is revoked.
+ */
+export function replaceViewerSession(
+  db: DatabaseSync, oldTokenHash: string, next: ViewerSession, now = Date.now(),
+): void {
+  if (oldTokenHash === next.token_hash) return;
+  db.prepare(`UPDATE site_sessions SET viewer_token_hash = ?, expires_at = MIN(expires_at, ?)
+    WHERE viewer_token_hash = ? AND EXISTS (
+      SELECT 1 FROM viewer_sessions WHERE token_hash = ? AND workos_user_id = ?
+        AND workos_org_id = ? AND revoked_at IS NULL AND expires_at > ?)`)
+    .run(next.token_hash, next.expires_at, oldTokenHash, oldTokenHash,
+      next.workos_user_id, next.workos_org_id, now);
+  revokeViewerSession(db, oldTokenHash, now);
+}
+
 export type ViewerRevokeFilter =
   | { email: string } | { workosUserId: string } | { workosOrgId: string };
 
