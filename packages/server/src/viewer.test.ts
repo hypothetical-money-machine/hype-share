@@ -3,13 +3,13 @@ import type { FastifyInstance, InjectOptions, LightMyRequestResponse } from "fas
 import { buildApp, type WorkOSAuthClient } from "./app.js";
 import { loadConfig, type Config } from "./config.js";
 import {
-  createApiKeyRecord, createOrg, createUser, getSite, hashApiKey, insertSite,
+  createApiKeyRecord, createOrg, createUser, deleteOrg, getSite, hashApiKey, insertSite,
   openDb, setUserOrg, updateOrg, upgrade,
 } from "./db.js";
 import { hashIp } from "./ip.js";
 import { reapExpiredSites } from "./reap.js";
 import { createFakeS3 } from "./testing/fake-s3.js";
-import { browserViewingEnabled, VIEW_CALLBACK_PATH } from "./viewer.js";
+import { browserViewingEnabled, VIEW_CALLBACK_PATH, VIEWER_STARTS_PER_HOUR } from "./viewer.js";
 import { getViewerSession, type ViewerAuthFlow, type ViewerSession } from "./viewer-db.js";
 
 const NOW = 1_800_000_030_000;
@@ -218,11 +218,21 @@ describe("viewer start", () => {
 
   it("limits starts by hashed IP and keeps other IPs independent", async () => {
     const h = await setup();
-    for (let i = 0; i < 10; i++) expect((await h.start()).statusCode).toBe(302);
+    for (let i = 0; i < VIEWER_STARTS_PER_HOUR; i++) expect((await h.start()).statusCode).toBe(302);
     expect((await h.start()).statusCode).toBe(429);
-    expect(h.workos.authorize).toHaveBeenCalledTimes(10);
+    expect(h.workos.authorize).toHaveBeenCalledTimes(VIEWER_STARTS_PER_HOUR);
     expect(h.db.prepare("SELECT bucket FROM rate_limits WHERE action = 'viewer_start'").get()).toEqual({ bucket: `viewer:${hashIp(IP, "test-pepper")}` });
     expect((await h.start("/", { remoteAddress: "203.0.113.11" })).statusCode).toBe(302);
+  });
+
+  it("counts only new WorkOS sign-ins against the limit, not redirects or the session shortcut", async () => {
+    const h = await setup(); const { cookie } = await signIn(h);
+    const noNonce = () => h.request({ method: "GET", url: `/v1/view/start?${new URLSearchParams({ site: "orgsite", path: "/" })}` });
+    for (let i = 0; i < VIEWER_STARTS_PER_HOUR + 5; i++) {
+      expect((await h.start("/", { headers: { cookie } })).statusCode).toBe(501);
+      expect((await noNonce()).statusCode).toBe(302);
+    }
+    expect(h.db.prepare("SELECT count FROM rate_limits WHERE action = 'viewer_start'").get()).toEqual({ count: 1 });
   });
 
   it("uses unprefixed host-only cookies on loopback HTTP", async () => {
@@ -345,6 +355,31 @@ describe("viewer callback", () => {
     const failed = await h.callback(cookiePair(second), "state_2");
     expect(failed.statusCode).toBe(403); expect(failed.body).not.toContain("secret exchange detail");
     expect(sessions(h)).toHaveLength(0);
+  });
+
+  it.each(["", undefined])("rejects a callback with code %j before calling WorkOS", async (code) => {
+    const h = await setup(); const started = await h.start();
+    const params = new URLSearchParams({ state: "state_1" }); if (code !== undefined) params.set("code", code);
+    const res = await h.request({ method: "GET", url: `${VIEW_CALLBACK_PATH}?${params}`, headers: { cookie: cookiePair(started) } });
+    expect(res.statusCode).toBe(403); expect(h.workos.authenticate).not.toHaveBeenCalled();
+    expect(sessions(h)).toHaveLength(0);
+  });
+
+  it("revokes the session a new sign-in replaces in the same browser", async () => {
+    const h = await setup(); const first = await signIn(h);
+    const started = await h.start("/", { headers: { cookie: "x=1" } });
+    const res = await h.callback(`${cookiePair(started)}; ${first.cookie}`, "state_2");
+    expect(res.statusCode).toBe(501);
+    const rows = sessions(h);
+    expect(rows).toHaveLength(2);
+    expect(rows.find((r) => r.token_hash === hashApiKey(first.cookie.split("=")[1]!))!.revoked_at).toBe(NOW);
+    expect(rows.filter((r) => r.revoked_at === null)).toHaveLength(1);
+  });
+
+  it("revokes viewer sessions for a deleted org's WorkOS link", async () => {
+    const h = await setup(); await signIn(h);
+    expect(deleteOrg(h.db, h.org.id, NOW)).not.toBeNull();
+    expect(sessions(h)[0]!.revoked_at).toBe(NOW);
   });
 
   it.each(["", "garbage", "e30.bnVsbA.sig", "e30.W10.sig", "e30.bm90anNvbg.sig"])("rejects malformed exchanged access token %j", async (token) => {

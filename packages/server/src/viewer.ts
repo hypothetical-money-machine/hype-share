@@ -18,6 +18,8 @@ import {
 export const VIEW_CALLBACK_PATH = "/v1/auth/workos/view/callback";
 const FLOW_SECONDS = 10 * 60;
 const SESSION_SECONDS = 8 * 60 * 60;
+/** New WorkOS sign-ins per hashed IP per hour; offices share NAT addresses. */
+export const VIEWER_STARTS_PER_HOUR = 120;
 const STATE_RE = /^[A-Za-z0-9_-]{1,256}$/;
 const NONCE_RE = /^[A-Za-z0-9_-]{43}$/;
 
@@ -130,15 +132,17 @@ export function registerViewerRoutes(
     const site = getSiteByIdOrSlug(db, label);
     const audience = site && honouredAudience(db, site);
     if (!site || !audience || isExpired(site)) throw new HttpError(404, "not_found", "site not found");
-    const bucket = `viewer:${hashIp(requestIp(req), config.ipHashPepper ?? config.workos!.apiKey)}`;
-    if (!consumeRate(db, bucket, "viewer_start", 10)) {
-      throw new HttpError(429, "rate_limited", "Too many viewer sign-in attempts. Try again next hour.");
-    }
     // Slice 5's site host will issue the nonce and return its hash here.
     if (nonceHash === undefined) return reply.redirect(new URL(path, siteUrl(config, site.id)).href, 302);
     const session = sessionFor(req);
     if (session?.workos_org_id === audience.workosOrgId) {
       return mintViewerGrant(db, config, reply, { session, site, returnPath: path, siteNonceHash: nonceHash.toLowerCase() });
+    }
+    // Count only new WorkOS sign-ins: the redirect and the session shortcut never
+    // call WorkOS, and a whole office can share one NAT address.
+    const bucket = `viewer:${hashIp(requestIp(req), config.ipHashPepper ?? config.workos!.apiKey)}`;
+    if (!consumeRate(db, bucket, "viewer_start", VIEWER_STARTS_PER_HOUR)) {
+      throw new HttpError(429, "rate_limited", "Too many viewer sign-in attempts. Try again next hour.");
     }
     const created = Date.now();
     try {
@@ -200,6 +204,9 @@ export function registerViewerRoutes(
       };
       // Tokens and PKCE verifier are discarded; a viewer never gets a users row.
       insertViewerSession(db, session);
+      // This cookie replaces any earlier session in this browser (e.g. another org's).
+      const replaced = req.cookies[cookieName];
+      if (replaced) revokeViewerSession(db, hashApiKey(replaced), now);
       reply.setCookie(cookieName, token, { ...cookieOptions, maxAge: Math.floor((session.expires_at - now) / 1000) });
       return mintViewerGrant(db, config, reply, {
         session, site, returnPath: flow.return_path, siteNonceHash: flow.site_nonce_hash,

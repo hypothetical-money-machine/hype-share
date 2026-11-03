@@ -1315,6 +1315,12 @@ export function deleteOrg(db: DatabaseSync, id: string, now: number): ClampSumma
     // also catches a site whose owner left the org without a clamp.
     const touched = new Set<string>();
     clearOrgAudiences(db, id, touched);
+    if (org.workos_organization_id !== null) {
+      // Deleting is a link change too: another org may later link this WorkOS org.
+      db.prepare(`UPDATE viewer_sessions SET revoked_at = ?
+        WHERE workos_org_id = ? AND revoked_at IS NULL`)
+        .run(now, org.workos_organization_id);
+    }
     // Detaching cancels every member's audiences (the users trigger would
     // too); cleared first so they are counted.
     for (const member of members) clearOwnerAudiences(db, member, touched);
