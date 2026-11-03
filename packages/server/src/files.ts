@@ -5,6 +5,17 @@ import {
   type SiteFileInput,
 } from "@shareplan/core";
 
+/**
+ * Site hosts will answer this prefix themselves (org-site sign-in), so no
+ * upload may claim it, on any site. Matched case-insensitively so no variant
+ * can look like it.
+ */
+export const RESERVED_PATH_PREFIX = "__shareplan/";
+
+export function isReservedPath(path: string): boolean {
+  return path.toLowerCase().startsWith(RESERVED_PATH_PREFIX);
+}
+
 export interface PreparedFile {
   path: string;
   body: Buffer;
@@ -35,6 +46,9 @@ export function prepareFiles(
     } catch (e) {
       const msg = e instanceof PathError ? e.message : "invalid path";
       throw new FileError("invalid_path", msg);
+    }
+    if (isReservedPath(path)) {
+      throw new FileError("reserved_path", `paths under ${RESERVED_PATH_PREFIX} are reserved: ${path}`);
     }
     if (seen.has(path)) {
       throw new FileError("duplicate_path", `duplicate path: ${path}`);

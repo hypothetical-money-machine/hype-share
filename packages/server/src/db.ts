@@ -83,19 +83,35 @@ export class ClaimIdentityConflictError extends Error {
   override readonly name = "ClaimIdentityConflictError";
 }
 
+/** What the visibility column holds. "org" is stored as "private" plus an audience. */
+export type StoredVisibility = Exclude<Visibility, "org">;
+
 export interface SiteRow {
   id: string;
   owner_key_id: string;
   owner_user_id: string;
   slug: string | null;
   title: string | null;
-  visibility: Visibility;
+  visibility: StoredVisibility;
   current_version_id: string | null;
   created_at: number;
   updated_at: number;
   expires_at: number | null;
   byte_size: number;
   file_count: number;
+  /** The org whose linked WorkOS org may read this site; see honouredAudience. */
+  audience_org_id: string | null;
+  /** That org's WorkOS link when the audience was set; a relink cancels it. */
+  audience_workos_org_id: string | null;
+  /** The version the audience was set for; any later write that skips it cancels it. */
+  audience_version_id: string | null;
+}
+
+/** The audience columns, all set or all null. */
+export interface SiteAudience {
+  orgId: string;
+  workosOrgId: string;
+  versionId: string;
 }
 
 export interface VersionRow {
@@ -110,7 +126,11 @@ export interface VersionRow {
 }
 
 const SITE_COLS = `id, owner_key_id, owner_user_id, slug, title, visibility, current_version_id,
-       created_at, updated_at, expires_at, byte_size, file_count`;
+       created_at, updated_at, expires_at, byte_size, file_count,
+       audience_org_id, audience_workos_org_id, audience_version_id`;
+
+const CLEAR_AUDIENCE = `audience_org_id = NULL, audience_workos_org_id = NULL,
+       audience_version_id = NULL`;
 
 const USER_COLS = `id, tier, email, workos_user_id, stripe_customer_id, claim_token_hash,
        created_at, claimed_at, org_id, org_role`;
@@ -351,6 +371,14 @@ export function upgrade(db: DatabaseSync): void {
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_orgs_workos_org
       ON orgs(workos_organization_id) WHERE workos_organization_id IS NOT NULL;
+  `);
+  // An org site is stored visibility = 'private' plus these; see honouredAudience.
+  addColumn(db, "sites", "audience_org_id", "TEXT REFERENCES orgs(id)");
+  addColumn(db, "sites", "audience_workos_org_id", "TEXT");
+  addColumn(db, "sites", "audience_version_id", "TEXT");
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_sites_audience_org
+      ON sites(audience_org_id) WHERE audience_org_id IS NOT NULL;
   `);
 }
 
@@ -682,15 +710,22 @@ export function revokeApiKey(
   return (result.changes ?? 0) > 0;
 }
 
+type AudienceColumns = "audience_org_id" | "audience_workos_org_id" | "audience_version_id";
+
 export function insertSite(
   db: DatabaseSync,
-  site: Omit<SiteRow, "byte_size" | "file_count"> & { byte_size?: number; file_count?: number },
+  site: Omit<SiteRow, "byte_size" | "file_count" | AudienceColumns> & {
+    byte_size?: number;
+    file_count?: number;
+    audience?: SiteAudience | null;
+  },
 ): void {
   db.prepare(
     `INSERT INTO sites
       (id, owner_key_id, owner_user_id, slug, title, visibility, current_version_id,
-       created_at, updated_at, expires_at, byte_size, file_count)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       created_at, updated_at, expires_at, byte_size, file_count,
+       audience_org_id, audience_workos_org_id, audience_version_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     site.id,
     site.owner_key_id,
@@ -704,9 +739,17 @@ export function insertSite(
     site.expires_at,
     site.byte_size ?? 0,
     site.file_count ?? 0,
+    site.audience?.orgId ?? null,
+    site.audience?.workosOrgId ?? null,
+    site.audience?.versionId ?? null,
   );
 }
 
+/**
+ * Point a site at a new version. Visibility and the audience are written
+ * together with the version, so a republish can never leave an audience from
+ * an earlier decision in place: null clears it.
+ */
 export function updateSiteVersion(
   db: DatabaseSync,
   siteId: string,
@@ -717,7 +760,8 @@ export function updateSiteVersion(
     byte_size: number;
     file_count: number;
     title?: string | null;
-    visibility?: Visibility;
+    visibility: StoredVisibility;
+    audience: SiteAudience | null;
   },
 ): void {
   db.prepare(
@@ -728,7 +772,10 @@ export function updateSiteVersion(
       byte_size = ?,
       file_count = ?,
       title = COALESCE(?, title),
-      visibility = COALESCE(?, visibility)
+      visibility = ?,
+      audience_org_id = ?,
+      audience_workos_org_id = ?,
+      audience_version_id = ?
      WHERE id = ?`,
   ).run(
     fields.current_version_id,
@@ -737,9 +784,56 @@ export function updateSiteVersion(
     fields.byte_size,
     fields.file_count,
     fields.title ?? null,
-    fields.visibility ?? null,
+    fields.visibility,
+    fields.audience?.orgId ?? null,
+    fields.audience?.workosOrgId ?? null,
+    fields.audience?.versionId ?? null,
     siteId,
   );
+}
+
+/** The fields honouredAudience reads; a full SiteRow has them all. */
+export type AudienceFields = Pick<
+  SiteRow,
+  "visibility" | "current_version_id" | "owner_user_id" | AudienceColumns
+>;
+
+/**
+ * The one check behind org visibility, used by every read. A site's audience
+ * counts only when all of these hold:
+ *  1. it is stored visibility = 'private';
+ *  2. audience_version_id is the current version (a republish by a binary that
+ *     does not know the columns cancels it);
+ *  3. the audience org is still linked to audience_workos_org_id (a relink or
+ *     unlink cancels it);
+ *  4. the owner is still in the audience org (detaching cancels it).
+ * Otherwise the site is plain owner-only private. Clamps clear stale columns
+ * for tidiness, but this per-request check is the guarantee.
+ */
+export function honouredAudience(db: DatabaseSync, site: AudienceFields): SiteAudience | null {
+  const orgId = site.audience_org_id;
+  const workosOrgId = site.audience_workos_org_id;
+  const versionId = site.audience_version_id;
+  if (site.visibility !== "private") return null;
+  if (orgId === null || workosOrgId === null || versionId === null) return null;
+  if (site.current_version_id === null || versionId !== site.current_version_id) return null;
+  const org = getOrg(db, orgId);
+  if (org === null || org.workos_organization_id !== workosOrgId) return null;
+  const owner = getUser(db, site.owner_user_id);
+  if (owner === null || owner.org_id !== orgId) return null;
+  return { orgId, workosOrgId, versionId };
+}
+
+/** What the API reports: "org" for an honoured audience, else the stored value. */
+export function effectiveVisibility(db: DatabaseSync, site: AudienceFields): Visibility {
+  return honouredAudience(db, site) === null ? site.visibility : "org";
+}
+
+/** Sites that carry audience columns at all, honoured or not. */
+export function listSitesWithAudience(db: DatabaseSync): SiteRow[] {
+  return db
+    .prepare(`SELECT ${SITE_COLS} FROM sites WHERE audience_org_id IS NOT NULL`)
+    .all() as unknown as SiteRow[];
 }
 
 export function updateSiteExpiry(
@@ -1078,7 +1172,9 @@ export interface ClampSummary {
 /**
  * Write the given columns; a tier change (either column, any value) clamps
  * every member's sites in the same transaction. Slice 6 calls this with the
- * billing fields. A duplicate WorkOS link throws 409.
+ * billing fields. A duplicate WorkOS link throws 409. Any change of the
+ * WorkOS link clears every site audience that names this org; those sites
+ * count as clamped.
  */
 export function updateOrg(
   db: DatabaseSync,
@@ -1087,7 +1183,8 @@ export function updateOrg(
   now: number,
 ): { org: OrgRow; clamped: ClampSummary } | null {
   return transaction(db, () => {
-    if (getOrg(db, id) === null) return null;
+    const before = getOrg(db, id);
+    if (before === null) return null;
     const sets: string[] = [];
     const values: (string | number | null)[] = [];
     for (const col of ORG_PATCH_COLS) {
@@ -1103,14 +1200,21 @@ export function updateOrg(
     } catch (err) {
       throw workosLinkConflict(err) ?? err;
     }
-    // Any change of the WorkOS link (A to null, A to B) must cancel what the
-    // old link granted, in this transaction: the org-visibility change clears
-    // the org's site audiences here, and viewer sign-in will also revoke
-    // viewer sessions for the old WorkOS org here.
+    const touched = new Set<string>();
+    const linkChanged =
+      patch.workos_organization_id !== undefined &&
+      patch.workos_organization_id !== before.workos_organization_id;
+    if (linkChanged) {
+      // Any change of the link (A to null, A to B) cancels what the old link
+      // granted. honouredAudience already refuses the old link; this clears
+      // the columns so nothing can rebind them. Viewer sign-in will also
+      // revoke viewer sessions for the old WorkOS org here.
+      clearOrgAudiences(db, id, touched);
+    }
     const tierChanged = patch.comp_tier !== undefined || patch.billing_tier !== undefined;
     const clamped = tierChanged
-      ? clampSitesForUsers(db, memberIds(db, id), now)
-      : { users: 0, sites: 0, skipped: 0 };
+      ? clampSitesForUsers(db, memberIds(db, id), now, touched)
+      : { users: 0, sites: touched.size, skipped: 0 };
     return { org: getOrg(db, id)!, clamped };
   });
 }
@@ -1128,11 +1232,43 @@ export function deleteOrg(db: DatabaseSync, id: string, now: number): ClampSumma
       );
     }
     const members = memberIds(db, id);
+    // sites.audience_org_id references the org, and foreign keys are on. This
+    // also catches a site whose owner left the org without a clamp.
+    const touched = new Set<string>();
+    clearOrgAudiences(db, id, touched);
     db.prepare(`UPDATE users SET org_id = NULL, org_role = NULL WHERE org_id = ?`).run(id);
-    const clamped = clampSitesForUsers(db, members, now);
+    const clamped = clampSitesForUsers(db, members, now, touched);
     db.prepare(`DELETE FROM orgs WHERE id = ?`).run(id);
     return clamped;
   });
+}
+
+/** Clear every audience that names orgId. Rows only. No transaction of its own. */
+function clearOrgAudiences(db: DatabaseSync, orgId: string, touched: Set<string>): void {
+  const rows = db
+    .prepare(`UPDATE sites SET ${CLEAR_AUDIENCE} WHERE audience_org_id = ? RETURNING id`)
+    .all(orgId) as { id: string }[];
+  for (const row of rows) touched.add(row.id);
+}
+
+/**
+ * Clear audiences on one owner's sites whose org or WorkOS link no longer
+ * matches the owner's current org and its link. Sites that still match keep
+ * theirs. Rows only. No transaction of its own.
+ */
+function clearStaleAudiences(db: DatabaseSync, user: UserRow, touched: Set<string>): void {
+  const org = user.org_id === null ? null : getOrg(db, user.org_id);
+  const rows = db
+    .prepare(
+      `UPDATE sites SET ${CLEAR_AUDIENCE}
+       WHERE owner_user_id = ?
+         AND (audience_org_id IS NOT NULL OR audience_workos_org_id IS NOT NULL
+              OR audience_version_id IS NOT NULL)
+         AND (audience_org_id IS NOT ? OR audience_workos_org_id IS NOT ?)
+       RETURNING id`,
+    )
+    .all(user.id, user.org_id, org?.workos_organization_id ?? null) as { id: string }[];
+  for (const row of rows) touched.add(row.id);
 }
 
 function memberIds(db: DatabaseSync, orgId: string): string[] {
@@ -1297,15 +1433,17 @@ export function revokeOrgMemberKey(
 /**
  * Bring one user's stored sites in line with a policy: rows only, never S3,
  * updated_at untouched (the user did not touch the site). Returns the number
- * of distinct sites changed. No transaction of its own.
+ * of distinct sites changed that were not already in touched. No transaction
+ * of its own.
  */
 export function clampSitesToPolicy(
   db: DatabaseSync,
   ownerUserId: string,
   policy: TierPolicy,
   now: number,
+  touched: Set<string> = new Set(),
 ): number {
-  const touched = new Set<string>();
+  const before = touched.size;
   const collect = (rows: unknown[]): void => {
     for (const row of rows as { id: string }[]) touched.add(row.id);
   };
@@ -1352,15 +1490,23 @@ export function clampSitesToPolicy(
         .all(ownerUserId),
     );
   }
-  return touched.size;
+  return touched.size - before;
 }
 
 /**
- * Clamp one user against their current effective tier. Null when the user's
- * own tier is unknown: the clamp is skipped so a membership change on an
+ * Clamp one user against their current org and effective tier. Stale site
+ * audiences are cleared first, whatever the tier. Null when the user's own
+ * tier is unknown: the tier clamp is skipped so a membership change on an
  * edited row still goes through.
  */
-function clampSitesForUser(db: DatabaseSync, user: UserRow, now: number): number | null {
+function clampSitesForUser(
+  db: DatabaseSync,
+  user: UserRow,
+  now: number,
+  touched: Set<string> = new Set(),
+): number | null {
+  const before = touched.size;
+  clearStaleAudiences(db, user, touched);
   const org = user.org_id === null ? null : getOrg(db, user.org_id);
   let policy: TierPolicy;
   try {
@@ -1369,35 +1515,36 @@ function clampSitesForUser(db: DatabaseSync, user: UserRow, now: number): number
     if (!(err instanceof UnknownTierError)) throw err;
     return null;
   }
-  return clampSitesToPolicy(db, user.id, policy, now);
+  clampSitesToPolicy(db, user.id, policy, now, touched);
+  return touched.size - before;
 }
 
 /**
  * Recompute each user's effective tier from current rows and clamp. Correct
  * whichever column moved (own tier, org tier, or membership). A user whose
  * own tier is unknown is skipped and counted, so one edited row never blocks
- * the whole org. No transaction of its own.
+ * the whole org. sites counts distinct sites, including any already in
+ * touched. No transaction of its own.
  */
 export function clampSitesForUsers(
   db: DatabaseSync,
   userIds: string[],
   now: number,
+  touched: Set<string> = new Set(),
 ): ClampSummary {
   let users = 0;
-  let sites = 0;
   let skipped = 0;
   for (const id of userIds) {
     const user = getUser(db, id);
     if (user === null) continue;
-    const clamped = clampSitesForUser(db, user, now);
+    const clamped = clampSitesForUser(db, user, now, touched);
     if (clamped === null) {
       skipped += 1;
       continue;
     }
     users += 1;
-    sites += clamped;
   }
-  return { users, sites, skipped };
+  return { users, sites: touched.size, skipped };
 }
 
 /**

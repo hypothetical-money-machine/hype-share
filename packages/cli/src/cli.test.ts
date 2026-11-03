@@ -31,7 +31,7 @@ describe("buildPublishBody", () => {
   });
 
   it("sends an explicit visibility", () => {
-    for (const visibility of ["public", "unlisted", "private"] as const) {
+    for (const visibility of ["public", "unlisted", "private", "org"] as const) {
       expect(buildPublishBody(files, { visibility }).visibility).toBe(visibility);
     }
   });

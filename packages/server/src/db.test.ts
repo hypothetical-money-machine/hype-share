@@ -244,6 +244,33 @@ describe("upgrade", () => {
     db.close();
   });
 
+  it("adds site audiences to an existing sites table, leaving rows owner-only", () => {
+    const db = openDb(":memory:");
+    const a = createOpsKey(db, { name: "a", token: "sp_a" });
+    site(db, "s1", "plan", 10, a.key.id, a.user.id);
+    db.exec(`
+      DROP INDEX idx_sites_audience_org;
+      ALTER TABLE sites DROP COLUMN audience_org_id;
+      ALTER TABLE sites DROP COLUMN audience_workos_org_id;
+      ALTER TABLE sites DROP COLUMN audience_version_id;
+    `);
+
+    upgrade(db);
+    upgrade(db);
+
+    expect(columnNames(db, "sites")).toEqual(
+      expect.arrayContaining(["audience_org_id", "audience_workos_org_id", "audience_version_id"]),
+    );
+    expect(schemaNames(db, "index")).toContain("idx_sites_audience_org");
+    expect(getSite(db, "s1")).toMatchObject({
+      audience_org_id: null,
+      audience_workos_org_id: null,
+      audience_version_id: null,
+    });
+    expect((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(3);
+    db.close();
+  });
+
   it("clears reserved slugs", () => {
     const db = openDb(":memory:");
     const a = createOpsKey(db, { name: "a", token: "sp_a" });

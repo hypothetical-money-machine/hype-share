@@ -12,6 +12,26 @@ describe("prepareFiles", () => {
     expect(files[0]!.body.toString("utf8")).toBe("<h1>hi</h1>");
   });
 
+  it("refuses the reserved __shareplan/ prefix in any case", () => {
+    for (const path of ["__shareplan/session.html", "__SharePlan/a/b.css", "./__shareplan/x.js"]) {
+      expect(() =>
+        prepareFiles(
+          [
+            { path: "index.html", content: "<h1>hi</h1>" },
+            { path, content: "a" },
+          ],
+          { maxSiteBytes: 10000, maxFileCount: 10 },
+        ),
+      ).toThrow(expect.objectContaining({ code: "reserved_path" }));
+    }
+    expect(
+      prepareFiles([{ path: "docs/__shareplan/x.html", content: "a" }], {
+        maxSiteBytes: 10000,
+        maxFileCount: 10,
+      }),
+    ).toHaveLength(1);
+  });
+
   it("rejects traversal", () => {
     expect(() =>
       prepareFiles([{ path: "../x", content: "a" }], {

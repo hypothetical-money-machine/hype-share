@@ -1,4 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
+import { effectiveVisibility, listSitesWithAudience, type AudienceFields } from "./db.js";
 import { TIER_POLICIES, effectiveTier, orgTier, type Tier } from "./tiers.js";
 
 const DAY = 86_400_000;
@@ -29,17 +30,28 @@ export function getOwnerStats(db: DatabaseSync, now = Date.now()) {
   const keys = db.prepare(`SELECT COUNT(*) AS active FROM api_keys WHERE revoked_at IS NULL`).get() as { active: number };
   const tierRows = db.prepare(`SELECT tier, COUNT(*) AS count FROM users GROUP BY tier`).all() as { tier: string; count: number }[];
   const tiers = Object.keys(TIER_POLICIES).map(tier => ({ tier, count: tierRows.find(row => row.tier === tier)?.count ?? 0 }));
-  const visibility = db.prepare(`SELECT visibility, COUNT(*) AS count FROM sites GROUP BY visibility`).all() as { visibility: string; count: number }[];
+  // Stored counts, then org sites moved out of private through the same check every read uses.
+  const stored = db.prepare(`SELECT visibility, COUNT(*) AS count FROM sites GROUP BY visibility`).all() as { visibility: string; count: number }[];
+  const orgSites = listSitesWithAudience(db).filter(site => effectiveVisibility(db, site) === "org").length;
+  const visibility = [...stored.map(row => row.visibility === "private" ? { ...row, count: row.count - orgSites } : row), { visibility: "org", count: orgSites }]
+    .filter(row => row.count > 0)
+    .sort((a, b) => a.visibility.localeCompare(b.visibility));
   const activityRows = db.prepare(`SELECT CAST(created_at / ? AS INTEGER) * ? AS day, COUNT(*) AS publishes
     FROM site_versions WHERE created_at >= ? GROUP BY day`).all(DAY, DAY, since) as { day: number; publishes: number }[];
   const activity = Array.from({ length: 30 }, (_, i) => {
     const day = since + i * DAY;
     return { date: new Date(day).toISOString().slice(0, 10), publishes: activityRows.find(row => row.day === day)?.publishes ?? 0 };
   });
-  const recentSites = db.prepare(`SELECT id, title, visibility, byte_size AS byteSize,
-    updated_at AS updatedAt, expires_at AS expiresAt FROM sites ORDER BY updated_at DESC, id LIMIT 20`).all() as {
-      id: string; title: string | null; visibility: string; byteSize: number; updatedAt: number; expiresAt: number | null;
-    }[];
+  const recentRows = db.prepare(`SELECT id, title, visibility, byte_size AS byteSize,
+    updated_at AS updatedAt, expires_at AS expiresAt, owner_user_id, current_version_id,
+    audience_org_id, audience_workos_org_id, audience_version_id
+    FROM sites ORDER BY updated_at DESC, id LIMIT 20`).all() as unknown as (AudienceFields & {
+      id: string; title: string | null; byteSize: number; updatedAt: number; expiresAt: number | null;
+    })[];
+  const recentSites = recentRows.map(row => ({
+    id: row.id, title: row.title, visibility: effectiveVisibility(db, row) as string,
+    byteSize: row.byteSize, updatedAt: row.updatedAt, expiresAt: row.expiresAt,
+  }));
   // Org output never carries join_token_hash, member emails, or the WorkOS org id (only whether
   // one is linked); the tier chart above stays own tiers only.
   const orgTotals = db.prepare(`SELECT COUNT(*) AS total,
