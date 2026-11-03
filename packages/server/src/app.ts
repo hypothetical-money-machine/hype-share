@@ -44,6 +44,7 @@ import {
   getOrg,
   getSite,
   getSiteByIdOrSlug,
+  getUser,
   getSiteBySlug,
   hashApiKey,
   honouredAudience,
@@ -1161,29 +1162,55 @@ async function publishNewSite(
 
   await putSiteFiles(ctx.s3, ctx.config.s3.bucket, siteId, versionId, files);
 
-  insertSite(ctx.db, {
-    id: siteId,
-    owner_key_id: account.key.id,
-    owner_user_id: account.user.id,
-    slug: body.slug ?? null,
-    title: body.title ?? null,
-    visibility,
-    current_version_id: versionId,
-    created_at: now,
-    updated_at: now,
-    expires_at,
-    byte_size,
-    file_count,
-    audience,
+  // Race rule for an org create: the owner may have been detached, or the org
+  // relinked, while the files uploaded. Re-check in the transaction that
+  // writes the rows, and write no audience the owner no longer has.
+  const committed = transaction(ctx.db, () => {
+    if (orgLink !== null) {
+      const owner = getUser(ctx.db, account.user.id);
+      const org = getOrg(ctx.db, orgLink.orgId);
+      if (
+        owner === null ||
+        owner.org_id !== orgLink.orgId ||
+        org === null ||
+        org.workos_organization_id !== orgLink.workosOrgId
+      ) {
+        return false;
+      }
+    }
+    insertSite(ctx.db, {
+      id: siteId,
+      owner_key_id: account.key.id,
+      owner_user_id: account.user.id,
+      slug: body.slug ?? null,
+      title: body.title ?? null,
+      visibility,
+      current_version_id: versionId,
+      created_at: now,
+      updated_at: now,
+      expires_at,
+      byte_size,
+      file_count,
+      audience,
+    });
+    insertVersion(ctx.db, {
+      id: versionId,
+      site_id: siteId,
+      created_at: now,
+      byte_size,
+      file_count,
+      note: body.note ?? null,
+    });
+    return true;
   });
-  insertVersion(ctx.db, {
-    id: versionId,
-    site_id: siteId,
-    created_at: now,
-    byte_size,
-    file_count,
-    note: body.note ?? null,
-  });
+  if (!committed) {
+    await discardVersionObjects(ctx, siteId, versionId);
+    throw new HttpError(
+      409,
+      "site_changed",
+      "the organization changed while this site uploaded; nothing was published, try again",
+    );
+  }
 
   const row = getSite(ctx.db, siteId)!;
   return toSiteResponse(ctx.config, ctx.db, row);

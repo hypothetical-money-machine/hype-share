@@ -132,6 +132,9 @@ const SITE_COLS = `id, owner_key_id, owner_user_id, slug, title, visibility, cur
 const CLEAR_AUDIENCE = `audience_org_id = NULL, audience_workos_org_id = NULL,
        audience_version_id = NULL`;
 
+const HAS_AUDIENCE = `(audience_org_id IS NOT NULL OR audience_workos_org_id IS NOT NULL
+       OR audience_version_id IS NOT NULL)`;
+
 const USER_COLS = `id, tier, email, workos_user_id, stripe_customer_id, claim_token_hash,
        created_at, claimed_at, org_id, org_role`;
 
@@ -379,6 +382,31 @@ export function upgrade(db: DatabaseSync): void {
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_sites_audience_org
       ON sites(audience_org_id) WHERE audience_org_id IS NOT NULL;
+  `);
+  // Cancelling an audience must stick, even on a binary that predates these
+  // columns: honouredAudience compares current values, so detach then
+  // re-attach, or link A to B and back, would otherwise revive it. Triggers
+  // live in the database, so every binary's writes fire them. The app clears
+  // the same rows first (to count them); these are the guarantee.
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS trg_users_org_change_clears_audience
+      AFTER UPDATE OF org_id ON users
+      WHEN OLD.org_id IS NOT NEW.org_id
+    BEGIN
+      UPDATE sites SET ${CLEAR_AUDIENCE}
+       WHERE owner_user_id = NEW.id AND ${HAS_AUDIENCE};
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_orgs_link_change_clears_audience
+      AFTER UPDATE OF workos_organization_id ON orgs
+      WHEN OLD.workos_organization_id IS NOT NEW.workos_organization_id
+    BEGIN
+      UPDATE sites SET ${CLEAR_AUDIENCE} WHERE audience_org_id = NEW.id;
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_orgs_delete_clears_audience
+      BEFORE DELETE ON orgs
+    BEGIN
+      UPDATE sites SET ${CLEAR_AUDIENCE} WHERE audience_org_id = OLD.id;
+    END;
   `);
 }
 
@@ -807,8 +835,11 @@ export type AudienceFields = Pick<
  *  3. the audience org is still linked to audience_workos_org_id (a relink or
  *     unlink cancels it);
  *  4. the owner is still in the audience org (detaching cancels it).
- * Otherwise the site is plain owner-only private. Clamps clear stale columns
- * for tidiness, but this per-request check is the guarantee.
+ * Otherwise the site is plain owner-only private. This compares current
+ * values only, so a cancellation must also clear the columns, or detach then
+ * re-attach (or relink A to B and back) would revive the audience. The
+ * triggers in upgrade() do that for every binary's writes; clamps do it too,
+ * to count the sites.
  */
 export function honouredAudience(db: DatabaseSync, site: AudienceFields): SiteAudience | null {
   const orgId = site.audience_org_id;
@@ -1195,21 +1226,22 @@ export function updateOrg(
     }
     sets.push("updated_at = ?");
     values.push(now);
-    try {
-      db.prepare(`UPDATE orgs SET ${sets.join(", ")} WHERE id = ?`).run(...values, id);
-    } catch (err) {
-      throw workosLinkConflict(err) ?? err;
-    }
     const touched = new Set<string>();
     const linkChanged =
       patch.workos_organization_id !== undefined &&
       patch.workos_organization_id !== before.workos_organization_id;
     if (linkChanged) {
       // Any change of the link (A to null, A to B) cancels what the old link
-      // granted. honouredAudience already refuses the old link; this clears
-      // the columns so nothing can rebind them. Viewer sign-in will also
-      // revoke viewer sessions for the old WorkOS org here.
+      // granted. honouredAudience already refuses the old link, and
+      // trg_orgs_link_change_clears_audience clears the columns on the write
+      // below; clearing them first here is what lets us count them. Viewer
+      // sign-in will also revoke viewer sessions for the old WorkOS org here.
       clearOrgAudiences(db, id, touched);
+    }
+    try {
+      db.prepare(`UPDATE orgs SET ${sets.join(", ")} WHERE id = ?`).run(...values, id);
+    } catch (err) {
+      throw workosLinkConflict(err) ?? err;
     }
     const tierChanged = patch.comp_tier !== undefined || patch.billing_tier !== undefined;
     const clamped = tierChanged
@@ -1236,6 +1268,9 @@ export function deleteOrg(db: DatabaseSync, id: string, now: number): ClampSumma
     // also catches a site whose owner left the org without a clamp.
     const touched = new Set<string>();
     clearOrgAudiences(db, id, touched);
+    // Detaching cancels every member's audiences (the users trigger would
+    // too); cleared first so they are counted.
+    for (const member of members) clearOwnerAudiences(db, member, touched);
     db.prepare(`UPDATE users SET org_id = NULL, org_role = NULL WHERE org_id = ?`).run(id);
     const clamped = clampSitesForUsers(db, members, now, touched);
     db.prepare(`DELETE FROM orgs WHERE id = ?`).run(id);
@@ -1252,6 +1287,21 @@ function clearOrgAudiences(db: DatabaseSync, orgId: string, touched: Set<string>
 }
 
 /**
+ * Clear every audience on one owner's sites, for a change of the owner's org.
+ * trg_users_org_change_clears_audience does the same on the users write; the
+ * app does it first so the cleared sites are counted. Rows only. No
+ * transaction of its own.
+ */
+function clearOwnerAudiences(db: DatabaseSync, ownerUserId: string, touched: Set<string>): void {
+  const rows = db
+    .prepare(
+      `UPDATE sites SET ${CLEAR_AUDIENCE} WHERE owner_user_id = ? AND ${HAS_AUDIENCE} RETURNING id`,
+    )
+    .all(ownerUserId) as { id: string }[];
+  for (const row of rows) touched.add(row.id);
+}
+
+/**
  * Clear audiences on one owner's sites whose org or WorkOS link no longer
  * matches the owner's current org and its link. Sites that still match keep
  * theirs. Rows only. No transaction of its own.
@@ -1261,9 +1311,7 @@ function clearStaleAudiences(db: DatabaseSync, user: UserRow, touched: Set<strin
   const rows = db
     .prepare(
       `UPDATE sites SET ${CLEAR_AUDIENCE}
-       WHERE owner_user_id = ?
-         AND (audience_org_id IS NOT NULL OR audience_workos_org_id IS NOT NULL
-              OR audience_version_id IS NOT NULL)
+       WHERE owner_user_id = ? AND ${HAS_AUDIENCE}
          AND (audience_org_id IS NOT ? OR audience_workos_org_id IS NOT ?)
        RETURNING id`,
     )
@@ -1335,13 +1383,20 @@ export function setUserOrg(
     if (user.org_id !== null && user.org_role === "admin" && !staysAdmin) {
       assertNotLastAdmin(db, user.org_id, user.id);
     }
+    const nextOrgId = org === null ? null : org.id;
+    const touched = new Set<string>();
+    // A change of org cancels every audience (so does the users trigger); a
+    // role change in the same org keeps them. Read the stored org_id, as the
+    // trigger does, not the caller's copy.
+    if (getUser(db, user.id)?.org_id !== nextOrgId) clearOwnerAudiences(db, user.id, touched);
     db.prepare(`UPDATE users SET org_id = ?, org_role = ? WHERE id = ?`).run(
-      org === null ? null : org.id,
+      nextOrgId,
       nextRole,
       user.id,
     );
-    const clampedSites = clampSitesForUser(db, getUser(db, user.id)!, now) ?? 0;
-    return { effectiveTier: effectiveTier(user.tier, orgTier(org)), clampedSites };
+    // Counted from touched, so audiences cleared before an unknown-tier skip count.
+    clampSitesForUser(db, getUser(db, user.id)!, now, touched);
+    return { effectiveTier: effectiveTier(user.tier, orgTier(org)), clampedSites: touched.size };
   });
 }
 
@@ -1378,8 +1433,11 @@ export function removeOrgMember(
     const target = getUser(db, userId);
     if (target === null || target.org_id !== orgId) return null;
     if (target.org_role === "admin") assertNotLastAdmin(db, orgId, userId);
+    const touched = new Set<string>();
+    clearOwnerAudiences(db, userId, touched);
     db.prepare(`UPDATE users SET org_id = NULL, org_role = NULL WHERE id = ?`).run(userId);
-    const clampedSites = clampSitesForUser(db, getUser(db, userId)!, now) ?? 0;
+    clampSitesForUser(db, getUser(db, userId)!, now, touched);
+    const clampedSites = touched.size;
     let revokedKeys = 0;
     if (opts.revokeKeys) {
       const result = db
