@@ -1410,7 +1410,7 @@ describe("account claiming", () => {
     expect(workos.authenticationCalls).toHaveLength(1);
   });
 
-  for (const method of ["GitHubOAuth", "GoogleOAuth"]) {
+  for (const method of ["GitHubOAuth", "GoogleOAuth", "SSO"]) {
     it(`upgrades a ${method} claim to free`, async () => {
       const workos = createFakeWorkOS(method);
       const { app, db } = await setup({ workos: WORKOS_CONFIG }, workos.client);
