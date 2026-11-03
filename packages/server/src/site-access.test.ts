@@ -432,6 +432,50 @@ describe("org site handoff", () => {
   });
 });
 
+describe("sign-out and overlapping sign-ins", () => {
+  it("ends every site this person signed in to, even from tabs that signed in at the same time", async () => {
+    const h = await setup();
+    // Two tabs, no apex cookie yet: each callback creates its own viewer session.
+    const a = await signIn(h, h.siteA.url);
+    const b = await signIn(h, h.siteB.url, "/");
+    expect(a.viewerCookie).not.toBe(b.viewerCookie);
+    expect(viewerSessions(h).filter((v) => v.revoked_at === null)).toHaveLength(2);
+    // The browser kept the last callback's apex cookie; signing out with it…
+    const logout = await h.get(`${BASE}/v1/view/logout`, {
+      method: "POST", cookie: b.viewerCookie,
+      headers: { origin: BASE, "content-type": "application/x-www-form-urlencoded" }, payload: "",
+    });
+    expect(logout.statusCode).toBe(200);
+    // …ends both sites, not just the one whose session the cookie named.
+    expect((await h.get(h.siteA.url, { cookie: a.siteCookie })).statusCode).toBe(401);
+    expect((await h.get(h.siteB.url, { cookie: b.siteCookie })).statusCode).toBe(401);
+  });
+});
+
+describe("redemption audience check", () => {
+  it("refuses a grant whose viewer is in another WorkOS org while the site is still org", async () => {
+    const h = await setup();
+    const first = await h.get(h.siteA.url, { headers: NAV });
+    const started = await h.get(first.headers.location as string, { headers: NAV });
+    const grant = await h.get(`${BASE}${VIEW_CALLBACK_PATH}?code=c&state=state_1`, { cookie: flowPair(started) });
+    expect(grant.statusCode).toBe(302);
+    h.db.prepare("UPDATE viewer_sessions SET workos_org_id = 'org_other'").run();
+    const res = await h.get(grant.headers.location as string, { cookie: pair(first, NONCE_COOKIE), headers: NAV });
+    expect(res.statusCode).toBe(403);
+    expect(setCookie(res, SITE_COOKIE)).toBeUndefined();
+  });
+});
+
+describe("legacy /s/ redirect", () => {
+  it("sends the org headers on the hop to an org site's own origin", async () => {
+    const h = await setup();
+    const res = await h.get(`${BASE}/s/${h.siteA.id}/report.html`);
+    expect(res.statusCode).toBe(302);
+    expect(res.headers.location).toBe(`https://${h.siteA.id}.${SUFFIX}/report.html`);
+    expectOrgHeaders(res);
+  });
+});
+
 describe("org site request order", () => {
   it("serves the owner's key, 404s another key and 401s an invalid key", async () => {
     const h = await setup();

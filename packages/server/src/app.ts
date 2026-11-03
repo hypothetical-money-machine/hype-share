@@ -886,6 +886,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     if (!isHostLabel(label)) {
       return reply.status(404).send({ error: { code: "not_found", message: "site not found" } });
     }
+    const target = RESERVED_HOST_LABELS.has(label) ? null : getSiteByIdOrSlug(deps.db, label);
+    if (target !== null && honouredAudience(deps.db, target) !== null) setOrgSiteHeaders(reply);
     return reply.redirect(`${siteUrl(deps.config, label)}${rest}${query}`, 302);
   };
   app.get("/s/:id", (req, reply) => legacy(req, reply, true));

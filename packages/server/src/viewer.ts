@@ -269,7 +269,10 @@ export function registerViewerRoutes(
   app.post("/v1/view/logout", { ...options, bodyLimit: 4096 }, async (req, reply) => {
     if (req.headers.origin !== base.origin) throw new HttpError(403, "invalid_origin", "Submit this form from the viewer sign-in page.");
     const session = sessionFor(req);
-    if (session) revokeViewerSession(db, session.token_hash);
+    // Sign out every viewer session this person holds, not just this cookie's:
+    // tabs that signed in at the same time each got their own session, and
+    // their site cookies would otherwise outlive the sign-out.
+    if (session) revokeViewerSessions(db, { workosUserId: session.workos_user_id });
     reply.clearCookie(cookieName, cookieOptions);
     const url = session
       ? workos!.userManagement.getLogoutUrl({ sessionId: session.workos_session_id, returnTo: new URL("/", base).href })
