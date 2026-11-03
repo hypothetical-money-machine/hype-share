@@ -188,6 +188,7 @@ describe("upgrade", () => {
         "idx_users_org",
         "idx_orgs_join_token",
         "idx_orgs_stripe_customer",
+        "idx_orgs_workos_org",
         "idx_sites_permanent",
       ]),
     );
@@ -221,6 +222,25 @@ describe("upgrade", () => {
     expect(getUser(db, a.user.id)).toMatchObject({ tier: "ops", org_id: null, org_role: null });
     expect(findApiKeyByToken(db, "sp_a")?.id).toBe(a.key.id);
     expect(getSite(db, "s1")).toEqual(before);
+    db.close();
+  });
+
+  it("adds the WorkOS link to an existing orgs table without a version bump", () => {
+    const db = openDb(":memory:");
+    const org = createOrg(db, { name: "SkySlope", compTier: "paid", joinToken: "org_x" });
+    db.exec(`
+      DROP INDEX idx_orgs_workos_org;
+      ALTER TABLE orgs DROP COLUMN workos_organization_id;
+    `);
+    expect(columnNames(db, "orgs")).not.toContain("workos_organization_id");
+
+    upgrade(db);
+    upgrade(db);
+
+    expect(columnNames(db, "orgs")).toContain("workos_organization_id");
+    expect(schemaNames(db, "index")).toContain("idx_orgs_workos_org");
+    expect(getOrg(db, org.id)).toMatchObject({ name: "SkySlope", workos_organization_id: null });
+    expect((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(3);
     db.close();
   });
 

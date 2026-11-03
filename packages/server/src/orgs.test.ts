@@ -18,6 +18,7 @@ import {
 } from "./db.js";
 import { hashIp } from "./ip.js";
 import { ORG_TOKEN_RE } from "./orgs.js";
+import { getOwnerStats } from "./owner-stats.js";
 import { HOUR_MS } from "./rate-limit.js";
 import { reapExpiredSites } from "./reap.js";
 import { createFakeS3, type FakeS3 } from "./testing/fake-s3.js";
@@ -40,6 +41,9 @@ function pinClock(): void {
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(FIXED_NOW);
 }
+
+const WORKOS_ORG_A = "org_01HSKYSLOPEAAAAAAAAAAAAAAA";
+const WORKOS_ORG_B = "org_01HSKYSLOPEBBBBBBBBBBBBBBB";
 
 // Well-formed but never issued.
 const UNKNOWN_ORG_TOKEN = `org_${"A".repeat(43)}`;
@@ -107,12 +111,19 @@ async function setup(
 interface FakeWorkOS {
   client: WorkOSAuthClient;
   method: string | undefined;
+  /** WorkOS organizations that exist, by id. */
+  organizations: Set<string>;
+  organizationLookups: string[];
+  failOrganizationLookup: boolean;
 }
 
 function createFakeWorkOS(method: string | undefined = "MagicAuth"): FakeWorkOS {
   let flow = 0;
   const fake: FakeWorkOS = {
     method,
+    organizations: new Set([WORKOS_ORG_A, WORKOS_ORG_B]),
+    organizationLookups: [],
+    failOrganizationLookup: false,
     client: undefined as unknown as WorkOSAuthClient,
   };
   fake.client = {
@@ -133,6 +144,13 @@ function createFakeWorkOS(method: string | undefined = "MagicAuth"): FakeWorkOS 
         },
         authenticationMethod: fake.method,
       }),
+    },
+    organizations: {
+      getOrganization: async (id) => {
+        fake.organizationLookups.push(id);
+        if (fake.failOrganizationLookup) throw new Error("WorkOS unavailable");
+        return fake.organizations.has(id) ? { id, name: `WorkOS ${id}` } : null;
+      },
     },
   };
   return fake;
@@ -248,6 +266,7 @@ interface OrgAdmin {
   memberCount: number;
   publishPerHour: number | null;
   joinEnabled: boolean;
+  workosOrganizationId: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -1510,6 +1529,180 @@ describe("operator: list, show, delete", () => {
     expect(typeof ops.userId).toBe("string");
     const minted = keys.find((k) => k.id === member.keyId)!;
     expect(minted).toMatchObject({ userId: member.userId, orgId: org.id });
+  });
+});
+
+describe("operator: link a WorkOS organization", () => {
+  it("links on create, relinks and unlinks on update, and shows the link", async () => {
+    const workos = createFakeWorkOS();
+    const { app, db } = await setup({ workos: WORKOS_CONFIG }, workos.client);
+    const { org } = await createOrg(app, { name: "SkySlope", workosOrganizationId: WORKOS_ORG_A });
+    expect(org.workosOrganizationId).toBe(WORKOS_ORG_A);
+    expect(workos.organizationLookups).toEqual([WORKOS_ORG_A]);
+
+    const relinked = await admin(app, "PUT", `/api/v1/admin/orgs/${org.id}`, {
+      workosOrganizationId: WORKOS_ORG_B,
+    });
+    expect(relinked.statusCode).toBe(200);
+    expect(relinked.json<{ org: OrgAdmin }>().org.workosOrganizationId).toBe(WORKOS_ORG_B);
+
+    const shown = await admin(app, "GET", `/api/v1/admin/orgs/${org.id}`);
+    expect(shown.json<{ org: OrgAdmin }>().org.workosOrganizationId).toBe(WORKOS_ORG_B);
+    const listed = await admin(app, "GET", "/api/v1/admin/orgs");
+    expect(listed.json<{ orgs: OrgAdmin[] }>().orgs[0]!.workosOrganizationId).toBe(WORKOS_ORG_B);
+
+    const unlinked = await admin(app, "PUT", `/api/v1/admin/orgs/${org.id}`, {
+      workosOrganizationId: null,
+    });
+    expect(unlinked.statusCode).toBe(200);
+    expect(unlinked.json<{ org: OrgAdmin }>().org.workosOrganizationId).toBeNull();
+    const row = db.prepare(`SELECT workos_organization_id FROM orgs WHERE id = ?`).get(org.id) as {
+      workos_organization_id: string | null;
+    };
+    expect(row.workos_organization_id).toBeNull();
+    // Unlinking never asks WorkOS.
+    expect(workos.organizationLookups).toEqual([WORKOS_ORG_A, WORKOS_ORG_B]);
+  });
+
+  it("refuses a WorkOS organization already linked elsewhere", async () => {
+    const workos = createFakeWorkOS();
+    const { app, db } = await setup({ workos: WORKOS_CONFIG }, workos.client);
+    const { org: first } = await createOrg(app, { name: "A", workosOrganizationId: WORKOS_ORG_A });
+    const { org: second } = await createOrg(app, { name: "B" });
+
+    const dupCreate = await admin(app, "POST", "/api/v1/admin/orgs", {
+      name: "C",
+      workosOrganizationId: WORKOS_ORG_A,
+    });
+    expect(dupCreate.statusCode).toBe(409);
+    expect(errorCode(dupCreate)).toBe("workos_org_linked");
+    expect((await admin(app, "GET", "/api/v1/admin/orgs")).json<{ orgs: unknown[] }>().orgs)
+      .toHaveLength(2);
+
+    const dupUpdate = await admin(app, "PUT", `/api/v1/admin/orgs/${second.id}`, {
+      workosOrganizationId: WORKOS_ORG_A,
+    });
+    expect(dupUpdate.statusCode).toBe(409);
+    expect(errorCode(dupUpdate)).toBe("workos_org_linked");
+
+    // Re-sending an org's own link is not a duplicate.
+    const same = await admin(app, "PUT", `/api/v1/admin/orgs/${first.id}`, {
+      workosOrganizationId: WORKOS_ORG_A,
+    });
+    expect(same.statusCode).toBe(200);
+
+    // The index holds even for a write that skips the route's check.
+    expect(() =>
+      db
+        .prepare(`UPDATE orgs SET workos_organization_id = ? WHERE id = ?`)
+        .run(WORKOS_ORG_A, second.id),
+    ).toThrow(/UNIQUE constraint failed: orgs\.workos_organization_id/);
+    // Any number of orgs can be unlinked.
+    await createOrg(app, { name: "D" });
+    const unlinkedCount = db
+      .prepare(`SELECT COUNT(*) AS n FROM orgs WHERE workos_organization_id IS NULL`)
+      .get() as { n: number };
+    expect(Number(unlinkedCount.n)).toBe(2);
+  });
+
+  it("validates the id with WorkOS before storing it", async () => {
+    const workos = createFakeWorkOS();
+    const { app } = await setup({ workos: WORKOS_CONFIG }, workos.client);
+    const { org } = await createOrg(app, { name: "SkySlope" });
+
+    const unknown = await admin(app, "PUT", `/api/v1/admin/orgs/${org.id}`, {
+      workosOrganizationId: "org_01HNOSUCHORG",
+    });
+    expect(unknown.statusCode).toBe(400);
+    expect(errorCode(unknown)).toBe("unknown_workos_org");
+
+    const unknownCreate = await admin(app, "POST", "/api/v1/admin/orgs", {
+      name: "X",
+      workosOrganizationId: "org_01HNOSUCHORG",
+    });
+    expect(unknownCreate.statusCode).toBe(400);
+    expect(errorCode(unknownCreate)).toBe("unknown_workos_org");
+
+    for (const bad of ["01HSKYSLOPE", "org_", "org_../users", "org_abc def", ""]) {
+      const res = await admin(app, "PUT", `/api/v1/admin/orgs/${org.id}`, {
+        workosOrganizationId: bad,
+      });
+      expect(res.statusCode).toBe(400);
+      expect(errorCode(res)).toBe("validation_error");
+    }
+    expect(workos.organizationLookups).toEqual(["org_01HNOSUCHORG", "org_01HNOSUCHORG"]);
+
+    workos.failOrganizationLookup = true;
+    const down = await admin(app, "PUT", `/api/v1/admin/orgs/${org.id}`, {
+      workosOrganizationId: WORKOS_ORG_A,
+    });
+    expect(down.statusCode).toBe(502);
+    expect(errorCode(down)).toBe("workos_unavailable");
+
+    const missing = await admin(app, "PUT", "/api/v1/admin/orgs/nope", {
+      workosOrganizationId: WORKOS_ORG_A,
+    });
+    expect(missing.statusCode).toBe(404);
+    expect(workos.organizationLookups.filter((id) => id === WORKOS_ORG_A)).toHaveLength(1);
+
+    const shown = await admin(app, "GET", `/api/v1/admin/orgs/${org.id}`);
+    expect(shown.json<{ org: OrgAdmin }>().org.workosOrganizationId).toBeNull();
+  });
+
+  it("needs WorkOS configured to link, but never to unlink", async () => {
+    const workos = createFakeWorkOS();
+    // A client without config counts as unconfigured, as for claiming.
+    const { app, db } = await setup({}, workos.client);
+    const create = await admin(app, "POST", "/api/v1/admin/orgs", {
+      name: "SkySlope",
+      workosOrganizationId: WORKOS_ORG_A,
+    });
+    expect(create.statusCode).toBe(503);
+    expect(errorCode(create)).toBe("workos_unconfigured");
+
+    const { org } = await createOrg(app, { name: "SkySlope", workosOrganizationId: null });
+    expect(org.workosOrganizationId).toBeNull();
+    const link = await admin(app, "PUT", `/api/v1/admin/orgs/${org.id}`, {
+      workosOrganizationId: WORKOS_ORG_A,
+    });
+    expect(link.statusCode).toBe(503);
+    expect(errorCode(link)).toBe("workos_unconfigured");
+    expect(workos.organizationLookups).toEqual([]);
+
+    // A link left over from when WorkOS was configured: the emergency unlink still works.
+    db.prepare(`UPDATE orgs SET workos_organization_id = ? WHERE id = ?`).run(WORKOS_ORG_A, org.id);
+    const unlink = await admin(app, "PUT", `/api/v1/admin/orgs/${org.id}`, {
+      workosOrganizationId: null,
+    });
+    expect(unlink.statusCode).toBe(200);
+    expect(unlink.json<{ org: OrgAdmin }>().org.workosOrganizationId).toBeNull();
+  });
+
+  it("works with no WorkOS client at all", async () => {
+    const { app, db } = await setup();
+    const { org } = await createOrg(app, { name: "SkySlope" });
+    const link = await admin(app, "PUT", `/api/v1/admin/orgs/${org.id}`, {
+      workosOrganizationId: WORKOS_ORG_A,
+    });
+    expect(link.statusCode).toBe(503);
+    db.prepare(`UPDATE orgs SET workos_organization_id = ? WHERE id = ?`).run(WORKOS_ORG_A, org.id);
+    const unlink = await admin(app, "PUT", `/api/v1/admin/orgs/${org.id}`, {
+      workosOrganizationId: null,
+    });
+    expect(unlink.statusCode).toBe(200);
+  });
+
+  it("owner stats show only whether an org is linked", async () => {
+    const workos = createFakeWorkOS();
+    const { app, db } = await setup({ workos: WORKOS_CONFIG }, workos.client);
+    await createOrg(app, { name: "Linked", workosOrganizationId: WORKOS_ORG_A });
+    await createOrg(app, { name: "Plain" });
+    const stats = getOwnerStats(db);
+    expect(stats.orgs.workosLinked).toBe(1);
+    // Both orgs have no members, so their order is by creation time and id.
+    const linked = Object.fromEntries(stats.orgList.map((o) => [o.name, o.workosLinked]));
+    expect(linked).toEqual({ Linked: 1, Plain: 0 });
+    expect(JSON.stringify(stats)).not.toContain(WORKOS_ORG_A);
   });
 });
 

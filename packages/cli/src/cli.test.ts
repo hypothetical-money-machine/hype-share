@@ -7,6 +7,7 @@ import {
   buildPublishBody,
   deletedLine,
   isCliEntrypoint,
+  parseWorkosOrgOrNone,
   printable,
   removedLine,
   resolveOrgToken,
@@ -72,6 +73,29 @@ describe("buildCreateOrgBody", () => {
       publishPerHour: 5,
     });
     expect(buildCreateOrgBody({ name: "SkySlope" })).toEqual({ name: "SkySlope" });
+  });
+
+  it("sends a WorkOS link, and treats none as no link", () => {
+    expect(buildCreateOrgBody({ name: "SkySlope", workosOrg: "org_01HABC" })).toEqual({
+      name: "SkySlope",
+      workosOrganizationId: "org_01HABC",
+    });
+    expect(buildCreateOrgBody({ name: "SkySlope", workosOrg: "none" })).toEqual({
+      name: "SkySlope",
+    });
+  });
+});
+
+describe("parseWorkosOrgOrNone", () => {
+  it("accepts a WorkOS organization id or none", () => {
+    expect(parseWorkosOrgOrNone("org_01HABC")).toBe("org_01HABC");
+    expect(parseWorkosOrgOrNone("none")).toBe("none");
+  });
+
+  it("rejects anything else client-side", () => {
+    for (const bad of ["01HABC", "org_", "org_a/b", `org_${"A".repeat(43)}-x`, "None"]) {
+      expect(() => parseWorkosOrgOrNone(bad)).toThrow(/WorkOS organization id/);
+    }
   });
 });
 

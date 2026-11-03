@@ -1,8 +1,9 @@
-import type { FastifyInstance } from "fastify";
+import type { FastifyBaseLogger, FastifyInstance } from "fastify";
 import type { DatabaseSync } from "node:sqlite";
 import { randomBytes } from "node:crypto";
 import { z } from "zod";
 import { createApiKey, type SiteListItem } from "@shareplan/core";
+import type { WorkOSAuthClient } from "./app.js";
 import type { Config } from "./config.js";
 import {
   assertOrgHasRoom,
@@ -13,6 +14,7 @@ import {
   deleteOrg,
   findOrgByJoinToken,
   getOrg,
+  getOrgByWorkosOrganizationId,
   getUser,
   listOrgMembers,
   listOrgs,
@@ -23,6 +25,8 @@ import {
   setOrgMemberRole,
   setUserOrg,
   updateOrg,
+  workosLinkConflict,
+  workosOrgLinkedError,
   type OrgMemberRow,
   type OrgPatch,
   type OrgRow,
@@ -50,6 +54,15 @@ export function createOrgToken(): string {
 }
 
 const roleSchema = z.enum(["admin", "member"]);
+
+/**
+ * A WorkOS organization id (org_ plus a ULID). Checked here so nothing but an
+ * id-shaped value reaches the WorkOS API path; WorkOS decides if it exists.
+ */
+const WORKOS_ORG_ID_RE = /^org_[0-9A-Za-z]{1,64}$/;
+const workosOrgIdSchema = z
+  .string()
+  .regex(WORKOS_ORG_ID_RE, "workosOrganizationId must be a WorkOS organization id (org_...)");
 
 export const createKeySchema = z.object({
   name: z.string().min(1).max(100).default("default"),
@@ -79,6 +92,7 @@ const createOrgSchema = z
     compTier: z.string().nullable().default(null),
     maxMembers: z.number().int().min(1).max(10000).default(100),
     publishPerHour: z.number().int().min(1).nullable().default(null),
+    workosOrganizationId: workosOrgIdSchema.nullable().default(null),
   })
   .refine((body) => body.publishPerHour === null || body.compTier !== null, {
     message: "publishPerHour needs a tier",
@@ -90,9 +104,11 @@ const updateOrgSchema = z
     compTier: z.string().nullable().optional(),
     maxMembers: z.number().int().min(1).max(10000).optional(),
     publishPerHour: z.number().int().min(1).nullable().optional(),
+    workosOrganizationId: workosOrgIdSchema.nullable().optional(),
   })
   .refine((body) => Object.values(body).some((value) => value !== undefined), {
-    message: "at least one of name, compTier, maxMembers, publishPerHour is required",
+    message:
+      "at least one of name, compTier, maxMembers, publishPerHour, workosOrganizationId is required",
   });
 
 const setUserOrgSchema = z.object({
@@ -103,7 +119,44 @@ const setUserOrgSchema = z.object({
 export interface OrgRouteDeps {
   config: Config;
   db: DatabaseSync;
+  /** Null when WorkOS is not configured; linking then needs it, unlinking never does. */
+  workos: WorkOSAuthClient | null;
   toListItem: (row: SiteRow) => SiteListItem;
+}
+
+/**
+ * Check a WorkOS organization id before it is stored as a link. Null needs
+ * nothing, so an operator can always unlink, even with WorkOS unconfigured
+ * (the emergency off switch). A non-null id needs WorkOS configured (503),
+ * must not be linked to another org (409), and must exist in WorkOS (400).
+ * The unique index repeats the duplicate check at write time.
+ */
+async function assertLinkable(
+  deps: OrgRouteDeps,
+  log: FastifyBaseLogger,
+  workosOrganizationId: string | null,
+  exceptOrgId?: string,
+): Promise<void> {
+  if (workosOrganizationId === null) return;
+  if (deps.workos === null || deps.config.workos === null) {
+    throw new HttpError(
+      503,
+      "workos_unconfigured",
+      "linking a WorkOS organization needs WorkOS configured on this server",
+    );
+  }
+  const holder = getOrgByWorkosOrganizationId(deps.db, workosOrganizationId);
+  if (holder !== null && holder.id !== exceptOrgId) throw workosOrgLinkedError();
+  let found: { id: string } | null;
+  try {
+    found = await deps.workos.organizations.getOrganization(workosOrganizationId);
+  } catch (err) {
+    log.error({ err }, "WorkOS organization lookup failed");
+    throw new HttpError(502, "workos_unavailable", "WorkOS could not look up the organization");
+  }
+  if (found === null || found.id !== workosOrganizationId) {
+    throw new HttpError(400, "unknown_workos_org", "WorkOS has no organization with that id");
+  }
 }
 
 /**
@@ -189,6 +242,7 @@ function orgAdminView(db: DatabaseSync, org: OrgRow) {
     memberCount: countOrgMembers(db, org.id),
     publishPerHour: tier === null ? null : (org.publish_per_hour ?? policyFor(tier).publishPerHour),
     joinEnabled: org.join_token_hash !== null,
+    workosOrganizationId: org.workos_organization_id,
     createdAt: iso(org.created_at),
     updatedAt: iso(org.updated_at),
   };
@@ -349,14 +403,21 @@ export function registerOrgRoutes(app: FastifyInstance, deps: OrgRouteDeps): voi
     requireAdmin(config.adminTokenHash, req);
     const body = createOrgSchema.parse(req.body ?? {});
     const compTier = parseOrgTier(body.compTier);
+    await assertLinkable(deps, req.log, body.workosOrganizationId);
     const joinToken = createOrgToken();
-    const org = createOrg(db, {
-      name: body.name,
-      compTier,
-      maxMembers: body.maxMembers,
-      publishPerHour: body.publishPerHour,
-      joinToken,
-    });
+    let org: OrgRow;
+    try {
+      org = createOrg(db, {
+        name: body.name,
+        compTier,
+        maxMembers: body.maxMembers,
+        publishPerHour: body.publishPerHour,
+        workosOrganizationId: body.workosOrganizationId,
+        joinToken,
+      });
+    } catch (err) {
+      throw workosLinkConflict(err) ?? err;
+    }
     return reply.status(201).send({ org: orgAdminView(db, org), joinToken });
   });
 
@@ -382,6 +443,11 @@ export function registerOrgRoutes(app: FastifyInstance, deps: OrgRouteDeps): voi
     if (body.compTier !== undefined) patch.comp_tier = parseOrgTier(body.compTier);
     if (body.maxMembers !== undefined) patch.max_members = body.maxMembers;
     if (body.publishPerHour !== undefined) patch.publish_per_hour = body.publishPerHour;
+    if (body.workosOrganizationId !== undefined) {
+      requireOrg(db, id);
+      await assertLinkable(deps, req.log, body.workosOrganizationId, id);
+      patch.workos_organization_id = body.workosOrganizationId;
+    }
     const result = updateOrg(db, id, patch, Date.now());
     if (result === null) throw new HttpError(404, "not_found", "organization not found");
     return reply.send({ org: orgAdminView(db, result.org), clamped: result.clamped });

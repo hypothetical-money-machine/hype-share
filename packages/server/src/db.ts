@@ -40,6 +40,8 @@ export interface OrgRow {
   join_token_hash: string | null;
   max_members: number;
   publish_per_hour: number | null;
+  /** The linked WorkOS organization (org_...), or null when unlinked. */
+  workos_organization_id: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -114,7 +116,7 @@ const USER_COLS = `id, tier, email, workos_user_id, stripe_customer_id, claim_to
        created_at, claimed_at, org_id, org_role`;
 
 const ORG_COLS = `id, name, comp_tier, billing_tier, stripe_customer_id, join_token_hash,
-       max_members, publish_per_hour, created_at, updated_at`;
+       max_members, publish_per_hour, workos_organization_id, created_at, updated_at`;
 
 /** SITE_COLS qualified for queries that join sites with users. */
 const ORG_SITE_COLS = SITE_COLS.split(",")
@@ -342,6 +344,13 @@ export function upgrade(db: DatabaseSync): void {
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_users_org ON users(org_id) WHERE org_id IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_sites_permanent ON sites(owner_user_id) WHERE expires_at IS NULL;
+  `);
+
+  // Org-private viewing: a shareplan org may be linked to one WorkOS org.
+  addColumn(db, "orgs", "workos_organization_id", "TEXT");
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_orgs_workos_org
+      ON orgs(workos_organization_id) WHERE workos_organization_id IS NOT NULL;
   `);
 }
 
@@ -883,6 +892,7 @@ export function createOrg(
     compTier: OrgTier | null;
     maxMembers?: number;
     publishPerHour?: number | null;
+    workosOrganizationId?: string | null;
     joinToken: string;
     now?: number;
   },
@@ -897,11 +907,12 @@ export function createOrg(
     join_token_hash: hashApiKey(opts.joinToken),
     max_members: opts.maxMembers ?? 100,
     publish_per_hour: opts.publishPerHour ?? null,
+    workos_organization_id: opts.workosOrganizationId ?? null,
     created_at: now,
     updated_at: now,
   };
   db.prepare(
-    `INSERT INTO orgs (${ORG_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO orgs (${ORG_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     row.id,
     row.name,
@@ -911,10 +922,40 @@ export function createOrg(
     row.join_token_hash,
     row.max_members,
     row.publish_per_hour,
+    row.workos_organization_id,
     row.created_at,
     row.updated_at,
   );
   return row;
+}
+
+export function workosOrgLinkedError(): HttpError {
+  return new HttpError(
+    409,
+    "workos_org_linked",
+    "that WorkOS organization is already linked to another organization",
+  );
+}
+
+/** The UNIQUE index on workos_organization_id as a 409, or null if err is something else. */
+export function workosLinkConflict(err: unknown): HttpError | null {
+  if (
+    err instanceof Error &&
+    /UNIQUE constraint failed: orgs\.workos_organization_id/.test(err.message)
+  ) {
+    return workosOrgLinkedError();
+  }
+  return null;
+}
+
+export function getOrgByWorkosOrganizationId(
+  db: DatabaseSync,
+  workosOrganizationId: string,
+): OrgRow | null {
+  const row = db
+    .prepare(`SELECT ${ORG_COLS} FROM orgs WHERE workos_organization_id = ?`)
+    .get(workosOrganizationId) as OrgRow | undefined;
+  return row ?? null;
 }
 
 export function getOrg(db: DatabaseSync, id: string): OrgRow | null {
@@ -1015,6 +1056,7 @@ export interface OrgPatch {
   stripe_customer_id?: string | null;
   max_members?: number;
   publish_per_hour?: number | null;
+  workos_organization_id?: string | null;
 }
 
 const ORG_PATCH_COLS = [
@@ -1024,6 +1066,7 @@ const ORG_PATCH_COLS = [
   "stripe_customer_id",
   "max_members",
   "publish_per_hour",
+  "workos_organization_id",
 ] as const;
 
 export interface ClampSummary {
@@ -1035,7 +1078,7 @@ export interface ClampSummary {
 /**
  * Write the given columns; a tier change (either column, any value) clamps
  * every member's sites in the same transaction. Slice 6 calls this with the
- * billing fields.
+ * billing fields. A duplicate WorkOS link throws 409.
  */
 export function updateOrg(
   db: DatabaseSync,
@@ -1055,7 +1098,15 @@ export function updateOrg(
     }
     sets.push("updated_at = ?");
     values.push(now);
-    db.prepare(`UPDATE orgs SET ${sets.join(", ")} WHERE id = ?`).run(...values, id);
+    try {
+      db.prepare(`UPDATE orgs SET ${sets.join(", ")} WHERE id = ?`).run(...values, id);
+    } catch (err) {
+      throw workosLinkConflict(err) ?? err;
+    }
+    // Any change of the WorkOS link (A to null, A to B) must cancel what the
+    // old link granted, in this transaction: the org-visibility change clears
+    // the org's site audiences here, and viewer sign-in will also revoke
+    // viewer sessions for the old WorkOS org here.
     const tierChanged = patch.comp_tier !== undefined || patch.billing_tier !== undefined;
     const clamped = tierChanged
       ? clampSitesForUsers(db, memberIds(db, id), now)

@@ -135,6 +135,9 @@ function createFakeWorkOS(method: string | undefined = "MagicAuth"): FakeWorkOS 
         };
       },
     },
+    organizations: {
+      getOrganization: async () => null,
+    },
   };
   return fake;
 }
