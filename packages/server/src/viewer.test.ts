@@ -185,13 +185,22 @@ describe("viewer start", () => {
   });
 
   it.each(["//evil.test", "/\\evil.test", "https://evil.test", "%2f%2fevil.test", "/%2fevil.test",
-    "/%5cevil.test", "/%255cevil.test", "/%252fevil.test", "/a\n", "/a%0d%0aLocation:evil", "/a\x7f", "", "/" + "a".repeat(1024)])(
+    "/%5cevil.test", "/%255cevil.test", "/%252fevil.test", "/a\n", "/a%0d%0aLocation:evil", "/a\x7f", "", "/" + "a".repeat(1024),
+    "/%3F%2F%2Fevil.test", "/a?x#frag", "/a?x=\n", "?//evil.test"])(
     "rejects return-path attack %j", async (path) => {
       const h = await setup();
       const res = await h.start(path);
       expect(res.statusCode).toBe(400);
       expect(h.workos.authorize).not.toHaveBeenCalled();
       privateHeaders(res);
+    });
+
+  it.each(["/report.html?source=https%3A%2F%2Fexample.com", "/r?u=//cdn.example/x", "/a?q=%5C%0A"])(
+    "accepts a query that carries an encoded URL or escapes: %j", async (path) => {
+      const h = await setup();
+      const res = await h.start(path);
+      expect(res.statusCode).toBe(302);
+      expect(flow(h).return_path).toBe(path);
     });
 
   it.each(["-invalid", "UPPER", "two.labels", "www", "a".repeat(64)])("rejects label %s", async (site) => {

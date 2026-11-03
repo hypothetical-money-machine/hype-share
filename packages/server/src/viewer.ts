@@ -36,12 +36,16 @@ export function viewerCookieName(config: Config, name = "shareplan_viewer"): str
 }
 
 /** Validate decoded forms too: encoded slashes/backslashes must not become a host. */
-export function validViewerReturnPath(path: string): boolean {
-  if (path.length === 0 || path.length > 1024) return false;
-  let decoded = path;
+export function validViewerReturnPath(target: string): boolean {
+  if (target.length === 0 || target.length > 1024) return false;
+  // Only the path decides where the redirect lands. The query is returned as
+  // given and may legitimately carry an encoded URL (`?next=https%3A%2F%2F…`).
+  const q = target.indexOf("?");
+  const query = q < 0 ? "" : target.slice(q);
+  if (/[#\x00-\x1f\x7f]/.test(query)) return false;
+  let decoded = q < 0 ? target : target.slice(0, q);
   for (;;) {
     if (!decoded.startsWith("/") || decoded.includes("//") || /[\\\x00-\x1f\x7f]/.test(decoded)) return false;
-    // Decode percent escapes while allowing literal percent signs in a query.
     const next = decoded.replace(/(?:%[0-9a-f]{2})+/gi, (part) => {
       try { return decodeURIComponent(part); } catch { return "\x00"; }
     });
