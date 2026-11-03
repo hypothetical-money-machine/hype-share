@@ -14,12 +14,14 @@
   "scripts": {
     "build": "npm run build -w @shareplan/core && npm run build -w @shareplan/server && npm run build -w @shareplan/cli",
     "test": "npm run test --workspaces --if-present",
-    "typecheck": "npm run typecheck --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present && tsc -p e2e/tsconfig.json",
+    "test:e2e": "npm run build -w @shareplan/core && playwright test --config e2e/playwright.config.ts",
     "dev": "npm run dev --workspace @shareplan/server",
     "start": "npm run start --workspace @shareplan/server",
     "cli": "npm run start --workspace @shareplan/cli --"
   },
   "devDependencies": {
+    "@playwright/test": "1.64.1",
     "typescript": "^5.9.2",
     "vitest": "^3.2.4"
   },
