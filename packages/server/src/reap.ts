@@ -2,18 +2,19 @@ import type { DatabaseSync } from "node:sqlite";
 import type { S3Client } from "@aws-sdk/client-s3";
 import type { Config } from "./config.js";
 import {
-  beginUpload,
   deleteSite,
   endUpload,
-  listAbandonedUploads,
+  listAllPrunableVersions,
   listExpiredSites,
   markSiteDeleting,
+  markVersionPruned,
   pruneClaimAuthFlows,
   pruneRateLimits,
   reconcilePermanentSites,
+  takeAbandonedUploads,
 } from "./db.js";
 import { pruneViewerAuth } from "./viewer-db.js";
-import { deletePrefix, deleteSiteObjects } from "./storage.js";
+import { deletePrefix, deleteSiteObjects, deleteVersionObjects } from "./storage.js";
 
 /**
  * An upload this old that never committed was abandoned: its publish failed
@@ -85,15 +86,32 @@ export async function reapExpiredSites(
     deps.log?.info(`reap: removed ${sites} expired site(s), ${objects} object(s)`);
   }
 
-  // Taking the record first means a publish that is somehow still running sees
-  // it gone and refuses to commit; on failure it goes back for the next sweep.
-  for (const prefix of listAbandonedUploads(deps.db, now - ABANDONED_UPLOAD_MS)) {
-    if (!endUpload(deps.db, prefix)) continue;
+  // Marked first, which stops a late commit; the record stays until its
+  // objects are gone, so a sweep that dies mid-delete is retried by the next.
+  for (const prefix of takeAbandonedUploads(deps.db, now - ABANDONED_UPLOAD_MS, Date.now())) {
     try {
       objects += await deletePrefix(deps.s3, deps.config.s3.bucket, prefix);
+      endUpload(deps.db, prefix);
     } catch (err) {
-      beginUpload(deps.db, prefix, now - ABANDONED_UPLOAD_MS);
       deps.log?.warn(`reap: could not remove abandoned upload ${prefix}: ${errMessage(err)}`);
+    }
+  }
+
+  // A publish prunes old versions itself, but only once: one that failed
+  // (S3 down, a per-key error) would otherwise keep its objects for good.
+  for (const version of listAllPrunableVersions(deps.db, deps.config.versionRetention)) {
+    try {
+      objects += await deleteVersionObjects(
+        deps.s3,
+        deps.config.s3.bucket,
+        version.site_id,
+        version.id,
+      );
+      markVersionPruned(deps.db, version.id);
+    } catch (err) {
+      deps.log?.warn(
+        `reap: could not prune version ${version.id} of ${version.site_id}: ${errMessage(err)}`,
+      );
     }
   }
   return { sites, objects };

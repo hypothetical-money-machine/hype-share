@@ -6,6 +6,7 @@ import Fastify, {
   type FastifyRequest,
 } from "fastify";
 import { STATUS_CODES } from "node:http";
+import { Readable } from "node:stream";
 import type { DatabaseSync } from "node:sqlite";
 import type { S3Client } from "@aws-sdk/client-s3";
 import fastifyCookie from "@fastify/cookie";
@@ -22,7 +23,6 @@ import {
   isHtmlPath,
   RESERVED_HOST_LABELS,
   s3ObjectKey,
-  s3SitePrefix,
   s3VersionPrefix,
   sanitizeSitePath,
   siteLabelFromHost,
@@ -43,6 +43,7 @@ import {
   completeClaim,
   deleteClaimAuthFlow,
   deleteSite,
+  commitUploadRecord,
   effectiveVisibility,
   endUpload,
   findOrgByJoinToken,
@@ -60,6 +61,7 @@ import {
   isExpired,
   isRetiredSiteId,
   listApiKeys,
+  retiredSlugOwner,
   listPrunableVersions,
   listSitesForUser,
   markSiteDeleting,
@@ -102,7 +104,7 @@ import {
   orgPublishPool,
   registerOrgRoutes,
 } from "./orgs.js";
-import { consumeRate } from "./rate-limit.js";
+import { consumeRate, rateExhausted } from "./rate-limit.js";
 import {
   clampStoredExpiry,
   effectiveTier,
@@ -122,6 +124,7 @@ import {
   deleteSiteObjects,
   deleteVersionObjects,
   getObject,
+  headObject,
   objectExists,
   putSiteFiles,
 } from "./storage.js";
@@ -164,6 +167,14 @@ const CLAIM_CALLBACK_COOKIE = "shareplan_claim_callback";
 const CLAIM_CONFIRM_MAX_AGE_SECONDS = 5 * 60;
 const CLAIM_CALLBACK_MAX_AGE_SECONDS = 10 * 60;
 const CLAIM_STARTS_PER_HOUR = 10;
+/** Wrong admin tokens per address per hour before the admin API refuses it. */
+const ADMIN_FAILURES_PER_HOUR = 10;
+/**
+ * Bodies on every route but publish are small JSON or forms; the large limit
+ * is set on the two publish routes only, so nothing else parses ~70 MB
+ * before it has authenticated or rate-limited anyone.
+ */
+const DEFAULT_BODY_LIMIT = 64 * 1024;
 
 /**
  * Request log lines carry the URL, and a claim link or an AuthKit callback
@@ -286,13 +297,14 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     // One hop: the socket peer, or the address the immediate proxy added.
     // `true` would trust every X-Forwarded-For entry, including the client's.
     trustProxy: deps.config.trustForwarded ? 1 : false,
-    // maxSiteBytes is enforced on *decoded* bytes in prepareFiles, but binary
-    // files reach us base64-encoded inside JSON — 4 characters per 3 bytes — so
-    // the transport limit has to cover that inflation or it would reject
-    // payloads well under the real limit. The extra MiB covers the JSON
-    // envelope (paths, title, note, quoting).
-    bodyLimit: Math.ceil(deps.config.maxSiteBytes / 3) * 4 + 1_048_576,
+    bodyLimit: DEFAULT_BODY_LIMIT,
   });
+  // maxSiteBytes is enforced on *decoded* bytes in prepareFiles, but binary
+  // files reach us base64-encoded inside JSON — 4 characters per 3 bytes — so
+  // the publish routes' transport limit has to cover that inflation or it
+  // would reject payloads well under the real limit. The extra MiB covers the
+  // JSON envelope (paths, title, note, quoting).
+  const publishBodyLimit = Math.ceil(deps.config.maxSiteBytes / 3) * 4 + 1_048_576;
 
   const ctx: Ctx = { ...deps, log: app.log };
   const apiOrigin = new URL(deps.config.publicBaseUrl).origin;
@@ -317,6 +329,30 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   const authenticate = async (req: FastifyRequest): Promise<void> => {
     req.account = requireAccount(deps.db, req);
   };
+  const publishRoute = { onRequest: authenticate, bodyLimit: publishBodyLimit };
+
+  // The admin token is checked on every admin route, so wrong guesses are
+  // counted here, per address, like owner login's attempts: past the limit
+  // the admin API refuses that address for the rest of the hour. Keyed on the
+  // matched route, so an encoded spelling of the path is counted the same.
+  const isAdminRoute = (req: FastifyRequest) =>
+    req.routeOptions.url?.startsWith("/api/v1/admin/") === true;
+  const adminBucket = (req: FastifyRequest) =>
+    `admin:${hashIp(requestIp(req), deps.config.ipHashPepper ?? deps.config.adminTokenHash ?? "")}`;
+  app.addHook("onRequest", async (req, reply) => {
+    if (!isAdminRoute(req)) return;
+    if (rateExhausted(deps.db, adminBucket(req), "admin_auth", ADMIN_FAILURES_PER_HOUR)) {
+      await reply.status(429).send({
+        error: { code: "rate_limited", message: "too many failed admin attempts" },
+      });
+      return reply;
+    }
+  });
+  app.addHook("onResponse", async (req, reply) => {
+    if (isAdminRoute(req) && reply.statusCode === 401) {
+      consumeRate(deps.db, adminBucket(req), "admin_auth", ADMIN_FAILURES_PER_HOUR);
+    }
+  });
   app.addContentTypeParser(
     "application/x-www-form-urlencoded",
     { parseAs: "string" },
@@ -816,14 +852,14 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   });
 
   // --- Sites API ---
-  app.post("/api/v1/sites", { onRequest: authenticate }, async (req, reply) => {
+  app.post("/api/v1/sites", publishRoute, async (req, reply) => {
     const account = req.account!;
     const body = createSiteSchema.parse(req.body);
     const site = await publishNewSite(ctx, account, body, req);
     return reply.status(201).send(site);
   });
 
-  app.put("/api/v1/sites/:id", { onRequest: authenticate }, async (req, reply) => {
+  app.put("/api/v1/sites/:id", publishRoute, async (req, reply) => {
     const account = req.account!;
     const { id } = req.params as { id: string };
     const body = updateSiteSchema.parse(req.body);
@@ -1280,7 +1316,7 @@ async function publishNewSite(
   // Everything that can reject the request runs before any bucket is spent.
   const orgLink = body.visibility === "org" ? orgVisibilityLink(ctx, account, body) : null;
   const { policy, files, byte_size, file_count } = preparePublish(ctx, account, body);
-  const siteId = createSiteId();
+  const siteId = freshSiteId(ctx);
   const versionId = createVersionId();
   const now = Date.now();
   // org is stored as private plus an audience, so anything that misses the
@@ -1290,14 +1326,15 @@ async function publishNewSite(
   const audience: SiteAudience | null = orgLink === null ? null : { ...orgLink, versionId };
   const expiresAt = resolveTierExpiry(policy, body.ttl, now, "create");
   if (body.slug !== undefined) {
-    assertSlugAvailable(ctx, body.slug);
+    assertSlugAvailable(ctx, body.slug, account.user.id);
   }
   consumePublishQuota(ctx, req, account);
 
   // No row points at these objects until the insert below, so any failure from
   // here on has to remove them itself; the upload record covers a removal that
-  // fails too.
-  const prefix = s3SitePrefix(siteId);
+  // fails too. Scoped to the version, so cleanup can never reach another
+  // site's objects even if the id were somehow taken meanwhile.
+  const prefix = s3VersionPrefix(siteId, versionId);
   beginUpload(ctx.db, prefix);
   try {
     await putSiteFiles(ctx.s3, ctx.config.s3.bucket, siteId, versionId, files);
@@ -1306,7 +1343,7 @@ async function publishNewSite(
     // have taken the slug, or an org downgrade lowered the tier, mid-upload.
     const limits = currentPolicy(ctx, account);
     const slug = body.slug !== undefined && limits.slugs ? body.slug : null;
-    if (slug !== null) assertSlugAvailable(ctx, slug);
+    if (slug !== null) assertSlugAvailable(ctx, slug, account.user.id);
     // Race rule for an org create: the owner may have been detached, or the org
     // relinked, while the files uploaded. Write no audience the owner no longer has.
     const committed = transaction(ctx.db, () => {
@@ -1435,7 +1472,7 @@ async function publishVersion(
   const newSlug =
     body.slug !== undefined && body.slug !== existing.slug ? body.slug : null;
   if (newSlug !== null) {
-    assertSlugAvailable(ctx, newSlug, existing.id);
+    assertSlugAvailable(ctx, newSlug, account.user.id, existing.id);
   }
   consumePublishQuota(ctx, req, account);
   const requested: StoredVisibility =
@@ -1464,7 +1501,7 @@ async function publishVersion(
     const limits = currentPolicy(ctx, account);
     let slug: string | null = limits.slugs ? current.slug : null;
     if (newSlug !== null && limits.slugs) {
-      assertSlugAvailable(ctx, newSlug, current.id);
+      assertSlugAvailable(ctx, newSlug, account.user.id, current.id);
       slug = newSlug;
     }
     const expires_at = clampStoredExpiry(
@@ -1526,8 +1563,29 @@ async function publishVersion(
     throw err;
   }
 
+  // Read before pruning: a delete may land while pruning awaits S3, and the
+  // publish itself has already committed.
+  const response = toSiteResponse(ctx.config, ctx.db, getSite(ctx.db, existing.id)!);
   await pruneOldVersions(ctx, existing.id);
-  return toSiteResponse(ctx.config, ctx.db, getSite(ctx.db, existing.id)!);
+  return response;
+}
+
+/**
+ * A new site id that is free as an id and as a host label: not a live or
+ * deleting site, not a slug (the id would shadow it, since lookups try ids
+ * first), and not a retired id.
+ */
+function freshSiteId(ctx: Ctx): string {
+  for (;;) {
+    const id = createSiteId();
+    if (
+      getSite(ctx.db, id, true) === null &&
+      getSiteBySlug(ctx.db, id, true) === null &&
+      !isRetiredSiteId(ctx.db, id)
+    ) {
+      return id;
+    }
+  }
 }
 
 /**
@@ -1542,12 +1600,19 @@ function currentPolicy(ctx: Ctx, account: Account): TierPolicy {
 /**
  * Slugs share a namespace with site ids, so both must be free, including the
  * ids of deleted sites: their links live on in chats and in visitors' browser
- * storage, and a slug that took one over would inherit both. A slug is also
+ * storage, and a slug that took one over would inherit both. A slug its
+ * owner gave up (a delete, a rename, a tier clamp) stays theirs for the same
+ * reason; they can take it back, nobody else can. A slug is also
  * a DNS label under hostname serving, so reserved labels stay off limits in
  * every mode: a site claimed as "www" under path serving would break the
  * moment a suffix was configured.
  */
-function assertSlugAvailable(ctx: Ctx, slug: string, exceptSiteId?: string): void {
+function assertSlugAvailable(
+  ctx: Ctx,
+  slug: string,
+  ownerUserId: string,
+  exceptSiteId?: string,
+): void {
   if (RESERVED_HOST_LABELS.has(slug)) {
     throw new HttpError(409, "slug_taken", `slug "${slug}" is reserved`);
   }
@@ -1559,6 +1624,10 @@ function assertSlugAvailable(ctx: Ctx, slug: string, exceptSiteId?: string): voi
   if (getSite(ctx.db, slug, true) || isRetiredSiteId(ctx.db, slug)) {
     throw new HttpError(409, "slug_taken", `slug "${slug}" collides with a site id`);
   }
+  const previousOwner = retiredSlugOwner(ctx.db, slug);
+  if (previousOwner !== null && previousOwner !== ownerUserId) {
+    throw new HttpError(409, "slug_taken", `slug "${slug}" belonged to another account`);
+  }
 }
 
 /**
@@ -1566,7 +1635,7 @@ function assertSlugAvailable(ctx: Ctx, slug: string, exceptSiteId?: string): voi
  * already taken it as abandoned, its objects are going, so the publish fails.
  */
 function commitUpload(ctx: Ctx, prefix: string): void {
-  if (!endUpload(ctx.db, prefix)) {
+  if (!commitUploadRecord(ctx.db, prefix)) {
     throw new HttpError(503, "upload_abandoned", "the upload took too long; publish again");
   }
 }
@@ -1677,12 +1746,12 @@ async function serveSitePath(
     await reply.status(404).send({ error: { code: "not_found", message: "site not found" } });
     return;
   }
+  // From here every response is about this site, errors included, so it
+  // carries the site's policy headers: a CDN must not cache a private site's
+  // 401 or 404 any more than its pages.
+  setSiteHeaders(reply, site);
   const audience = honouredAudience(ctx.db, site);
   if (audience !== null) setOrgSiteHeaders(reply);
-  if (isExpired(site)) {
-    await reply.status(410).send({ error: { code: "gone", message: "site expired" } });
-    return;
-  }
   if (audience !== null) {
     // Path mode never enables browser viewing, so there it is bearer-only.
     if (!(await authorizeOrgSite(ctx.config, ctx.db, req, reply, site, audience, relPath))) return;
@@ -1701,6 +1770,12 @@ async function serveSitePath(
       return;
     }
   }
+  // After the access check, so an expired private site is indistinguishable
+  // from any other private one to a caller who may not see it.
+  if (isExpired(site)) {
+    await reply.status(410).send({ error: { code: "gone", message: "site expired" } });
+    return;
+  }
 
   const requested = normalizeServePath(relPath);
   if (requested === null) {
@@ -1710,13 +1785,19 @@ async function serveSitePath(
   const bucket = ctx.config.s3.bucket;
   const versionId = site.current_version_id;
   const keyFor = (p: string) => s3ObjectKey(site.id, versionId, p);
+  // HEAD answers from metadata; GET streams the body rather than holding it.
+  const fetchObject = (p: string) =>
+    req.method === "HEAD"
+      ? headObject(ctx.s3, bucket, keyFor(p))
+      : getObject(ctx.s3, bucket, keyFor(p));
 
   let path = requested;
-  let obj = await getObject(ctx.s3, bucket, keyFor(path));
+  let obj: { body?: Readable; contentType: string | undefined; contentLength: number | undefined } | null =
+    await fetchObject(path);
   if (!obj && isDirectoryRequest(relPath)) {
     // A directory URL also serves index.htm, which uploads accept as an index.
     path = path.slice(0, -1);
-    obj = await getObject(ctx.s3, bucket, keyFor(path));
+    obj = await fetchObject(path);
   } else if (!obj && !path.endsWith("index.html")) {
     // A directory hit has to bounce to the trailing-slash URL rather than serve
     // the index here: at /s/:id/docs the browser resolves "./style.css" against
@@ -1748,7 +1829,7 @@ async function serveSitePath(
 
   const ct = obj.contentType ?? contentTypeForPath(path);
   reply.header("Content-Type", ct);
-  setSiteHeaders(reply, site);
+  if (obj.contentLength !== undefined) reply.header("Content-Length", obj.contentLength);
 
   const isSvg = ct.startsWith("image/svg") || path.toLowerCase().endsWith(".svg");
   if (isHtmlPath(path) || ct.startsWith("text/html")) {
@@ -1759,7 +1840,9 @@ async function serveSitePath(
   }
   // Every other org response keeps ORG_HTML_CSP from setOrgSiteHeaders.
 
-  await reply.send(obj.body);
+  // HEAD has no body to send. An empty stream rather than nothing, because
+  // Fastify's HEAD route turns an undefined payload into Content-Length: 0.
+  await reply.send(obj.body ?? Readable.from([]));
 }
 
 /** How the landing page describes site URLs, without inventing an id. */

@@ -9,6 +9,7 @@ import {
   CreateBucketCommand,
   type S3ClientConfig,
 } from "@aws-sdk/client-s3";
+import type { Readable } from "node:stream";
 import type { Config } from "./config.js";
 import {
   s3ObjectKey,
@@ -74,33 +75,53 @@ export async function putSiteFiles(
   }
 }
 
+export interface StoredObject {
+  /** The body as a stream, so serving never holds a whole file in memory. */
+  body: Readable;
+  contentType: string | undefined;
+  contentLength: number | undefined;
+}
+
+/** An object's body as a stream, or null if there is no such key. */
 export async function getObject(
   client: S3Client,
   bucket: string,
   key: string,
-): Promise<{ body: Buffer; contentType: string | undefined } | null> {
+): Promise<StoredObject | null> {
   try {
-    const out = await client.send(
-      new GetObjectCommand({
-        Bucket: bucket,
-        Key: key,
-      }),
-    );
+    const out = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
     if (!out.Body) return null;
-    const bytes = await out.Body.transformToByteArray();
     return {
-      body: Buffer.from(bytes),
+      body: out.Body as Readable,
       contentType: out.ContentType,
+      contentLength: out.ContentLength,
     };
   } catch (err: unknown) {
-    const name = (err as { name?: string })?.name;
-    if (name === "NoSuchKey" || name === "NotFound") return null;
-    // AWS SDK v3 sometimes uses $metadata.httpStatusCode
-    const status = (err as { $metadata?: { httpStatusCode?: number } })?.$metadata
-      ?.httpStatusCode;
-    if (status === 404) return null;
+    if (isNotFound(err)) return null;
     throw err;
   }
+}
+
+/** An object's metadata, without its body, or null if there is no such key. */
+export async function headObject(
+  client: S3Client,
+  bucket: string,
+  key: string,
+): Promise<Omit<StoredObject, "body"> | null> {
+  try {
+    const out = await client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+    return { contentType: out.ContentType, contentLength: out.ContentLength };
+  } catch (err: unknown) {
+    if (isNotFound(err)) return null;
+    throw err;
+  }
+}
+
+/** S3 says "no such key" several ways; AWS SDK v3 sometimes only via status. */
+function isNotFound(err: unknown): boolean {
+  const name = (err as { name?: string })?.name;
+  const status = (err as { $metadata?: { httpStatusCode?: number } })?.$metadata?.httpStatusCode;
+  return name === "NoSuchKey" || name === "NotFound" || status === 404;
 }
 
 /** Whether an object exists, without downloading it. */
@@ -109,16 +130,7 @@ export async function objectExists(
   bucket: string,
   key: string,
 ): Promise<boolean> {
-  try {
-    await client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
-    return true;
-  } catch (err: unknown) {
-    const name = (err as { name?: string })?.name;
-    const status = (err as { $metadata?: { httpStatusCode?: number } })?.$metadata
-      ?.httpStatusCode;
-    if (name === "NotFound" || name === "NoSuchKey" || status === 404) return false;
-    throw err;
-  }
+  return (await headObject(client, bucket, key)) !== null;
 }
 
 export function deleteSiteObjects(

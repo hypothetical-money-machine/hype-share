@@ -135,7 +135,8 @@ docker compose --env-file .env.prod -f compose.prod.yaml up -d --build
 ```
 
 Configuration notes:
-- Point `SHAREPLAN_PUBLIC_BASE_URL` to your public API URL (e.g. `https://share.example.com`).
+- Compose refuses to start without `SHAREPLAN_PUBLIC_BASE_URL`, `SHAREPLAN_SITE_HOST_SUFFIX`, `SHAREPLAN_ADMIN_TOKEN`, `SHAREPLAN_IP_HASH_PEPPER` and the MinIO credentials. At startup the server logs a warning for each feature its config leaves off.
+- Point `SHAREPLAN_PUBLIC_BASE_URL` to your public API URL (e.g. `https://share.example.com`). It must be a bare origin, with no path.
 - The container binds to `127.0.0.1:8788` on the host. Configure your reverse proxy (Caddy, Nginx, or Traefik) to terminate HTTPS and forward traffic.
 - Set `SHAREPLAN_SITE_HOST_SUFFIX` to your site domain, configure wildcard DNS (`*.share.example.com`), and make sure your reverse proxy forwards the original `Host` header.
 
@@ -358,9 +359,9 @@ These settings apply to self-hosted instances. See [`.env.example`](.env.example
 |----------|---------|
 | `SHAREPLAN_PUBLIC_BASE_URL` | API host, and the base of site URLs when no suffix is set |
 | `SHAREPLAN_SITE_HOST_SUFFIX` | Serve sites at `<id>.<suffix>`; needs wildcard DNS and a TLS certificate |
-| `SHAREPLAN_S3_*` | S3 endpoint, bucket, region, and static credentials (`SHAREPLAN_S3_ACCESS_KEY` and `SHAREPLAN_S3_SECRET_KEY` together, or neither for the AWS SDK default chain) |
+| `SHAREPLAN_S3_*` | S3 endpoint, bucket, region, and static credentials (`SHAREPLAN_S3_ACCESS_KEY` and `SHAREPLAN_S3_SECRET_KEY` together, or neither for the AWS SDK default chain). The region defaults to `AWS_REGION` or `AWS_DEFAULT_REGION` when no endpoint is set, else `auto` |
 | `SHAREPLAN_S3_FORCE_PATH_STYLE` | Set `true` for MinIO |
-| `SHAREPLAN_ADMIN_TOKEN` | Mint operator API keys via `/api/v1/admin/keys` |
+| `SHAREPLAN_ADMIN_TOKEN` | Mint operator API keys via `/api/v1/admin/keys`; at least 16 characters |
 | `SHAREPLAN_IP_HASH_PEPPER` | HMAC pepper for the register and `free--` per-IP limits |
 | `SHAREPLAN_TRUST_FORWARDED` | Trust one hop of `X-Forwarded-For` (the address your reverse proxy adds) |
 | `SHAREPLAN_CLIENT_IP_HEADER` | Read the client address from this header instead, e.g. `cf-connecting-ip` behind Cloudflare plus a local proxy. Needs `SHAREPLAN_TRUST_FORWARDED=true` (the server refuses to start without it). Only set it when every request reaches the server through a proxy that overwrites the header |
@@ -385,9 +386,12 @@ authentication methods and asks the user to reopen the original claim link.
 ### Storage lifecycle
 
 Each publish writes a new version prefix. Once the site points at it, the server
-deletes the objects of versions past the retention window. By default it keeps the
-previous version, so a page loaded seconds before a republish can still fetch its
-assets. The server keeps the version row as history either way.
+deletes the objects of versions past the retention window; by default it keeps the
+previous version's objects as well as the live one. The site's URLs always serve the
+live version, so a page loaded just before a republish fetches its assets from the
+new version: keep asset names stable, or give changed assets new names. The server
+keeps the version row as history either way. If a publish cannot prune an old
+version, the sweeper retries it.
 
 The server answers requests for expired sites with `410` immediately; a background
 sweeper then deletes their objects and rows. The sweeper deletes objects before
@@ -401,7 +405,11 @@ uploading to it. If the object delete fails, it still answers `204` and the swee
 finishes the job. A publish that fails partway removes the objects it uploaded.
 
 A deleted site's id is retired for good: no vanity slug can take it, so an old
-link never starts serving someone else's page.
+link never starts serving someone else's page. A slug its site gives up, by a delete,
+a rename or a tier downgrade, stays reserved for the account that held it: that
+account can take it back, no other can. Ids deleted before this rule existed were not
+recorded and are not protected. A publish that dies partway is recorded until it
+commits, so the sweeper removes what it uploaded even if its own cleanup failed.
 
 The sweeper also assigns an expiry to any permanent site whose owner's current
 tier no longer allows one (for example after a manual tier change), so no site
@@ -414,7 +422,19 @@ stays permanent under a tier that forbids it.
 - Set `SHAREPLAN_SITE_HOST_SUFFIX` so every site gets its own origin. Site hosts
   answer only `GET` and `HEAD` for that site's files; the API is reachable only on the
   apex. Old `/s/:id/` links redirect to the site host. Use a domain that hosts
-  nothing trusted, because a site can still set cookies for the parent domain.
+  nothing trusted, because a site can still set cookies for the parent domain. When
+  the API shares that parent domain (as with `hype-share.com` and
+  `*.hype-share.com`), the `__Host-` cookies and Origin checks stop forged sessions
+  and CSRF, but a site can still fill the parent domain with cookies until requests
+  from that browser to the API and every other site fail with `431`. A separate
+  registrable domain for sites, listed in the Public Suffix List, removes that.
+- Vanity slugs cannot use infrastructure or sign-in labels (`www`, `api`, `admin`,
+  `login`, `auth`, `account`, `billing`, `support` and similar).
+- Wrong admin tokens are limited to ten per address per hour; past that the admin API
+  refuses the address, right token or not, until the hour ends. `SHAREPLAN_ADMIN_TOKEN`
+  must be at least 16 characters.
+- Only the two publish routes accept large bodies, and they authenticate first;
+  every other route takes at most 64 KiB.
 - Without a suffix, all sites share one origin under `/s/:id/`, so a script in
   one site can reach another. This suits local development, not public hosting.
 - The server stores API keys as SHA-256 hashes only. IP rate limits use HMAC-SHA256 with `SHAREPLAN_IP_HASH_PEPPER`.

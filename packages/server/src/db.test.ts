@@ -311,8 +311,11 @@ describe("upgrade", () => {
     site(db, "s1", "my_plan", 10, a.key.id, a.user.id);
     site(db, "s2", "v1.2", 11, a.key.id, a.user.id);
     site(db, "s3", "Launch-Day", 12, a.key.id, a.user.id);
+    site(db, "s4", "login", 13, a.key.id, a.user.id);
     db.exec("PRAGMA user_version = 3;");
     upgrade(db);
+    // Newly reserved labels are released by the same step.
+    expect(getSite(db, "s4")?.slug).toBeNull();
     expect(getSite(db, "s1")?.slug).toBeNull();
     expect(getSite(db, "s2")?.slug).toBeNull();
     expect(getSite(db, "s3")?.slug).toBe("Launch-Day");
