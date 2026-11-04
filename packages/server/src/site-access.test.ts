@@ -135,7 +135,9 @@ function setCookies(res: LightMyRequestResponse): string[] {
   return header === undefined ? [] : Array.isArray(header) ? header : [header];
 }
 function setCookie(res: LightMyRequestResponse, name: string): string | undefined {
-  return setCookies(res).find((c) => c.startsWith(`${name}=`));
+  // Site nonces carry a slot suffix: __Host-shareplan_site_nonce_<8 hex>.
+  const slotted = name === NONCE_COOKIE ? new RegExp(`^${name}_[a-f0-9]{8}=`) : null;
+  return setCookies(res).find((c) => c.startsWith(`${name}=`) || (slotted?.test(c) ?? false));
 }
 function pair(res: LightMyRequestResponse, name: string): string {
   const header = setCookie(res, name);
@@ -350,6 +352,29 @@ describe("org site handoff", () => {
     }
   });
 
+  it("lets two first visits that race, neither holding a nonce yet, both redeem", async () => {
+    const h = await setup();
+    // Both requests leave before either response sets a cookie.
+    const [tab1, tab2] = await Promise.all([
+      h.get(new URL("/report.html", h.siteA.url).href, { headers: NAV }),
+      h.get(new URL("/docs/", h.siteA.url).href, { headers: NAV }),
+    ]);
+    const [n1, n2] = [pair(tab1, NONCE_COOKIE), pair(tab2, NONCE_COOKIE)];
+    expect(n1.split("=")[0]).not.toBe(n2.split("=")[0]);
+    // The browser now holds both cookies and sends both on every request.
+    const jar = `${n1}; ${n2}`;
+    const s1 = await h.get(tab1.headers.location as string, { headers: NAV });
+    const s2 = await h.get(tab2.headers.location as string, { headers: NAV });
+    const g1 = await h.get(`${BASE}${VIEW_CALLBACK_PATH}?code=c1&state=state_1`, { cookie: flowPair(s1) });
+    const g2 = await h.get(`${BASE}${VIEW_CALLBACK_PATH}?code=c2&state=state_2`, { cookie: flowPair(s2) });
+    const r1 = await h.get(g1.headers.location as string, { cookie: jar, headers: NAV });
+    const r2 = await h.get(g2.headers.location as string, { cookie: jar, headers: NAV });
+    expect([r1.statusCode, r2.statusCode]).toEqual([302, 302]);
+    // A later visit reuses one of them rather than minting a third.
+    const later = await h.get(h.siteA.url, { headers: NAV, cookie: jar });
+    expect([n1, n2]).toContain(pair(later, NONCE_COOKIE));
+  });
+
   it("refuses a reused, expired, wrong-host, wrong-nonce, missing-nonce or malformed code with 400", async () => {
     const h = await setup();
     const prepare = async (siteUrl: string) => {
@@ -376,7 +401,7 @@ describe("org site handoff", () => {
     const onB = new URL(`${grant.pathname}${grant.search}`, h.siteB.url);
     expect((await h.get(onB.href, { cookie: nonce, headers: NAV })).statusCode).toBe(400);
     // Wrong nonce, then no nonce: neither burns the code.
-    const other = `${NONCE_COOKIE}=${"B".repeat(43)}`;
+    const other = `${NONCE_COOKIE}_0000beef=${"B".repeat(43)}`;
     expect((await h.get(grant.href, { cookie: other, headers: NAV })).statusCode).toBe(400);
     expect((await h.get(grant.href, { headers: NAV })).statusCode).toBe(400);
     expect((await h.get(grant.href, { cookie: nonce, headers: NAV })).statusCode).toBe(302);
@@ -768,5 +793,10 @@ describe("site session lifecycle", () => {
     expect(redactQuerySecrets("/v1/view/start?site=a&path=%2F&n=ff00")).toBe("/v1/view/start?site=a&path=%2F&n=[redacted]");
     expect(redactQuerySecrets("/cb?state=s&code=c")).toBe("/cb?state=[redacted]&code=[redacted]");
     expect(redactQuerySecrets("/report?notes=1")).toBe("/report?notes=1");
+    // Encoded or case-varied names are the same parameter to the query parser.
+    expect(redactQuerySecrets("/__shareplan/session?%63ode=abc")).toBe("/__shareplan/session?%63ode=[redacted]");
+    expect(redactQuerySecrets("/cb?%73tate=s&CODE=c&%6E=ff")).toBe("/cb?%73tate=[redacted]&CODE=[redacted]&%6E=[redacted]");
+    expect(redactQuerySecrets("/cb?%E0%A4%A=x&a=1#code=frag")).toBe("/cb?%E0%A4%A=[redacted]&a=1#code=frag");
+    expect(redactQuerySecrets("/plain")).toBe("/plain");
   });
 });

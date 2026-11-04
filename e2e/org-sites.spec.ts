@@ -75,7 +75,7 @@ test("an org member signs in with SSO through the site handoff", async ({ page, 
     { host, path: "/report.html", status: 200, fetchSite: "cross-site" },
   ]);
   const redemption = harness.requests.find(r => r.path === "/__shareplan/session")!;
-  expect(redemption).toMatchObject({ fetchMode: "navigate", fetchDest: "document", cookie: expect.stringContaining(`${NONCE_COOKIE}=`) });
+  expect(redemption).toMatchObject({ fetchMode: "navigate", fetchDest: "document", cookie: expect.stringContaining(`${NONCE_COOKIE}_`) });
   expect(redemption.cookie).not.toContain(SITE_COOKIE + "=");
   expect(harness.requests.at(-1)!.cookie).toContain(`${SITE_COOKIE}=`);
   // AuthKit was asked for a fresh sign-in to the linked WorkOS org.
@@ -87,7 +87,7 @@ test("an org member signs in with SSO through the site handoff", async ({ page, 
   expect(await cookie(context, site.url, SITE_COOKIE)).toMatchObject({
     domain: new URL(site.url).hostname, secure: true, httpOnly: true, sameSite: "Lax", path: "/",
   });
-  expect(await cookie(context, site.url, NONCE_COOKIE)).toMatchObject({ domain: new URL(site.url).hostname, secure: true, httpOnly: true });
+  expect((await context.cookies(site.url)).find(c => c.name.startsWith(`${NONCE_COOKIE}_`))).toMatchObject({ domain: new URL(site.url).hostname, secure: true, httpOnly: true });
   expect(await cookie(context, APEX, VIEW_COOKIE)).toMatchObject({ domain: "shareplan.localhost", secure: true, httpOnly: true });
   // What the browser actually sent (context.cookies(url) domain-matches loosely).
   await page.goto(`${APEX}/v1/view/`);
@@ -209,7 +209,7 @@ test("two tabs that start sign-in together share one nonce and both redeem", asy
   const starts = harness.requests.filter(r => r.host === new URL(site.url).host && r.status === 302 && r.path !== "/__shareplan/session");
   expect(starts).toHaveLength(2);
   expect(starts[0]!.cookie).not.toContain(NONCE_COOKIE);
-  expect(starts[1]!.cookie).toContain(`${NONCE_COOKIE}=`);
+  expect(starts[1]!.cookie).toContain(`${NONCE_COOKIE}_`);
   const grants = harness.db.prepare("SELECT nonce_hash, token_hash, used_at, return_path FROM site_sessions ORDER BY created_at, rowid").all() as
     { nonce_hash: string; token_hash: string | null; used_at: number | null; return_path: string }[];
   expect(grants).toHaveLength(2);

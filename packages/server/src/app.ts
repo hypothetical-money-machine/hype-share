@@ -1062,8 +1062,26 @@ function clearClaimCallbackCookie(reply: FastifyReply, config: Config): void {
 }
 
 /** A request URL with the values of code, state and n replaced, for logs. */
+const SECRET_QUERY_NAMES = new Set(["code", "state", "n"]);
+
+/**
+ * Hide handoff codes, OAuth state and nonce hashes in a logged URL. Names are
+ * decoded first, as the query parser does, so `%63ode=` is caught too; a name
+ * that can't be decoded has its value hidden rather than guessed at.
+ */
 export function redactQuerySecrets(url: string): string {
-  return url.replace(/([?&](?:code|state|n)=)[^&#]*/gi, "$1[redacted]");
+  const q = url.indexOf("?");
+  if (q < 0) return url;
+  const hash = url.indexOf("#", q);
+  const end = hash < 0 ? url.length : hash;
+  const params = url.slice(q + 1, end).split("&").map((param) => {
+    const eq = param.indexOf("=");
+    if (eq < 0) return param;
+    let name: string | null;
+    try { name = decodeURIComponent(param.slice(0, eq).replace(/\+/g, " ")).toLowerCase(); } catch { name = null; }
+    return name === null || SECRET_QUERY_NAMES.has(name) ? `${param.slice(0, eq)}=[redacted]` : param;
+  });
+  return `${url.slice(0, q + 1)}${params.join("&")}${url.slice(end)}`;
 }
 
 /** Request URL split at the "?", with the query keeping its "?" (or ""). */

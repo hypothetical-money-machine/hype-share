@@ -80,7 +80,22 @@ function siteCookieOptions(config: Config) {
 }
 
 export const siteCookieName = (config: Config) => viewerCookieName(config, "shareplan_site");
-export const siteNonceCookieName = (config: Config) => viewerCookieName(config, "shareplan_site_nonce");
+/**
+ * Site nonces live in one cookie per pending sign-in, `<prefix>shareplan_site_nonce_<slot>`,
+ * so two first visits that race (neither yet holding a nonce) don't overwrite each other.
+ */
+export const siteNonceCookiePrefix = (config: Config) => viewerCookieName(config, "shareplan_site_nonce_");
+const NONCE_SLOT_RE = /^[a-f0-9]{8}$/;
+const MAX_NONCES = 8;
+
+/** This browser's site nonces on this host, as [cookie name, value], oldest names first. */
+function siteNonces(config: Config, req: FastifyRequest): [string, string][] {
+  const prefix = siteNonceCookiePrefix(config);
+  return Object.entries(req.cookies)
+    .filter((entry): entry is [string, string] => entry[0].startsWith(prefix) &&
+      NONCE_SLOT_RE.test(entry[0].slice(prefix.length)) && typeof entry[1] === "string" && TOKEN_RE.test(entry[1]))
+    .slice(0, MAX_NONCES);
+}
 
 function error(reply: FastifyReply, status: number, code: string, message: string): FastifyReply {
   return reply.status(status).send({ error: { code, message } });
@@ -138,9 +153,9 @@ export async function authorizeOrgSite(
   if (enabled && req.method === "GET" && isDocumentNavigation(req)) {
     // Reuse an unexpired nonce so a second tab doesn't strand the first
     // tab's pending grant, and give it a fresh 10 minutes either way.
-    const existing = req.cookies[siteNonceCookieName(config)];
-    const nonce = existing && TOKEN_RE.test(existing) ? existing : randomBytes(32).toString("base64url");
-    reply.setCookie(siteNonceCookieName(config), nonce, { ...siteCookieOptions(config), maxAge: NONCE_SECONDS });
+    const [name, nonce] = siteNonces(config, req)[0] ??
+      [`${siteNonceCookiePrefix(config)}${randomBytes(4).toString("hex")}`, randomBytes(32).toString("base64url")];
+    reply.setCookie(name, nonce, { ...siteCookieOptions(config), maxAge: NONCE_SECONDS });
     const start = new URL("/v1/view/start", config.publicBaseUrl);
     start.search = new URLSearchParams({
       site: site.id,
@@ -180,16 +195,21 @@ async function redeemSiteGrant(
     return;
   }
   const code = (req.query as Record<string, unknown>).code;
-  const nonce = req.cookies[siteNonceCookieName(config)];
+  const nonces = siteNonces(config, req).map(([, value]) => value);
   const invalid = () => error(reply, 400, "invalid_handoff", "This sign-in link is invalid or expired. Open the site again.");
-  if (typeof code !== "string" || !TOKEN_RE.test(code) || !nonce || !TOKEN_RE.test(nonce)) {
+  if (typeof code !== "string" || !TOKEN_RE.test(code) || nonces.length === 0) {
     await invalid();
     return;
   }
   const now = Date.now();
   const token = randomBytes(32).toString("base64url");
   const outcome = transaction(db, () => {
-    const grant = consumeSiteGrant(db, code, site.id, nonce, now);
+    // The grant is bound to one nonce; a wrong one never consumes it.
+    let grant: ReturnType<typeof consumeSiteGrant> = null;
+    for (const nonce of nonces) {
+      grant = consumeSiteGrant(db, code, site.id, nonce, now);
+      if (grant !== null) break;
+    }
     if (grant === null) return "invalid" as const;
     const viewer = getViewerSessionByHash(db, grant.viewer_token_hash, now);
     const current = getSite(db, site.id);
