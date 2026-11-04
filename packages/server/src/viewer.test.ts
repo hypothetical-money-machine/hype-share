@@ -238,7 +238,7 @@ describe("viewer start", () => {
     const h = await setup(); const { cookie } = await signIn(h);
     const noNonce = () => h.request({ method: "GET", url: `/v1/view/start?${new URLSearchParams({ site: "orgsite", path: "/" })}` });
     for (let i = 0; i < VIEWER_STARTS_PER_HOUR + 5; i++) {
-      expect((await h.start("/", { headers: { cookie } })).statusCode).toBe(501);
+      expect((await h.start("/", { headers: { cookie } })).statusCode).toBe(302);
       expect((await noNonce()).statusCode).toBe(302);
     }
     expect(h.db.prepare("SELECT count FROM rate_limits WHERE action = 'viewer_start'").get()).toEqual({ count: 1 });
@@ -378,7 +378,7 @@ describe("viewer callback", () => {
     const h = await setup(); const first = await signIn(h);
     const started = await h.start("/", { headers: { cookie: "x=1" } });
     const res = await h.callback(`${cookiePair(started)}; ${first.cookie}`, "state_2");
-    expect(res.statusCode).toBe(501);
+    expect(res.statusCode).toBe(302);
     const rows = sessions(h);
     expect(rows).toHaveLength(2);
     expect(rows.find((r) => r.token_hash === hashApiKey(first.cookie.split("=")[1]!))!.revoked_at).toBe(NOW);
