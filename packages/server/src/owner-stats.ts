@@ -1,5 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
-import { effectiveVisibility, listSitesWithAudience, type AudienceFields } from "./db.js";
+import { countHonouredAudiences, effectiveVisibility, type AudienceFields } from "./db.js";
 import { TIER_POLICIES, effectiveTier, orgTier, type Tier } from "./tiers.js";
 
 const DAY = 86_400_000;
@@ -32,7 +32,7 @@ export function getOwnerStats(db: DatabaseSync, now = Date.now()) {
   const tiers = Object.keys(TIER_POLICIES).map(tier => ({ tier, count: tierRows.find(row => row.tier === tier)?.count ?? 0 }));
   // Stored counts, then org sites moved out of private through the same check every read uses.
   const stored = db.prepare(`SELECT visibility, COUNT(*) AS count FROM sites GROUP BY visibility`).all() as { visibility: string; count: number }[];
-  const orgSites = listSitesWithAudience(db).filter(site => effectiveVisibility(db, site) === "org").length;
+  const orgSites = countHonouredAudiences(db);
   const visibility = [...stored.map(row => row.visibility === "private" ? { ...row, count: row.count - orgSites } : row), { visibility: "org", count: orgSites }]
     .filter(row => row.count > 0)
     .sort((a, b) => a.visibility.localeCompare(b.visibility));

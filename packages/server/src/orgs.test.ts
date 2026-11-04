@@ -8,9 +8,12 @@ import type { DatabaseSync } from "node:sqlite";
 import { buildApp, type WorkOSAuthClient } from "./app.js";
 import type { Config } from "./config.js";
 import {
+  countHonouredAudiences,
   createApiKeyRecord,
   createOpsKey,
   createUser,
+  honouredAudience,
+  type AudienceFields,
   getUser,
   hashApiKey,
   openDb,
@@ -2409,6 +2412,35 @@ describe("org visibility fails closed", () => {
     db.prepare(`UPDATE orgs SET workos_organization_id = ? WHERE id = ?`).run(WORKOS_ORG_B, org.id);
     expect(counts()).toEqual({ private: 2, unlisted: 1 });
     expect(getOwnerStats(db).recentSites.find((s) => s.id === site.id)!.visibility).toBe("private");
+  });
+});
+
+describe("countHonouredAudiences", () => {
+  it("agrees with honouredAudience across every condition", async () => {
+    const { app, db, member } = await linkedOrgSetup();
+    const { org: other } = await createOrg(app, { name: "Other", compTier: "paid", workosOrganizationId: WORKOS_ORG_B });
+    const published: string[] = [];
+    for (let i = 0; i < 5; i++) published.push((await publishOrgSite(app, member.token)).id);
+    const ids = published as [string, string, string, string, string];
+    await publish(app, { ...helloSite(), visibility: "private" }, member.token);
+    await publish(app, helloSite(), member.token);
+    const jsCount = () => (db.prepare(`SELECT * FROM sites`).all() as unknown as AudienceFields[])
+      .filter((site) => honouredAudience(db, site) !== null).length;
+    const agree = (expected: number) => {
+      expect(jsCount()).toBe(expected);
+      expect(countHonouredAudiences(db)).toBe(expected);
+    };
+    agree(5);
+    // Break one condition per site with raw writes the triggers don't touch.
+    db.prepare(`UPDATE sites SET visibility = 'unlisted' WHERE id = ?`).run(ids[1]);
+    db.prepare(`UPDATE sites SET audience_version_id = 'version_other' WHERE id = ?`).run(ids[2]);
+    db.prepare(`UPDATE sites SET audience_workos_org_id = ? WHERE id = ?`).run(WORKOS_ORG_B, ids[3]);
+    db.prepare(`UPDATE sites SET audience_org_id = ?, audience_workos_org_id = ? WHERE id = ?`).run(other.id, WORKOS_ORG_B, ids[4]);
+    agree(1);
+    // The owner leaving the org, with the triggers gone (as on an old binary).
+    db.exec(`DROP TRIGGER trg_users_org_change_clears_audience`);
+    db.prepare(`UPDATE users SET org_id = NULL, org_role = NULL WHERE id = (SELECT owner_user_id FROM sites WHERE id = ?)`).run(ids[0]);
+    agree(0);
   });
 });
 

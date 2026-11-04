@@ -861,10 +861,22 @@ export function effectiveVisibility(db: DatabaseSync, site: AudienceFields): Vis
 }
 
 /** Sites that carry audience columns at all, honoured or not. */
-export function listSitesWithAudience(db: DatabaseSync): SiteRow[] {
-  return db
-    .prepare(`SELECT ${SITE_COLS} FROM sites WHERE audience_org_id IS NOT NULL`)
-    .all() as unknown as SiteRow[];
+/**
+ * How many sites honouredAudience would honour, in one query: the same four
+ * conditions as a join, for counts that would otherwise cost two reads per
+ * site. Keep the two in step; a test compares them.
+ */
+export function countHonouredAudiences(db: DatabaseSync): number {
+  const row = db.prepare(`SELECT COUNT(*) AS n FROM sites s
+    JOIN orgs o ON o.id = s.audience_org_id
+    JOIN users u ON u.id = s.owner_user_id
+    WHERE s.visibility = 'private'
+      AND s.audience_workos_org_id IS NOT NULL
+      AND s.audience_version_id IS NOT NULL
+      AND s.current_version_id = s.audience_version_id
+      AND o.workos_organization_id = s.audience_workos_org_id
+      AND u.org_id = s.audience_org_id`).get() as { n: number };
+  return row.n;
 }
 
 export function updateSiteExpiry(
