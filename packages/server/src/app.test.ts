@@ -2601,3 +2601,40 @@ describe("council round 2", () => {
     expect(bad.headers["cache-control"]).toBe("private, no-store");
   });
 });
+
+describe("council round 3", () => {
+  it("never lets a CDN cache a server error from a public site", async () => {
+    const { app, s3 } = await setup();
+    const site = (await publish(app, { ...helloSite("<h1>pub</h1>") })).json<{ id: string }>();
+    s3.hooks.getResponse = () => ({
+      ContentLength: 10,
+      Body: new Readable({
+        read() {
+          this.destroy(new Error("s3 connection reset"));
+        },
+      }),
+    });
+    const res = await inject(app, { method: "GET", url: `/s/${site.id}/` });
+    expect(res.statusCode).toBe(500);
+    expect(res.headers["cache-control"]).toBe("no-store");
+  });
+
+  it("leaves a site host's admin-path requests to the site, with its headers", async () => {
+    const { app } = await setup({ siteHostSuffix: "sites.test", publicBaseUrl: "https://api.test" });
+    const site = (await publish(app, { ...helloSite(), visibility: "private" })).json<{ id: string }>();
+    for (let i = 0; i < 10; i++) {
+      await inject(app, {
+        method: "GET",
+        url: "/api/v1/admin/keys",
+        headers: { host: "api.test", "x-admin-token": `wrong-${i}` },
+      });
+    }
+    const onSite = await inject(app, {
+      method: "GET",
+      url: "/api/v1/admin/keys",
+      headers: { host: `${site.id}.sites.test` },
+    });
+    expect(onSite.statusCode).not.toBe(429);
+    expect(onSite.headers["cache-control"]).toBe("private, no-store");
+  });
+});

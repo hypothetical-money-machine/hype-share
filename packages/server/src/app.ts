@@ -121,6 +121,7 @@ import {
 } from "./tiers.js";
 import { FileError, ensureIndexHtml, prepareFiles, type PreparedFile } from "./files.js";
 import {
+  DEFAULT_BODY_LIMITS,
   deletePrefix,
   deleteSiteObjects,
   deleteVersionObjects,
@@ -128,6 +129,7 @@ import {
   headObject,
   objectExists,
   putSiteFiles,
+  type BodyLimits,
 } from "./storage.js";
 
 const fileInputSchema = z.object({
@@ -215,6 +217,8 @@ export interface AppDeps {
   s3: S3Client;
   /** The client site serving reads through; defaults to `s3`. See createS3Client. */
   serveS3?: S3Client;
+  /** How long served bodies may stall or run, and what may be buffered; tests shorten these. */
+  bodyLimits?: BodyLimits;
   /** Fastify options passthrough, mainly so tests can silence the logger. */
   logger?: boolean;
   /** Where log lines go instead of stdout; tests capture them here. */
@@ -351,6 +355,9 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   app.addHook("onRequest", async (req, reply) => {
     const tokenHash = deps.config.adminTokenHash;
     if (tokenHash === null || !isAdminTokenRoute(req)) return;
+    // A site host never reaches the API; its own hook answers, with the site's headers.
+    const suffix = deps.config.siteHostSuffix;
+    if (suffix !== null && siteLabelFromHost(req.headers.host ?? "", suffix) !== null) return;
     const bucket = adminBucket(req);
     const lockedOut = rateExhausted(deps.db, bucket, "admin_auth", ADMIN_FAILURES_PER_HOUR);
     if (!lockedOut && adminTokenCheck(tokenHash, req) === "invalid") {
@@ -395,6 +402,10 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     // own headers were set (a stream that broke before its first byte).
     reply.removeHeader("content-length");
     reply.type("application/json; charset=utf-8");
+    // A site's own Cache-Control may already be set (public, max-age=60);
+    // an outage must not be cached as if it were the page.
+    const status = err instanceof AuthError || err instanceof HttpError ? err.statusCode : 500;
+    if (status >= 500) reply.header("Cache-Control", "no-store");
     if (err instanceof AuthError || err instanceof HttpError) {
       return reply.status(err.statusCode).send({
         error: { code: err.code, message: err.message },
@@ -1816,10 +1827,14 @@ async function serveSitePath(
   const versionId = site.current_version_id;
   const keyFor = (p: string) => s3ObjectKey(site.id, versionId, p);
   // HEAD answers from metadata; GET streams the body rather than holding it.
+  const limits = ctx.bodyLimits ?? DEFAULT_BODY_LIMITS;
   const fetchObject = (p: string) =>
     req.method === "HEAD"
       ? headObject(ctx.serveS3 ?? ctx.s3, bucket, keyFor(p))
-      : getObject(ctx.serveS3 ?? ctx.s3, bucket, keyFor(p));
+      : getObject(ctx.serveS3 ?? ctx.s3, bucket, keyFor(p), limits);
+  // The visitor's side of the same rule: a connection that moves nothing for
+  // the idle limit is closed, which also tears down the S3 body behind it.
+  reply.raw.setTimeout(limits.idleMs, () => reply.raw.destroy());
 
   let path = requested;
   let obj: { body?: Readable; contentType: string | undefined; contentLength: number | undefined } | null =

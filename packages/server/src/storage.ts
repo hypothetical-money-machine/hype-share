@@ -9,7 +9,7 @@ import {
   CreateBucketCommand,
   type S3ClientConfig,
 } from "@aws-sdk/client-s3";
-import { Readable } from "node:stream";
+import { Readable, Transform, pipeline } from "node:stream";
 import type { Config } from "./config.js";
 import {
   s3ObjectKey,
@@ -27,9 +27,10 @@ export interface StoredFile {
 /**
  * Serving streams large objects to visitors, and a slow reader holds its S3
  * socket for as long as it reads. So serving gets its own client, with a
- * bigger pool, and every socket is dropped after a stretch with no traffic:
- * slow readers can then starve neither publishing nor the sweeper, and a
- * stalled one cannot hold a socket for ever.
+ * bigger pool: slow readers cannot starve publishing or the sweeper. What
+ * bounds how long a body can hold a socket is getObject's own deadlines; the
+ * SDK's requestTimeout only covers waiting for response headers (and only
+ * aborts with throwOnRequestTimeout), so it is not relied on for bodies.
  */
 const S3_POOL = {
   serve: { maxSockets: 256, requestTimeout: 30_000 },
@@ -42,7 +43,12 @@ export function createS3Client(config: Config, purpose: keyof typeof S3_POOL = "
   const cfg: S3ClientConfig = {
     region: config.s3.region,
     forcePathStyle: config.s3.forcePathStyle,
-    requestHandler: { requestTimeout: pool.requestTimeout, httpAgent: agent, httpsAgent: agent },
+    requestHandler: {
+      requestTimeout: pool.requestTimeout,
+      throwOnRequestTimeout: true,
+      httpAgent: agent,
+      httpsAgent: agent,
+    },
   };
   // Without explicit SHAREPLAN_S3_* keys, leave credentials to the SDK's
   // default chain: AWS_* env vars (with AWS_SESSION_TOKEN), profiles, and
@@ -95,31 +101,102 @@ export interface StoredObject {
   body: Readable;
   contentType: string | undefined;
   contentLength: number | undefined;
+  /** Read in full (and counted against the buffer budget) rather than streamed. */
+  buffered?: boolean;
 }
 
+/** How a served body is bounded. Tests shorten these. */
+export interface BodyLimits {
+  /** Destroy a body that moves no bytes for this long (an S3 stall, or a visitor who stopped reading). */
+  idleMs: number;
+  /** Destroy a body that is still going after this long, however it trickles. */
+  maxMs: number;
+  /** Objects up to this size are read in full, handing their S3 socket back at once. */
+  bufferUpToBytes: number;
+  /** Bytes all buffered bodies may hold at once; past it, objects stream instead. */
+  bufferBudgetBytes: number;
+}
+
+export const DEFAULT_BODY_LIMITS: BodyLimits = {
+  idleMs: 30_000,
+  maxMs: 10 * 60_000,
+  bufferUpToBytes: 256 * 1024,
+  bufferBudgetBytes: 64 * 1024 * 1024,
+};
+
+/** Bytes held by buffered bodies not yet sent or abandoned, process-wide. */
+let bufferedBytes = 0;
+
 /**
- * Objects at most this big are read in full before serving, which hands their
- * S3 socket back at once; most HTML, CSS and JS is far smaller. Bigger ones
- * stream, so memory stays flat however large the file.
+ * Pass `source` through, destroying both if no chunk moves for `idleMs` or the
+ * whole body takes longer than `maxMs`. Backpressure is kept: a visitor who
+ * stops reading pauses the source, the idle timer then fires, and the S3
+ * socket goes back to the pool.
  */
-const BUFFER_UP_TO_BYTES = 1024 * 1024;
+function withDeadlines(source: Readable, limits: BodyLimits): Readable {
+  let idle: NodeJS.Timeout | undefined;
+  const resetIdle = () => {
+    clearTimeout(idle);
+    idle = setTimeout(fail(`idle for ${limits.idleMs} ms`), limits.idleMs);
+  };
+  // Every chunk that gets through counts as progress.
+  const out = new Transform({
+    transform(chunk, _enc, done) {
+      resetIdle();
+      done(null, chunk);
+    },
+  });
+  function fail(why: string) {
+    return () => out.destroy(new Error(`S3 body ${why}`));
+  }
+  const total = setTimeout(fail(`took longer than ${limits.maxMs} ms`), limits.maxMs);
+  resetIdle();
+  out.on("close", () => {
+    clearTimeout(idle);
+    clearTimeout(total);
+  });
+  // pipeline destroys the source when `out` is destroyed, and vice versa.
+  pipeline(source, out, () => {});
+  return out;
+}
 
 /** An object's body as a stream, or null if there is no such key. */
 export async function getObject(
   client: S3Client,
   bucket: string,
   key: string,
+  limits: BodyLimits = DEFAULT_BODY_LIMITS,
 ): Promise<StoredObject | null> {
   try {
     const out = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
     if (!out.Body) return null;
-    let body = out.Body as Readable;
-    if (out.ContentLength !== undefined && out.ContentLength <= BUFFER_UP_TO_BYTES) {
-      const chunks: Buffer[] = [];
-      for await (const chunk of body) chunks.push(Buffer.from(chunk as Uint8Array));
-      body = Readable.from([Buffer.concat(chunks)]);
+    const body = withDeadlines(out.Body as Readable, limits);
+    const length = out.ContentLength;
+    if (
+      length !== undefined &&
+      length <= limits.bufferUpToBytes &&
+      bufferedBytes + length <= limits.bufferBudgetBytes
+    ) {
+      bufferedBytes += length;
+      let released = false;
+      const release = () => {
+        if (!released) {
+          released = true;
+          bufferedBytes -= length;
+        }
+      };
+      try {
+        const chunks: Buffer[] = [];
+        for await (const chunk of body) chunks.push(Buffer.from(chunk as Uint8Array));
+        const buffered = Readable.from([Buffer.concat(chunks)]);
+        buffered.on("close", release);
+        return { body: buffered, contentType: out.ContentType, contentLength: length, buffered: true };
+      } catch (err) {
+        release();
+        throw err;
+      }
     }
-    return { body, contentType: out.ContentType, contentLength: out.ContentLength };
+    return { body, contentType: out.ContentType, contentLength: length, buffered: false };
   } catch (err: unknown) {
     if (isNotFound(err)) return null;
     throw err;

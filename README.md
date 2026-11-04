@@ -436,6 +436,13 @@ stays permanent under a tier that forbids it.
   must be at least 16 characters.
 - Only the two publish routes accept large bodies, and they authenticate first;
   every other route takes at most 64 KiB.
+- Serving reads S3 through its own connection pool. Files up to 256 KiB are read in
+  full (within a 64 MiB budget across all requests), and bigger ones stream. A
+  response that moves no bytes for 30 seconds, or a file still streaming after 10
+  minutes, is closed, which frees its S3 connection. A reverse proxy that buffers
+  responses in front of the server takes slow readers off it entirely.
+- Server errors are sent with `Cache-Control: no-store`, so a cache in front never
+  keeps an outage.
 - Without a suffix, all sites share one origin under `/s/:id/`, so a script in
   one site can reach another. This suits local development, not public hosting.
 - The server stores API keys as SHA-256 hashes only. IP rate limits use HMAC-SHA256 with `SHAREPLAN_IP_HASH_PEPPER`.
