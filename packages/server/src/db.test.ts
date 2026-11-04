@@ -35,6 +35,7 @@ import {
   type OrgRow,
   type SiteRow,
   type UserRow,
+  SCHEMA_VERSION,
 } from "./db.js";
 import { HttpError } from "./errors.js";
 import { policyFor, type OrgRole, type Tier } from "./tiers.js";
@@ -180,8 +181,9 @@ describe("upgrade", () => {
     const db = openDb(":memory:");
     const version = () =>
       (db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version;
-    expect(version()).toBe(3);
-    expect(schemaNames(db, "table")).toContain("orgs");
+    expect(version()).toBe(SCHEMA_VERSION);
+    expect(schemaNames(db, "table")).toEqual(expect.arrayContaining(["orgs", "retired_site_ids"]));
+    expect(columnNames(db, "sites")).toContain("deleting_at");
     expect(columnNames(db, "users")).toEqual(expect.arrayContaining(["org_id", "org_role"]));
     expect(schemaNames(db, "index")).toEqual(
       expect.arrayContaining([
@@ -190,10 +192,12 @@ describe("upgrade", () => {
         "idx_orgs_stripe_customer",
         "idx_orgs_workos_org",
         "idx_sites_permanent",
+        "idx_users_claim_token",
+        "idx_rate_limits_window",
       ]),
     );
     upgrade(db); // no-op, index already exists
-    expect(version()).toBe(3);
+    expect(version()).toBe(SCHEMA_VERSION);
     db.close();
   });
 
@@ -248,7 +252,7 @@ describe("upgrade", () => {
     expect(columnNames(db, "orgs")).toContain("workos_organization_id");
     expect(schemaNames(db, "index")).toContain("idx_orgs_workos_org");
     expect(getOrg(db, org.id)).toMatchObject({ name: "SkySlope", workos_organization_id: null });
-    expect((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(3);
+    expect((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(SCHEMA_VERSION);
     db.close();
   });
 
@@ -286,7 +290,7 @@ describe("upgrade", () => {
       audience_workos_org_id: null,
       audience_version_id: null,
     });
-    expect((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(3);
+    expect((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(SCHEMA_VERSION);
     db.close();
   });
 
@@ -298,6 +302,20 @@ describe("upgrade", () => {
     upgrade(db);
     expect(getSiteBySlug(db, "www")).toBeNull();
     expect(getSite(db, "s1")?.slug).toBeNull();
+    db.close();
+  });
+
+  it("clears slugs that are not hostname labels, keeping ones that only differ by case", () => {
+    const db = openDb(":memory:");
+    const a = createOpsKey(db, { name: "a", token: "sp_a" });
+    site(db, "s1", "my_plan", 10, a.key.id, a.user.id);
+    site(db, "s2", "v1.2", 11, a.key.id, a.user.id);
+    site(db, "s3", "Launch-Day", 12, a.key.id, a.user.id);
+    db.exec("PRAGMA user_version = 3;");
+    upgrade(db);
+    expect(getSite(db, "s1")?.slug).toBeNull();
+    expect(getSite(db, "s2")?.slug).toBeNull();
+    expect(getSite(db, "s3")?.slug).toBe("Launch-Day");
     db.close();
   });
 

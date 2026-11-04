@@ -1,8 +1,5 @@
+import { escapeHtml as escape } from "@shareplan/core";
 import type { OwnerStats } from "./owner-stats.js";
-
-function escape(value: string): string {
-  return value.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
-}
 const number = (n: number) => n.toLocaleString("en-US");
 function bytes(n: number): string {
   if (n < 1024) return `${number(n)} B`;

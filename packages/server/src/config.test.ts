@@ -138,4 +138,42 @@ describe("loadConfig", () => {
       /must be a number/,
     );
   });
+
+  it("leaves S3 credentials to the SDK chain unless both SHAREPLAN_S3 keys are set", () => {
+    const aws = { ...base, AWS_ACCESS_KEY_ID: "ASIAEXAMPLE", AWS_SECRET_ACCESS_KEY: "s" };
+    expect(loadConfig(aws).s3.credentials).toBeUndefined();
+    expect(
+      loadConfig({ ...base, SHAREPLAN_S3_ACCESS_KEY: "k", SHAREPLAN_S3_SECRET_KEY: "s" }).s3
+        .credentials,
+    ).toEqual({ accessKeyId: "k", secretAccessKey: "s" });
+    expect(() => loadConfig({ ...base, SHAREPLAN_S3_ACCESS_KEY: "k" })).toThrow(/set together/);
+  });
+
+  it("fails at startup on an unparseable default ttl", () => {
+    expect(loadConfig({ ...base, SHAREPLAN_DEFAULT_TTL: "30d" }).defaultTtl).toBe("30d");
+    expect(() => loadConfig({ ...base, SHAREPLAN_DEFAULT_TTL: "30 days" })).toThrow(
+      /SHAREPLAN_DEFAULT_TTL/,
+    );
+  });
+
+  it("keeps the sweep interval inside what setInterval honours", () => {
+    expect(loadConfig({ ...base, SHAREPLAN_REAP_INTERVAL_SEC: "3000000" }).reapIntervalMs).toBe(
+      2_147_483_647,
+    );
+    expect(loadConfig({ ...base, SHAREPLAN_REAP_INTERVAL_SEC: "60" }).reapIntervalMs).toBe(60_000);
+  });
+
+  it("reads the client ip header name", () => {
+    expect(loadConfig(base).clientIpHeader).toBeNull();
+    const trusted = { ...base, SHAREPLAN_TRUST_FORWARDED: "true" };
+    expect(
+      loadConfig({ ...trusted, SHAREPLAN_CLIENT_IP_HEADER: " CF-Connecting-IP " }).clientIpHeader,
+    ).toBe("cf-connecting-ip");
+    expect(() => loadConfig({ ...trusted, SHAREPLAN_CLIENT_IP_HEADER: "x y" })).toThrow(
+      /SHAREPLAN_CLIENT_IP_HEADER/,
+    );
+    expect(() => loadConfig({ ...base, SHAREPLAN_CLIENT_IP_HEADER: "cf-connecting-ip" })).toThrow(
+      /needs SHAREPLAN_TRUST_FORWARDED/,
+    );
+  });
 });

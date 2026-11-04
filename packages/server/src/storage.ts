@@ -2,6 +2,7 @@ import {
   S3Client,
   PutObjectCommand,
   GetObjectCommand,
+  HeadObjectCommand,
   DeleteObjectsCommand,
   ListObjectsV2Command,
   HeadBucketCommand,
@@ -25,12 +26,14 @@ export interface StoredFile {
 export function createS3Client(config: Config): S3Client {
   const cfg: S3ClientConfig = {
     region: config.s3.region,
-    credentials: {
-      accessKeyId: config.s3.accessKeyId,
-      secretAccessKey: config.s3.secretAccessKey,
-    },
     forcePathStyle: config.s3.forcePathStyle,
   };
+  // Without explicit SHAREPLAN_S3_* keys, leave credentials to the SDK's
+  // default chain: AWS_* env vars (with AWS_SESSION_TOKEN), profiles, and
+  // ECS/EKS/EC2 roles all work that way, and a static pair would override them.
+  if (config.s3.credentials) {
+    cfg.credentials = config.s3.credentials;
+  }
   if (config.s3.endpoint) {
     cfg.endpoint = config.s3.endpoint;
   }
@@ -100,6 +103,24 @@ export async function getObject(
   }
 }
 
+/** Whether an object exists, without downloading it. */
+export async function objectExists(
+  client: S3Client,
+  bucket: string,
+  key: string,
+): Promise<boolean> {
+  try {
+    await client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+    return true;
+  } catch (err: unknown) {
+    const name = (err as { name?: string })?.name;
+    const status = (err as { $metadata?: { httpStatusCode?: number } })?.$metadata
+      ?.httpStatusCode;
+    if (name === "NotFound" || name === "NoSuchKey" || status === 404) return false;
+    throw err;
+  }
+}
+
 export function deleteSiteObjects(
   client: S3Client,
   bucket: string,
@@ -117,7 +138,12 @@ export function deleteVersionObjects(
   return deletePrefix(client, bucket, s3VersionPrefix(siteId, versionId));
 }
 
-/** Delete every object under a prefix. Returns how many were removed. */
+/**
+ * Delete every object under a prefix. Returns how many were removed, and
+ * throws if any key could not be: DeleteObjects answers 200 even when some
+ * keys fail, listing them under Errors, and a caller that dropped its row on
+ * a silent partial failure would orphan those objects for good.
+ */
 export async function deletePrefix(
   client: S3Client,
   bucket: string,
@@ -137,12 +163,20 @@ export async function deletePrefix(
       .map((o) => o.Key)
       .filter((k): k is string => typeof k === "string");
     if (keys.length > 0) {
-      await client.send(
+      const out = await client.send(
         new DeleteObjectsCommand({
           Bucket: bucket,
           Delete: { Objects: keys.map((Key) => ({ Key })), Quiet: true },
         }),
       );
+      const failed = out.Errors ?? [];
+      if (failed.length > 0) {
+        const first = failed[0]!;
+        throw new Error(
+          `could not delete ${failed.length} of ${keys.length} object(s) under ${prefix}` +
+            ` (first: ${first.Key ?? "?"}: ${first.Code ?? "error"} ${first.Message ?? ""})`.trimEnd(),
+        );
+      }
       deleted += keys.length;
     }
     ContinuationToken = listed.IsTruncated ? listed.NextContinuationToken : undefined;

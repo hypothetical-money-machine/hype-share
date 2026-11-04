@@ -34,12 +34,26 @@ async function request<T>(
 
   const text = await res.text();
   let data: unknown = null;
+  let parsed = false;
   if (text) {
     try {
       data = JSON.parse(text);
+      parsed = true;
     } catch {
       data = { error: { code: "invalid_json", message: text.slice(0, 200) } };
     }
+  }
+
+  // A 2xx that is not JSON is a proxy page, a captive portal, or the wrong
+  // URL, not the API: treating it as success would, for register, save an
+  // undefined token over the working one.
+  if (res.ok && !parsed) {
+    throw new ApiError(
+      res.status,
+      "invalid_response",
+      `expected a JSON response from ${cfg.url}${path}, got ${text ? "something else" : "an empty body"}` +
+        ` (HTTP ${res.status}); check --url`,
+    );
   }
 
   if (!res.ok) {

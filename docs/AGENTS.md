@@ -8,11 +8,20 @@ Agents can publish to the hosted service at [hype-share.com](https://hype-share.
 
 ### Hosted (hype-share.com)
 
-Register an agent key directly against the hosted service. No operator tokens or human credentials are required:
+The CLI is not on npm (do not run `npx shareplan`, which would fetch whatever package holds that name). Install it from the repository:
 
 ```bash
-npx shareplan register --url https://hype-share.com --name claude
+git clone https://github.com/hypothetical-money-machine/hype-share.git
+cd hype-share && npm ci && npm run build && npm link -w @shareplan/cli
 ```
+
+Then register an agent key directly against the hosted service. No operator tokens or human credentials are required:
+
+```bash
+shareplan register --url https://hype-share.com --name claude
+```
+
+Or skip the CLI and call `POST /api/v1/register` directly (see the HTTP API in the README).
 
 This issues a `free--` tier API key, saves it to `~/.config/shareplan/config.json`, and returns a `claimUrl` a human can use in a browser to link their account.
 
@@ -29,7 +38,7 @@ If your team gave you an organization join token, register with it and the key p
 
 ```bash
 export SHAREPLAN_ORG_TOKEN=org_...
-npx shareplan register --url https://hype-share.com --name claude-ci
+shareplan register --url https://hype-share.com --name claude-ci
 ```
 
 (`--org-token org_...` also works.) The response's `effectiveTier` is the tier that applies. `shareplan whoami` and `GET /api/v1/me` show it later. The token is never written to the config file.
@@ -40,13 +49,13 @@ When using a self-hosted or private shareplan server:
 
 - **If open registration is enabled** (`SHAREPLAN_IP_HASH_PEPPER` is configured):
   ```bash
-  npx shareplan register --url http://127.0.0.1:8788 --name agent
+  shareplan register --url http://127.0.0.1:8788 --name agent
   ```
 - **If using operator-issued keys** (or open registration is disabled):
   An operator mints a key using the server's admin token:
   ```bash
-  npx shareplan create-key --url http://127.0.0.1:8788 --admin-token "$SHAREPLAN_ADMIN_TOKEN" --name agent
-  npx shareplan login --url http://127.0.0.1:8788 --token sp_...
+  shareplan create-key --url http://127.0.0.1:8788 --admin-token "$SHAREPLAN_ADMIN_TOKEN" --name agent
+  shareplan login --url http://127.0.0.1:8788 --token sp_...
   ```
   Keys created with the admin token belong to the `ops` tier: they have no TTL maximum cap, can set `"ttl": null` for permanent hosting, can assign custom vanity slugs, and bypass IP rate limits.
 
@@ -168,7 +177,9 @@ POST /api/v1/sites/a1b2c3d4e5/touch
 Authorization: Bearer sp_...
 ```
 
-Resets `expiresAt` to the tier maximum (30 days from now for `free--`). Sites that are already expired return `410 gone` and cannot be revived.
+Resets `expiresAt` to the tier maximum (30 days from now for `free--`). On tiers with no maximum (`paid`, `ops`) it extends a site with an expiry to the default TTL or one year, never shortening it. Sites that are already expired return `410 gone` and cannot be revived, by touch or by a republish.
+
+A republish (`PUT /api/v1/sites/:id`) without `ttl` keeps the current expiry, so a site republished daily still expires on schedule unless you pass `ttl` or call touch.
 
 ### Endpoints
 
@@ -197,7 +208,7 @@ On `PUT`, omitting `ttl` preserves the current expiry. Only accounts whose `effe
 
 ### Hosted on hype-share.com (`free--` tier)
 
-- **Allowed files**: `html`, `htm`, `css`, `js`, `mjs`, `json`, `map`, `txt`, `md`, `png`, `jpg`, `jpeg`, `gif`, `webp`, `avif`, `svg`, `ico`, `woff`, `woff2`. Uploading other extensions returns `400 file_type_not_allowed`.
+- **Allowed files**: `html`, `htm`, `css`, `js`, `mjs`, `json`, `txt`, `md`, `png`, `jpg`, `jpeg`, `gif`, `webp`, `avif`, `svg`, `ico`, `woff`, `woff2`. Uploading other extensions (including source maps, `map`) returns `400 file_type_not_allowed`. The CLI skips hidden files and symlinks when publishing a directory.
 - **File structure**: Multi-file uploads require an `index.html`. Single files wrap automatically.
 - **Site size**: 50 MiB total byte size, maximum 200 files.
 - **TTL**: Default 7d, maximum 30d. Setting `ttl: null` returns `400 ttl_not_allowed`.

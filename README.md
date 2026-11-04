@@ -16,7 +16,7 @@ Agent writes index.html  ->  shareplan publish  ->  https://xk9f2m.hype-share.co
 - **Any S3-compatible store.** The server works with Cloudflare R2, Garage, AWS S3, and MinIO for local development.
 - **SQLite metadata.** SQLite stores users, sites, versions, API keys, and rate limits.
 - **Versioned publishes.** A republish replaces content without breaking in-flight requests, and the server deletes versions past the retention window from storage.
-- **TTL and expiry.** Site lifetimes are configurable. Republishing or calling `touch` resets the TTL, and a background sweeper deletes expired sites.
+- **TTL and expiry.** Site lifetimes are configurable. Calling `touch`, or republishing with a `ttl`, extends a site; a republish without one keeps the current expiry. A background sweeper deletes expired sites.
 - **Per-site origins.** The server serves each site from `<id>.<domain>`, so the browser's same-origin policy keeps sites apart. Single-origin `/s/:id/` is the alternative.
 - **Vanity slugs.** Supported tiers get `my-plan.<domain>` alongside `<id>.<domain>`.
 - **Security headers.** Every served asset gets nosniff and no-referrer headers. HTML gets a CSP, SVG gets a sandboxed CSP, and sites that are not public are marked noindex.
@@ -29,15 +29,26 @@ The commands below run against the public deployment at [hype-share.com](https:/
 
 ### Quick start (hosted)
 
+The CLI is not published to npm, so install it from this repository. Do not
+run `npx shareplan`: npm would fetch whatever package holds that name, and it
+would then see the API token you mint.
+
 ```bash
+# 0. Install the CLI (puts `shareplan` on your PATH)
+git clone https://github.com/hypothetical-money-machine/hype-share.git
+cd hype-share && npm ci && npm run build && npm link -w @shareplan/cli
+
 # 1. Register an agent key (saves token to ~/.config/shareplan/config.json)
-npx shareplan register --url https://hype-share.com --name my-agent
+shareplan register --url https://hype-share.com --name my-agent
 
 # 2. Publish a site
 mkdir -p /tmp/demo && echo '<!doctype html><h1>hello hype-share</h1>' > /tmp/demo/index.html
-npx shareplan publish /tmp/demo --title "demo" --ttl 7d
+shareplan publish /tmp/demo --title "demo" --ttl 7d
 # prints https://xk9f2m.hype-share.com/
 ```
+
+Without the CLI, the [HTTP API](#http-api) does the same with any client:
+`curl -X POST https://hype-share.com/api/v1/register -H 'content-type: application/json' -d '{"name":"my-agent"}'`.
 
 ### Hosted accounts and tiers
 
@@ -49,7 +60,7 @@ On `hype-share.com`, agents and humans get tiered accounts. All publishing uses 
 - **Organizations.** An operator can create an organization with a tier and a join token. Registering with `--org-token` (or `SHAREPLAN_ORG_TOKEN`) puts the new key inside the organization. Organization admins can also mint keys without sharing the token. Members publish at the higher of their own tier and the organization's, never `ops`. When the organization's tier is higher than a member's own, that member's publishes also count against one pooled hourly cap for the organization. A member at or above the organization's tier skips the pool. Lowering an organization's tier sets an expiry at the new maximum on every permanent member site, unless the owner's own tier allows permanent sites. A personally `paid` member keeps permanent sites. If a member's effective tier falls below `free-`, the change also removes their vanity slugs. If it falls below `free`, their public sites become unlisted. The sweeper deletes the newly expiring sites when that expiry passes.
 - **Org-private sites.** With `"visibility": "org"`, a member of an organization linked to a WorkOS organization publishes a site that opens in a browser only after an SSO sign-in to that WorkOS organization. The owner's key still reads it. Viewers sign out at `/v1/view/`; operators sign them out with `shareplan revoke-viewers`. See [Org-private viewing](PLAN.md#org-private-viewing).
 - **Slugs and visibility.** Vanity slugs require `free-` or higher. Public directory listings require `free` or higher. `free--` sites are unlisted and use random site IDs (`xk9f2m.hype-share.com`).
-- **Upload rules.** Allowed files are HTML and page assets (`html`, `htm`, `css`, `js`, `mjs`, `json`, `map`, `txt`, `md`, `png`, `jpg`, `jpeg`, `gif`, `webp`, `avif`, `svg`, `ico`, `woff`, `woff2`). A site can hold at most 50 MiB and 200 files. The server rejects video, audio, pdf, zip, and wasm.
+- **Upload rules.** Allowed files are HTML and page assets (`html`, `htm`, `css`, `js`, `mjs`, `json`, `txt`, `md`, `png`, `jpg`, `jpeg`, `gif`, `webp`, `avif`, `svg`, `ico`, `woff`, `woff2`). A site can hold at most 50 MiB and 200 files. The server rejects video, audio, pdf, zip, wasm, and source maps (`map`). File names may not contain control characters, and each path segment is limited to 255 bytes.
 
 | Tier | Proof | Default TTL | Max TTL | Touch/publish | Bytes/site |
 |------|-------|-------------|---------|---------------|------------|
@@ -72,12 +83,12 @@ A self-hosted server reads its S3 target, admin token, and limits from the envir
 1. **Operator access (`ops` tier).**
    You configure `SHAREPLAN_ADMIN_TOKEN` on a self-hosted server. Minting keys with this token (`shareplan create-key --admin-token ...`) creates an `ops` user. Operator keys have no TTL maximum, can set `"ttl": null` for permanent sites, can assign any vanity slug, and are exempt from IP rate limits. An operator grants `unlock` or `paid` to a team by creating an organization with `shareplan create-org --tier paid` instead of editing the database. `ops` stays user-level; an organization never grants it.
 2. **Registration control.**
-   Setting `SHAREPLAN_IP_HASH_PEPPER` lets agents self-register via `POST /api/v1/register` or `shareplan register` on your private server. If you omit the pepper, the server answers `POST /api/v1/register` with `503` unless the request carries a valid organization join token, so keys come only from the operator or from an organization. The join token, not the client IP address, is the credential, so creating an organization re-enables registration for that team.
+   Setting `SHAREPLAN_IP_HASH_PEPPER` lets agents self-register via `POST /api/v1/register` or `shareplan register` on your private server. If you omit the pepper, the server answers `POST /api/v1/register` with `503` unless the request carries a valid organization join token, so keys come only from the operator or from an organization. The join token, not the client IP address, is the credential, so creating an organization re-enables registration for that team. Without a pepper, organization members also skip the per-IP publish limit; their own hourly cap and the organization's pool still apply.
 3. **URL and domain structure.**
    - **With domain suffix.** Setting `SHAREPLAN_SITE_HOST_SUFFIX=share.example.com` serves sites at `https://<id>.share.example.com/` with origin isolation. This requires wildcard DNS and a TLS certificate.
    - **Without domain suffix (path-based).** Leaving `SHAREPLAN_SITE_HOST_SUFFIX` unset serves sites under `/s/<id>/` on the API host (e.g. `http://127.0.0.1:8788/s/<id>/`). This suits local development or private LANs without wildcard DNS.
 4. **Storage backend.**
-   Use local MinIO, AWS S3, Cloudflare R2, or Garage via standard S3 environment variables.
+   Use local MinIO, AWS S3, Cloudflare R2, or Garage. Set `SHAREPLAN_S3_ACCESS_KEY` and `SHAREPLAN_S3_SECRET_KEY` for static keys; leave both unset to use the AWS SDK's default credential chain (`AWS_*` variables including `AWS_SESSION_TOKEN`, profiles, and ECS, EKS, or EC2 roles).
 
 ### Local development
 
@@ -101,15 +112,16 @@ npm start
 
 # 5. Get an API key
 # Option A: Register an agent key (uses SHAREPLAN_IP_HASH_PEPPER from .env.example)
-npx shareplan register --url http://127.0.0.1:8788 --name local-agent
+npm run cli -- register --url http://127.0.0.1:8788 --name local-agent
 
 # Option B: Mint an operator key with the admin token (ops tier, no TTL caps)
-npx shareplan create-key --url http://127.0.0.1:8788 --admin-token "$SHAREPLAN_ADMIN_TOKEN"
-npx shareplan login --url http://127.0.0.1:8788 --token 'sp_...'
+npm run cli -- create-key --url http://127.0.0.1:8788 --admin-token "$SHAREPLAN_ADMIN_TOKEN"
+npm run cli -- login --url http://127.0.0.1:8788 --token 'sp_...'
 
 # 6. Publish
 mkdir -p /tmp/demo && echo '<!doctype html><h1>hello shareplan</h1>' > /tmp/demo/index.html
-npx shareplan publish /tmp/demo --title "demo" --ttl 7d
+npm run cli -- publish /tmp/demo --title "demo" --ttl 7d
+# or run `npm link -w @shareplan/cli` once and use `shareplan` directly
 ```
 
 ### Production deployment (Docker Compose)
@@ -145,7 +157,7 @@ An Organizations panel lists each organization with its tier, member, site, and
 permanent-site counts. You change organization tiers with the admin token, not
 from the portal.
 
-Counts reflect current database records. Deleting or reaping a site also removes
+Counts reflect current database records, leaving out sites whose delete has started. Deleting or reaping a site also removes
 its publishing history from the chart. File sizes are metadata estimates, not an
 S3 inventory or billing total. The server does not yet collect visitor counts,
 bandwidth, or revenue.
@@ -178,7 +190,7 @@ shareplan whoami                                 # view current server and key
 shareplan publish ./site --title "Q3 plan" --ttl 7d
 shareplan publish ./site --title "Q3 plan" --ttl none   # permanent (paid, ops, or a paid organization)
 shareplan publish ./site --site <id>             # update an existing site with a new version
-shareplan touch <id>                            # reset TTL to tier maximum
+shareplan touch <id>                            # reset TTL to tier maximum (see below for paid and ops)
 shareplan ls                                    # list your sites
 shareplan info <id>                             # view site metadata
 shareplan rm <id>                               # delete site and purge storage
@@ -218,6 +230,10 @@ shareplan revoke-viewers --email <email> --url <url> --admin-token <tok>   # or 
 - `--note <note>`: optional description stored on the version record
 
 The CLI wraps a single file: images get an image viewer page, HTML files become `index.html`, and text/data files get a download page.
+
+Publishing a directory skips hidden entries (`.git`, `.DS_Store`, `.vscode`, `.env`, ...), `node_modules`, and symlinks. Each skipped entry other than `.git` and `node_modules` is named on stderr.
+
+`touch` resets a site's TTL to the tier maximum. Tiers with no maximum (`paid`, `ops`) extend a site that has an expiry to the default TTL (`SHAREPLAN_DEFAULT_TTL` for `ops`) or one year, and never shorten it. A republish without `--ttl` keeps the current expiry, and an expired site cannot be republished or touched.
 
 The CLI prints only the public site URL to stdout; metadata goes to stderr.
 The environment variables `SHAREPLAN_URL`, `SHAREPLAN_TOKEN`, and `SHAREPLAN_ORG_TOKEN` override the saved config. `SHAREPLAN_ORG_TOKEN` applies only to `register` and `org join`, and the CLI never saves it.
@@ -303,7 +319,7 @@ Response (`201`):
 | `GET` | `/v1/auth/workos/callback` | WorkOS code | Complete an account claim |
 | `POST` | `/api/v1/sites` | Bearer token | Create a new site |
 | `PUT` | `/api/v1/sites/:id` | Bearer token | Publish a new version of an existing site |
-| `POST` | `/api/v1/sites/:id/touch` | Bearer token | Reset TTL to tier maximum (site owner only) |
+| `POST` | `/api/v1/sites/:id/touch` | Bearer token | Reset TTL to tier maximum, or extend it on tiers without one (site owner only) |
 | `GET` | `/api/v1/sites` | Bearer token | List sites owned by the current user |
 | `GET` | `/api/v1/sites/:id` | Bearer token | Fetch site metadata |
 | `DELETE` | `/api/v1/sites/:id` | Bearer token | Delete a site and remove its files |
@@ -342,21 +358,26 @@ These settings apply to self-hosted instances. See [`.env.example`](.env.example
 |----------|---------|
 | `SHAREPLAN_PUBLIC_BASE_URL` | API host, and the base of site URLs when no suffix is set |
 | `SHAREPLAN_SITE_HOST_SUFFIX` | Serve sites at `<id>.<suffix>`; needs wildcard DNS and a TLS certificate |
-| `SHAREPLAN_S3_*` | S3 endpoint, bucket, region, credentials |
+| `SHAREPLAN_S3_*` | S3 endpoint, bucket, region, and static credentials (`SHAREPLAN_S3_ACCESS_KEY` and `SHAREPLAN_S3_SECRET_KEY` together, or neither for the AWS SDK default chain) |
 | `SHAREPLAN_S3_FORCE_PATH_STYLE` | Set `true` for MinIO |
 | `SHAREPLAN_ADMIN_TOKEN` | Mint operator API keys via `/api/v1/admin/keys` |
 | `SHAREPLAN_IP_HASH_PEPPER` | HMAC pepper for the register and `free--` per-IP limits |
-| `SHAREPLAN_TRUST_FORWARDED` | Trust `CF-Connecting-IP` or `X-Forwarded-For` behind a reverse proxy |
+| `SHAREPLAN_TRUST_FORWARDED` | Trust one hop of `X-Forwarded-For` (the address your reverse proxy adds) |
+| `SHAREPLAN_CLIENT_IP_HEADER` | Read the client address from this header instead, e.g. `cf-connecting-ip` behind Cloudflare plus a local proxy. Needs `SHAREPLAN_TRUST_FORWARDED=true` (the server refuses to start without it). Only set it when every request reaches the server through a proxy that overwrites the header |
 | `SHAREPLAN_REGISTER_PER_DAY` | Max `POST /register` per IP hash per day, default 10 |
 | `SHAREPLAN_ORG_REGISTER_PER_DAY` | Daily cap per organization on join-token registrations and admin key mints, default 100 |
 | `SHAREPLAN_MAX_SITE_BYTES` | Max total bytes per site, default 50 MiB |
 | `SHAREPLAN_MAX_FILE_COUNT` | Max files per site, default 200 |
-| `SHAREPLAN_DEFAULT_TTL` | Default TTL for operator keys when a publish omits `ttl` |
+| `SHAREPLAN_DEFAULT_TTL` | Default TTL for operator keys when a publish omits `ttl`; the server refuses to start if it does not parse |
 | `SHAREPLAN_VERSION_RETENTION` | Versions kept in storage, default 2 |
 | `SHAREPLAN_REAP_INTERVAL_SEC` | Expired-site sweep interval in seconds, default 300 (`0` disables) |
 | `WORKOS_API_KEY` | WorkOS secret API key; required with the other WorkOS settings to enable claiming |
 | `WORKOS_CLIENT_ID` | WorkOS AuthKit client ID |
 | `WORKOS_REDIRECT_URI` | Exact AuthKit callback URL: `<SHAREPLAN_PUBLIC_BASE_URL>/v1/auth/workos/callback` |
+
+Claiming needs `SHAREPLAN_SITE_HOST_SUFFIX`: with path serving, uploaded HTML shares
+the API's origin and could start a claim, so claim links answer `503`. The
+confirmation form's POST must carry the API origin.
 
 Configure AuthKit to offer email codes, GitHub, Google, and company SSO. The server rejects other
 authentication methods and asks the user to reopen the original claim link.
@@ -371,7 +392,16 @@ assets. The server keeps the version row as history either way.
 The server answers requests for expired sites with `410` immediately; a background
 sweeper then deletes their objects and rows. The sweeper deletes objects before
 rows, so if a delete fails, the next sweep retries it instead of leaving orphaned
-files.
+files. A delete counts as failed when S3 reports any key it could not remove, not
+only when the request itself fails.
+
+`DELETE /api/v1/sites/:id` marks the site as deleting before it removes anything,
+so from then on the site is gone to visitors, its owner, and any publish still
+uploading to it. If the object delete fails, it still answers `204` and the sweeper
+finishes the job. A publish that fails partway removes the objects it uploaded.
+
+A deleted site's id is retired for good: no vanity slug can take it, so an old
+link never starts serving someone else's page.
 
 The sweeper also assigns an expiry to any permanent site whose owner's current
 tier no longer allows one (for example after a manual tier change), so no site

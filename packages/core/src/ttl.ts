@@ -3,16 +3,19 @@ export const MAX_TIME_MS = 8.64e15;
 
 /**
  * Parse a human TTL like "7d", "12h", "30m", "3600s", or a bare number of seconds.
- * Returns milliseconds from now, or null for no expiry.
+ * Returns milliseconds from now, or null for no expiry (null or undefined input).
  */
 export function parseTtl(input: string | number | null | undefined): number | null {
-  if (input === null || input === undefined || input === "") return null;
+  // "" is not "no expiry": only null means that, so a blank value from a form
+  // or a shell variable cannot silently make a site permanent.
+  if (input === null || input === undefined) return null;
   if (typeof input === "number") {
     if (!Number.isFinite(input) || input <= 0) {
       throw new Error("ttl must be a positive number of seconds");
     }
     const ms = Math.floor(input * 1000);
-    if (!Number.isFinite(ms) || ms > MAX_TIME_MS) {
+    // A positive ttl that floors to 0 ms would expire on arrival.
+    if (!Number.isFinite(ms) || ms < 1 || ms > MAX_TIME_MS) {
       throw new Error("ttl must be a positive number of seconds");
     }
     return ms;
@@ -43,7 +46,7 @@ export function parseTtl(input: string | number | null | undefined): number | nu
                 ? 7 * 86_400_000
                 : 365 * 86_400_000;
   const ms = Math.floor(n * mult);
-  if (!Number.isFinite(ms) || ms > MAX_TIME_MS) {
+  if (!Number.isFinite(ms) || ms < 1 || ms > MAX_TIME_MS) {
     throw new Error(`invalid ttl: ${input}`);
   }
   return ms;

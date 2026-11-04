@@ -77,7 +77,7 @@ Private site GET already requires the owner's key in `serveSitePath`. After the 
 
 ## Rate limits
 
-HMAC-SHA256 the client address with `SHAREPLAN_IP_HASH_PEPPER`. Store the hex (or a truncation), never the raw IP. IPv4: the full address. IPv6: the `/64`. Behind Cloudflare, use `CF-Connecting-IP` only when the peer is Cloudflare; otherwise use the socket address. Trusting that header from anyone else lets a client pick its bucket.
+HMAC-SHA256 the client address with `SHAREPLAN_IP_HASH_PEPPER`. Store the hex (or a truncation), never the raw IP. IPv4: the full address. IPv6: the `/64`. Behind Cloudflare, use `CF-Connecting-IP` only when the peer is Cloudflare; otherwise use the socket address. Trusting that header from anyone else lets a client pick its bucket. Implemented as `SHAREPLAN_CLIENT_IP_HEADER`, read only with `SHAREPLAN_TRUST_FORWARDED`; without it the address is one `X-Forwarded-For` hop, which behind Cloudflare plus a local proxy is the shared edge.
 
 `free--` publish/touch is limited by both the user and the IP hash. Extra keys from one café do not multiply the 120/h. Humans (email and up) drop the IP publish limit; they still have the per-user hour cap. Register without an `orgToken` always uses the IP hash and requires the pepper; a valid `orgToken` register spends the organization's daily `register` bucket instead and needs no pepper, since the token is the credential (see Organizations, Rate limits).
 

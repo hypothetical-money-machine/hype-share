@@ -16,13 +16,17 @@ import {
   createSiteId,
   createVersionId,
   contentTypeForPath,
+  encodeSitePathForUrl,
   HOST_LABEL_RE,
   isHostLabel,
   isHtmlPath,
   RESERVED_HOST_LABELS,
   s3ObjectKey,
+  s3SitePrefix,
+  s3VersionPrefix,
   sanitizeSitePath,
   siteLabelFromHost,
+  type SiteFileInput,
   type SiteResponse,
   type SiteListItem,
   type Visibility,
@@ -30,6 +34,7 @@ import {
 import { WORKOS_CALLBACK_PATH, type Config } from "./config.js";
 import { randomBytes } from "node:crypto";
 import {
+  beginUpload,
   createApiKeyRecord,
   createClaimAuthFlow,
   createUser,
@@ -39,6 +44,7 @@ import {
   deleteClaimAuthFlow,
   deleteSite,
   effectiveVisibility,
+  endUpload,
   findOrgByJoinToken,
   findUserByClaimToken,
   getClaimAuthFlow,
@@ -52,9 +58,11 @@ import {
   insertSite,
   insertVersion,
   isExpired,
+  isRetiredSiteId,
   listApiKeys,
   listPrunableVersions,
   listSitesForUser,
+  markSiteDeleting,
   markVersionPruned,
   revokeApiKey,
   transaction,
@@ -65,7 +73,13 @@ import {
   type SiteRow,
   type StoredVisibility,
 } from "./db.js";
-import { AuthError, requireAccount, requireAdmin, type Account } from "./auth.js";
+import {
+  AuthError,
+  requireAccount,
+  requireAdmin,
+  resolveUser,
+  type Account,
+} from "./auth.js";
 import { claimRedirectPage, escapeHtml, setAuthPageHeaders } from "./auth-pages.js";
 import { siteScheme, siteUrl } from "./site-url.js";
 import { registerViewerRoutes } from "./viewer.js";
@@ -79,7 +93,7 @@ import {
 } from "./site-access.js";
 import { registerOwnerPortal } from "./owner.js";
 import { HttpError } from "./errors.js";
-import { hashIp, requestIp } from "./ip.js";
+import { clientIpFromHeader, hashIp, requestIp } from "./ip.js";
 import {
   consumeOrgRegister,
   createKeySchema,
@@ -96,16 +110,19 @@ import {
   policyFor,
   resolveTierExpiry,
   tierForAuthenticationMethod,
+  touchExpiry,
   TtlPolicyError,
   UnknownTierError,
   type Tier,
   type TierPolicy,
 } from "./tiers.js";
-import { FileError, ensureIndexHtml, prepareFiles } from "./files.js";
+import { FileError, ensureIndexHtml, prepareFiles, type PreparedFile } from "./files.js";
 import {
+  deletePrefix,
   deleteSiteObjects,
   deleteVersionObjects,
   getObject,
+  objectExists,
   putSiteFiles,
 } from "./storage.js";
 
@@ -149,6 +166,26 @@ const CLAIM_CALLBACK_MAX_AGE_SECONDS = 10 * 60;
 const CLAIM_STARTS_PER_HOUR = 10;
 
 /**
+ * Request log lines carry the URL, and a claim link or an AuthKit callback
+ * query is a live credential. Fastify logs "incoming request" for every
+ * request, including the ones no route matches (HEAD /claim/..., a trailing
+ * slash), so redact in the serializer rather than per route. Query values go
+ * through redactQuerySecrets; this hides the claim token in the path.
+ */
+export function redactRequestUrl(url: string): string {
+  const { path, query } = splitQuery(url);
+  // Classified on the decoded, slash-collapsed form, since the router decodes
+  // too: /cl%61im/<token> reaches the claim route (or its 404) just the same.
+  // A path that does not decode is not routable, but is redacted anyway.
+  const decoded = decodePath(path);
+  if (decoded === null) return "[redacted]";
+  const normalized = decoded.replace(/\/{2,}/g, "/").replace(/\/+$/, "").toLowerCase();
+  if (normalized === "/claim" || normalized.startsWith("/claim/")) return "/claim/[redacted]";
+  if (normalized === WORKOS_CALLBACK_PATH && query !== "") return `${path}?[redacted]`;
+  return redactQuerySecrets(url);
+}
+
+/**
  * Fastify's transport errors carry a usable status and a safe message, but
  * their codes are FST_ERR_*; map the ones a client can actually trigger onto
  * the snake_case vocabulary the rest of the API returns.
@@ -166,6 +203,8 @@ export interface AppDeps {
   s3: S3Client;
   /** Fastify options passthrough, mainly so tests can silence the logger. */
   logger?: boolean;
+  /** Where log lines go instead of stdout; tests capture them here. */
+  logStream?: NodeJS.WritableStream;
   /** Test override for the WorkOS methods used by claims, viewers and org linking. */
   workos?: WorkOSAuthClient;
 }
@@ -201,6 +240,13 @@ export interface WorkOSAuthClient {
   };
 }
 
+declare module "fastify" {
+  interface FastifyRequest {
+    /** Set by the `authenticate` route hook on routes that use it. */
+    account: Account | null;
+  }
+}
+
 /** AppDeps plus the app logger, so helpers can report background failures. */
 interface Ctx extends AppDeps {
   log: FastifyBaseLogger;
@@ -215,12 +261,13 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
           serializers: {
             req: (req: FastifyRequest) => ({
               method: req.method,
-              url: redactQuerySecrets(req.url),
+              url: redactRequestUrl(req.url),
               host: req.host,
               remoteAddress: req.ip,
               remotePort: req.socket?.remotePort,
             }),
           },
+          ...(deps.logStream ? { stream: deps.logStream } : {}),
         }
       : false,
     // The router answers malformed URLs before any hook runs. Keep Fastify's
@@ -248,9 +295,28 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   });
 
   const ctx: Ctx = { ...deps, log: app.log };
+  const apiOrigin = new URL(deps.config.publicBaseUrl).origin;
   const workos = deps.workos ?? createWorkOSAuthClient(deps.config);
 
   app.register(fastifyCookie);
+  app.decorateRequest("clientIp", "");
+  app.decorateRequest("account", null);
+  const clientIpHeader = deps.config.trustForwarded ? deps.config.clientIpHeader : null;
+  if (clientIpHeader !== null) {
+    app.addHook("onRequest", async (req) => {
+      const ip = clientIpFromHeader(req, clientIpHeader);
+      if (ip !== null) req.clientIp = ip;
+    });
+  }
+  // Fastify's default 404 logs "Route <method>:<url> not found" with the raw
+  // URL, which for a mistyped claim link is the claim token.
+  app.setNotFoundHandler((_req, reply) =>
+    reply.status(404).send({ error: { code: "not_found", message: "route not found" } }),
+  );
+  // Publish bodies run to ~70 MB of JSON, so authenticate before parsing one.
+  const authenticate = async (req: FastifyRequest): Promise<void> => {
+    req.account = requireAccount(deps.db, req);
+  };
   app.addContentTypeParser(
     "application/x-www-form-urlencoded",
     { parseAs: "string" },
@@ -404,10 +470,10 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       "Binary files use `contentBase64`. Response includes `url` like `" + siteUrl(deps.config, "<id>") + "`.",
       "",
       "## Update",
-      "`PUT /api/v1/sites/:id` with the same body shape (new version).",
+      "`PUT /api/v1/sites/:id` with the same body shape (new version). Without `ttl` it keeps the current expiry; pass `ttl` or call touch to extend it. Expired sites cannot be republished.",
       "",
       "## Keep-alive (touch)",
-      "`POST /api/v1/sites/:id/touch` resets TTL to the tier maximum (30d on free--).",
+      "`POST /api/v1/sites/:id/touch` resets TTL to the tier maximum (30d on free--). Tiers without a maximum (paid, ops) extend to the default TTL or one year, whichever applies, and never shorten an expiry.",
       "",
       "## List / delete",
       "- `GET /api/v1/sites`",
@@ -501,6 +567,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
           "Account claiming is not configured on this server.",
         );
       }
+      if (!deps.config.siteHostSuffix) return claimNeedsSiteHostsPage(reply);
       const { token } = req.params as { token: string };
       if (!CLAIM_TOKEN_RE.test(token)) {
         return invalidClaimPage(reply);
@@ -525,6 +592,19 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
           503,
           "Claiming unavailable",
           "Account claiming is not configured on this server.",
+        );
+      }
+      // The confirmation cookie is SameSite=Strict, but uploaded HTML on the
+      // API's own origin (path serving) or a sibling site host (same site)
+      // still sends it. Only the confirmation page itself may start sign-in,
+      // so require isolated site hosts and the API origin on the POST.
+      if (!deps.config.siteHostSuffix) return claimNeedsSiteHostsPage(reply);
+      if (req.headers.origin !== apiOrigin) {
+        return authPage(
+          reply,
+          403,
+          "Confirmation required",
+          "Open the claim link and confirm on that page before signing in.",
         );
       }
       const { token } = req.params as { token: string };
@@ -736,22 +816,22 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   });
 
   // --- Sites API ---
-  app.post("/api/v1/sites", async (req, reply) => {
-    const account = requireAccount(deps.db, req);
+  app.post("/api/v1/sites", { onRequest: authenticate }, async (req, reply) => {
+    const account = req.account!;
     const body = createSiteSchema.parse(req.body);
     const site = await publishNewSite(ctx, account, body, req);
     return reply.status(201).send(site);
   });
 
-  app.put("/api/v1/sites/:id", async (req, reply) => {
-    const account = requireAccount(deps.db, req);
+  app.put("/api/v1/sites/:id", { onRequest: authenticate }, async (req, reply) => {
+    const account = req.account!;
     const { id } = req.params as { id: string };
     const body = updateSiteSchema.parse(req.body);
-    const existing = getSite(deps.db, id);
-    if (!existing || existing.owner_user_id !== account.user.id) {
-      return reply.status(404).send({
-        error: { code: "not_found", message: "site not found" },
-      });
+    const existing = ownSite(deps.db, id, account.user.id);
+    // Same rule as touch: an expired site is gone, and the sweeper may already
+    // be deleting it, so a republish must not spend quota or revive it.
+    if (isExpired(existing)) {
+      throw new HttpError(410, "site_expired", "site expired");
     }
     const site = await publishVersion(ctx, existing, account, body, req);
     return reply.send(site);
@@ -760,27 +840,14 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   app.post("/api/v1/sites/:id/touch", async (req, reply) => {
     const account = requireAccount(deps.db, req);
     const { id } = req.params as { id: string };
-    const existing = getSite(deps.db, id);
-    if (!existing || existing.owner_user_id !== account.user.id) {
-      return reply.status(404).send({
-        error: { code: "not_found", message: "site not found" },
-      });
-    }
+    const existing = ownSite(deps.db, id, account.user.id);
     if (isExpired(existing)) {
       throw new HttpError(410, "site_expired", "site expired");
     }
     consumePublishQuota(ctx, req, account);
     const policy = policyForTier(account.tier, ctx.config);
     const now = Date.now();
-    let expiresAt: number | null;
-    if (existing.expires_at === null && policy.allowNullTtl) {
-      expiresAt = null;
-    } else if (policy.maxTtl === null) {
-      expiresAt = existing.expires_at;
-    } else {
-      expiresAt = resolveTierExpiry(policy, policy.maxTtl, now, "explicit");
-    }
-    updateSiteExpiry(deps.db, id, expiresAt, now);
+    updateSiteExpiry(deps.db, id, touchExpiry(policy, existing.expires_at, now), now);
     applyStoredTierLimits(deps.db, existing, policy);
     const row = getSite(deps.db, id)!;
     return reply.send(toSiteResponse(deps.config, deps.db, row));
@@ -796,26 +863,23 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   app.get("/api/v1/sites/:id", async (req, reply) => {
     const { user } = requireAccount(deps.db, req);
     const { id } = req.params as { id: string };
-    const row = getSite(deps.db, id);
-    if (!row || row.owner_user_id !== user.id) {
-      return reply.status(404).send({
-        error: { code: "not_found", message: "site not found" },
-      });
-    }
+    const row = ownSite(deps.db, id, user.id);
     return reply.send(toSiteResponse(deps.config, deps.db, row));
   });
 
   app.delete("/api/v1/sites/:id", async (req, reply) => {
     const { user } = requireAccount(deps.db, req);
     const { id } = req.params as { id: string };
-    const row = getSite(deps.db, id);
-    if (!row || row.owner_user_id !== user.id) {
-      return reply.status(404).send({
-        error: { code: "not_found", message: "site not found" },
-      });
+    ownSite(deps.db, id, user.id);
+    // Marked first, so a publish still uploading cannot land on the row while
+    // its objects go, and so the sweeper finishes the job if this one fails.
+    markSiteDeleting(deps.db, id, Date.now());
+    try {
+      await deleteSiteObjects(deps.s3, deps.config.s3.bucket, id);
+      deleteSite(deps.db, id);
+    } catch (err) {
+      app.log.warn({ err, siteId: id }, "site delete left for the sweeper to finish");
     }
-    await deleteSiteObjects(deps.s3, deps.config.s3.bucket, id);
-    deleteSite(deps.db, id);
     return reply.status(204).send();
   });
 
@@ -871,7 +935,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     const params = req.params as { id: string; "*"?: string };
     // Params arrive decoded, so anything that goes back into a URL is
     // re-encoded per segment rather than pasted in as text.
-    const rest = (params["*"] ?? "").split("/").map(encodeURIComponent).join("/");
+    const rest = encodeSitePathForUrl(params["*"] ?? "");
     const { query } = splitQuery(req.url);
     if (suffix === null) {
       if (bare) {
@@ -935,6 +999,15 @@ function createWorkOSAuthClient(config: Config): WorkOSAuthClient | null {
       },
     },
   };
+}
+
+function claimNeedsSiteHostsPage(reply: FastifyReply): FastifyReply {
+  return authPage(
+    reply,
+    503,
+    "Claiming unavailable",
+    "Account claiming needs isolated site hosts (SHAREPLAN_SITE_HOST_SUFFIX) on this server.",
+  );
 }
 
 function invalidClaimPage(reply: FastifyReply): FastifyReply {
@@ -1115,19 +1188,18 @@ function policyForTier(tier: Tier, config: Config): TierPolicy {
  */
 function consumePublishQuota(ctx: Ctx, req: FastifyRequest, account: Account): void {
   const policy = policyForTier(account.tier, ctx.config);
+  const pepper = ctx.config.ipHashPepper;
   if (policy.ipPublishLimit) {
-    const pepper = ctx.config.ipHashPepper;
-    if (!pepper) {
-      throw new AuthError(
-        503,
-        "rate_limit_unconfigured",
-        "SHAREPLAN_IP_HASH_PEPPER is not set",
-      );
-    }
-    const ip = requestIp(req);
-    const ipBucket = `ip:${hashIp(ip, pepper)}`;
-    if (!consumeRate(ctx.db, ipBucket, "publish", policy.publishPerHour)) {
-      throw new HttpError(429, "rate_limited", "too many publishes from this address");
+    if (pepper) {
+      const ipBucket = `ip:${hashIp(requestIp(req), pepper)}`;
+      if (!consumeRate(ctx.db, ipBucket, "publish", policy.publishPerHour)) {
+        throw new HttpError(429, "rate_limited", "too many publishes from this address");
+      }
+    } else if (account.org === null) {
+      // Without a pepper the only free-- accounts left are organization
+      // members (open registration is off); their join token, not their
+      // address, admitted them, and their user and org buckets still apply.
+      throw new AuthError(503, "rate_limit_unconfigured", "SHAREPLAN_IP_HASH_PEPPER is not set");
     }
   }
   const userBucket = `user:${account.user.id}`;
@@ -1171,91 +1243,124 @@ function applyStoredTierLimits(
   }
 }
 
+interface PreparedPublish {
+  policy: TierPolicy;
+  files: PreparedFile[];
+  byte_size: number;
+  file_count: number;
+}
+
+/** The checks and file prep both publish paths share; spends no quota. */
+function preparePublish(
+  ctx: Ctx,
+  account: Account,
+  body: { slug?: string; visibility?: Visibility; files: SiteFileInput[] },
+): PreparedPublish {
+  assertTierPublish(account.tier, body);
+  const files = ensureIndexHtml(prepareFiles(body.files, ctx.config));
+  return {
+    policy: policyForTier(account.tier, ctx.config),
+    files,
+    byte_size: files.reduce((n, f) => n + f.body.byteLength, 0),
+    file_count: files.length,
+  };
+}
+
+/** A requested visibility the tier may not list falls back to unlisted. */
+function allowedVisibility(visibility: StoredVisibility, policy: TierPolicy): StoredVisibility {
+  return visibility === "public" && !policy.publicVisibility ? "unlisted" : visibility;
+}
+
 async function publishNewSite(
   ctx: Ctx,
   account: Account,
   body: z.infer<typeof createSiteSchema>,
   req: FastifyRequest,
 ): Promise<SiteResponse> {
+  // Everything that can reject the request runs before any bucket is spent.
   const orgLink = body.visibility === "org" ? orgVisibilityLink(ctx, account, body) : null;
-  assertTierPublish(account.tier, body);
-  consumePublishQuota(ctx, req, account);
-  const policy = policyForTier(account.tier, ctx.config);
-  let files = prepareFiles(body.files, ctx.config);
-  files = ensureIndexHtml(files);
-
+  const { policy, files, byte_size, file_count } = preparePublish(ctx, account, body);
   const siteId = createSiteId();
   const versionId = createVersionId();
   const now = Date.now();
   // org is stored as private plus an audience, so anything that misses the
   // audience (an older binary, a later relink) serves it owner-only.
-  const visibility: StoredVisibility =
+  const requested: StoredVisibility =
     body.visibility === undefined ? "unlisted" : body.visibility === "org" ? "private" : body.visibility;
-  const audience: SiteAudience | null =
-    orgLink === null ? null : { ...orgLink, versionId };
-  const expires_at = resolveTierExpiry(policy, body.ttl, now, "create");
-
+  const audience: SiteAudience | null = orgLink === null ? null : { ...orgLink, versionId };
+  const expiresAt = resolveTierExpiry(policy, body.ttl, now, "create");
   if (body.slug !== undefined) {
     assertSlugAvailable(ctx, body.slug);
   }
+  consumePublishQuota(ctx, req, account);
 
-  const byte_size = files.reduce((n, f) => n + f.body.byteLength, 0);
-  const file_count = files.length;
-
-  await putSiteFiles(ctx.s3, ctx.config.s3.bucket, siteId, versionId, files);
-
-  // Race rule for an org create: the owner may have been detached, or the org
-  // relinked, while the files uploaded. Re-check in the transaction that
-  // writes the rows, and write no audience the owner no longer has.
-  const committed = transaction(ctx.db, () => {
-    if (orgLink !== null) {
-      const owner = getUser(ctx.db, account.user.id);
-      const org = getOrg(ctx.db, orgLink.orgId);
-      if (
-        owner === null ||
-        owner.org_id !== orgLink.orgId ||
-        org === null ||
-        org.workos_organization_id !== orgLink.workosOrgId
-      ) {
-        return false;
+  // No row points at these objects until the insert below, so any failure from
+  // here on has to remove them itself; the upload record covers a removal that
+  // fails too.
+  const prefix = s3SitePrefix(siteId);
+  beginUpload(ctx.db, prefix);
+  try {
+    await putSiteFiles(ctx.s3, ctx.config.s3.bucket, siteId, versionId, files);
+    // Nothing awaits from here to the insert, so the checks and writes land as
+    // one step. Both are redone against the current state: another publish may
+    // have taken the slug, or an org downgrade lowered the tier, mid-upload.
+    const limits = currentPolicy(ctx, account);
+    const slug = body.slug !== undefined && limits.slugs ? body.slug : null;
+    if (slug !== null) assertSlugAvailable(ctx, slug);
+    // Race rule for an org create: the owner may have been detached, or the org
+    // relinked, while the files uploaded. Write no audience the owner no longer has.
+    const committed = transaction(ctx.db, () => {
+      if (orgLink !== null) {
+        const owner = getUser(ctx.db, account.user.id);
+        const org = getOrg(ctx.db, orgLink.orgId);
+        if (
+          owner === null ||
+          owner.org_id !== orgLink.orgId ||
+          org === null ||
+          org.workos_organization_id !== orgLink.workosOrgId
+        ) {
+          return false;
+        }
       }
+      commitUpload(ctx, prefix);
+      insertSite(ctx.db, {
+        id: siteId,
+        owner_key_id: account.key.id,
+        owner_user_id: account.user.id,
+        slug,
+        title: body.title ?? null,
+        visibility: allowedVisibility(requested, limits),
+        current_version_id: versionId,
+        created_at: now,
+        updated_at: now,
+        expires_at: clampStoredExpiry(limits, expiresAt, now),
+        byte_size,
+        file_count,
+        audience,
+      });
+      insertVersion(ctx.db, {
+        id: versionId,
+        site_id: siteId,
+        created_at: now,
+        byte_size,
+        file_count,
+        note: body.note ?? null,
+      });
+      return true;
+    });
+    if (!committed) {
+      throw new HttpError(
+        409,
+        "site_changed",
+        "the organization changed while this site uploaded; nothing was published, try again",
+      );
     }
-    insertSite(ctx.db, {
-      id: siteId,
-      owner_key_id: account.key.id,
-      owner_user_id: account.user.id,
-      slug: body.slug ?? null,
-      title: body.title ?? null,
-      visibility,
-      current_version_id: versionId,
-      created_at: now,
-      updated_at: now,
-      expires_at,
-      byte_size,
-      file_count,
-      audience,
-    });
-    insertVersion(ctx.db, {
-      id: versionId,
-      site_id: siteId,
-      created_at: now,
-      byte_size,
-      file_count,
-      note: body.note ?? null,
-    });
-    return true;
-  });
-  if (!committed) {
-    await discardVersionObjects(ctx, siteId, versionId);
-    throw new HttpError(
-      409,
-      "site_changed",
-      "the organization changed while this site uploaded; nothing was published, try again",
-    );
+  } catch (err) {
+    await discardUpload(ctx, prefix);
+    throw err;
   }
 
-  const row = getSite(ctx.db, siteId)!;
-  return toSiteResponse(ctx.config, ctx.db, row);
+  return toSiteResponse(ctx.config, ctx.db, getSite(ctx.db, siteId)!);
 }
 
 /**
@@ -1315,21 +1420,15 @@ async function publishVersion(
   // Omitted or "org" keeps an org site org, if its audience is still honoured
   // when the version lands; any other explicit visibility clears the audience.
   const keepOrg = wasOrg && (body.visibility === undefined || body.visibility === "org");
-  assertTierPublish(account.tier, body);
-  consumePublishQuota(ctx, req, account);
-  const policy = policyForTier(account.tier, ctx.config);
-  let files = prepareFiles(body.files, ctx.config);
-  files = ensureIndexHtml(files);
-
+  // Everything that can reject the request runs before any bucket is spent.
+  const { policy, files, byte_size, file_count } = preparePublish(ctx, account, body);
   const versionId = createVersionId();
   const now = Date.now();
 
   // An explicit ttl always wins (including `null` to clear it, if the tier
-  // allows). Otherwise keep the stored expiry if this tier still allows it.
-  const expires_at =
-    body.ttl !== undefined
-      ? resolveTierExpiry(policy, body.ttl, now, "explicit")
-      : clampStoredExpiry(policy, existing.expires_at, now);
+  // allows). Otherwise the stored expiry is kept, re-clamped below.
+  const explicitExpiry =
+    body.ttl !== undefined ? resolveTierExpiry(policy, body.ttl, now, "explicit") : undefined;
 
   // Checked up front so a taken slug fails before we upload anything, but only
   // written once the upload lands — a failed publish must not move the slug.
@@ -1338,102 +1437,112 @@ async function publishVersion(
   if (newSlug !== null) {
     assertSlugAvailable(ctx, newSlug, existing.id);
   }
-  const dropSlug = !policy.slugs && existing.slug !== null;
-
-  const byte_size = files.reduce((n, f) => n + f.body.byteLength, 0);
-  const file_count = files.length;
-  let visibility: StoredVisibility =
+  consumePublishQuota(ctx, req, account);
+  const requested: StoredVisibility =
     keepOrg || body.visibility === undefined || body.visibility === "org"
       ? existing.visibility
       : body.visibility;
-  if (visibility === "public" && !policy.publicVisibility) {
-    visibility = "unlisted";
-  }
-  const versionFields = {
-    current_version_id: versionId,
-    updated_at: now,
-    expires_at,
-    byte_size,
-    file_count,
-    title: body.title ?? undefined,
-  };
-  const versionRow = {
-    id: versionId,
-    site_id: existing.id,
-    created_at: now,
-    byte_size,
-    file_count,
-    note: body.note ?? null,
-  };
 
-  await putSiteFiles(ctx.s3, ctx.config.s3.bucket, existing.id, versionId, files);
+  // This version has no site_versions row until the writes below, so pruning
+  // can never reach its objects: any failure from here on discards them, and
+  // the upload record covers a discard that fails too.
+  const prefix = s3VersionPrefix(existing.id, versionId);
+  beginUpload(ctx.db, prefix);
+  try {
+    await putSiteFiles(ctx.s3, ctx.config.s3.bucket, existing.id, versionId, files);
 
-  if (wasOrg) {
-    // Race rule, for republishes that involve org: decide from the row as it
-    // is now, in one transaction, and refuse if anything moved during the
-    // upload. Otherwise a slower publish could undo a concurrent public or
-    // private publish, or keep an audience a relink just cancelled.
+    // Re-read after the upload, not just before it. While we awaited S3 the
+    // site may have been deleted (or the sweeper may have started on it), it
+    // may have expired, another publish may have claimed the slug, or the
+    // owner's tier may have dropped. Nothing awaits between these checks and
+    // the writes, so they land as one step; sites.slug is UNIQUE, so writing
+    // blind would surface a slug race as a 500 instead of a 409.
+    const current = ownSite(ctx.db, existing.id, account.user.id);
+    if (isExpired(current)) {
+      throw new HttpError(410, "site_expired", "site expired");
+    }
+    const limits = currentPolicy(ctx, account);
+    let slug: string | null = limits.slugs ? current.slug : null;
+    if (newSlug !== null && limits.slugs) {
+      assertSlugAvailable(ctx, newSlug, current.id);
+      slug = newSlug;
+    }
+    const expires_at = clampStoredExpiry(
+      limits,
+      explicitExpiry !== undefined ? explicitExpiry : current.expires_at,
+      now,
+    );
+    const visibility = allowedVisibility(requested, limits);
+
     const committed = transaction(ctx.db, () => {
-      const current = getSite(ctx.db, existing.id);
-      if (
-        current === null ||
-        current.current_version_id !== existing.current_version_id ||
-        !sameAudienceColumns(current, existing)
-      ) {
-        return false;
+      let audience: SiteAudience | null = null;
+      if (wasOrg) {
+        // Race rule for org republishes: refuse if anything moved during the
+        // upload. Otherwise a slower publish could undo a concurrent public or
+        // private publish, or keep an audience a relink just cancelled.
+        if (
+          current.current_version_id !== existing.current_version_id ||
+          !sameAudienceColumns(current, existing)
+        ) {
+          return false;
+        }
+        // Never rebinds: an audience survives only with the link it was set for.
+        const still = honouredAudience(ctx.db, current);
+        if (still === null) return false;
+        audience = keepOrg ? { ...still, versionId } : null;
       }
-      // Never rebinds: an audience survives only with the link it was set for.
-      const still = honouredAudience(ctx.db, current);
-      if (still === null) return false;
-      const audience = keepOrg ? { ...still, versionId } : null;
-      if (dropSlug) updateSiteSlug(ctx.db, existing.id, null);
-      updateSiteVersion(ctx.db, existing.id, {
-        ...versionFields,
+      commitUpload(ctx, prefix);
+      if (slug !== current.slug) updateSiteSlug(ctx.db, current.id, slug);
+      // A plain site is last writer wins, and any stale audience goes.
+      updateSiteVersion(ctx.db, current.id, {
+        current_version_id: versionId,
+        updated_at: now,
+        expires_at,
+        byte_size,
+        file_count,
+        title: body.title ?? undefined,
         visibility: keepOrg ? "private" : visibility,
         audience,
       });
-      insertVersion(ctx.db, versionRow);
+      insertVersion(ctx.db, {
+        id: versionId,
+        site_id: current.id,
+        created_at: now,
+        byte_size,
+        file_count,
+        note: body.note ?? null,
+      });
       return true;
     });
     if (!committed) {
-      await discardVersionObjects(ctx, existing.id, versionId);
       throw new HttpError(
         409,
         "site_changed",
         "the site changed while this version uploaded; nothing was published, try again",
       );
     }
-    await pruneOldVersions(ctx, existing.id);
-    return toSiteResponse(ctx.config, ctx.db, getSite(ctx.db, existing.id)!);
+  } catch (err) {
+    await discardUpload(ctx, prefix);
+    throw err;
   }
-
-  if (newSlug !== null) {
-    // Re-checked after the upload, not just before it: another publish can claim
-    // the slug while we await S3, and sites.slug is UNIQUE, so writing blind
-    // would surface the race as a 500 instead of a 409. Nothing awaits between
-    // this check and the writes below, so they land as one step.
-    try {
-      assertSlugAvailable(ctx, newSlug, existing.id);
-    } catch (err) {
-      await discardVersionObjects(ctx, existing.id, versionId);
-      throw err;
-    }
-    updateSiteSlug(ctx.db, existing.id, newSlug);
-  } else if (dropSlug) {
-    updateSiteSlug(ctx.db, existing.id, null);
-  }
-  // Not an org site, so last writer wins as before; any stale audience goes.
-  updateSiteVersion(ctx.db, existing.id, { ...versionFields, visibility, audience: null });
-  insertVersion(ctx.db, versionRow);
 
   await pruneOldVersions(ctx, existing.id);
-
-  const row = getSite(ctx.db, existing.id)!;
-  return toSiteResponse(ctx.config, ctx.db, row);
+  return toSiteResponse(ctx.config, ctx.db, getSite(ctx.db, existing.id)!);
 }
 
 /**
- * Slugs share a namespace with site ids, so both must be free. A slug is also
+ * The policy for the account's tier as it stands now. A publish resolves its
+ * account before a long upload; an org downgrade or detach can land meanwhile,
+ * and the bulk clamp only sees rows that already exist.
+ */
+function currentPolicy(ctx: Ctx, account: Account): TierPolicy {
+  return policyForTier(resolveUser(ctx.db, account.user.id).tier, ctx.config);
+}
+
+/**
+ * Slugs share a namespace with site ids, so both must be free, including the
+ * ids of deleted sites: their links live on in chats and in visitors' browser
+ * storage, and a slug that took one over would inherit both. A slug is also
  * a DNS label under hostname serving, so reserved labels stay off limits in
  * every mode: a site claimed as "www" under path serving would break the
  * moment a suffix was configured.
@@ -1442,33 +1551,39 @@ function assertSlugAvailable(ctx: Ctx, slug: string, exceptSiteId?: string): voi
   if (RESERVED_HOST_LABELS.has(slug)) {
     throw new HttpError(409, "slug_taken", `slug "${slug}" is reserved`);
   }
-  const bySlug = getSiteBySlug(ctx.db, slug);
+  // Rows mid-delete still hold their slug and id until the row is really gone.
+  const bySlug = getSiteBySlug(ctx.db, slug, true);
   if (bySlug && bySlug.id !== exceptSiteId) {
     throw new HttpError(409, "slug_taken", `slug "${slug}" is already in use`);
   }
-  if (getSite(ctx.db, slug)) {
+  if (getSite(ctx.db, slug, true) || isRetiredSiteId(ctx.db, slug)) {
     throw new HttpError(409, "slug_taken", `slug "${slug}" collides with a site id`);
   }
 }
 
 /**
- * Drop the objects of a version that will never be recorded. No site_versions
- * row means pruning can never reach them, so a publish that dies after its
- * upload has to clean up after itself. Failing to is logged, not fatal — the
- * caller is already on its way to reporting a more useful error.
+ * Inside the commit transaction: drop the upload's record. If the sweeper has
+ * already taken it as abandoned, its objects are going, so the publish fails.
  */
-async function discardVersionObjects(
-  ctx: Ctx,
-  siteId: string,
-  versionId: string,
-): Promise<void> {
+function commitUpload(ctx: Ctx, prefix: string): void {
+  if (!endUpload(ctx.db, prefix)) {
+    throw new HttpError(503, "upload_abandoned", "the upload took too long; publish again");
+  }
+}
+
+/**
+ * Drop the objects of a publish that will never be recorded: a whole new site,
+ * or one version. With no row pointing at them, pruning and site deletes never
+ * reach them, so a publish that dies after (or during) its upload cleans up
+ * after itself. If that fails too, the upload record stays and the sweeper
+ * retries once it counts as abandoned; the caller still reports its own error.
+ */
+async function discardUpload(ctx: Ctx, prefix: string): Promise<void> {
   try {
-    await deleteVersionObjects(ctx.s3, ctx.config.s3.bucket, siteId, versionId);
+    await deletePrefix(ctx.s3, ctx.config.s3.bucket, prefix);
+    endUpload(ctx.db, prefix);
   } catch (err) {
-    ctx.log.warn(
-      { err, siteId, versionId },
-      "failed to discard objects of an abandoned version",
-    );
+    ctx.log.warn({ err, prefix }, "failed to discard an abandoned publish; the sweeper will retry");
   }
 }
 
@@ -1492,6 +1607,24 @@ async function pruneOldVersions(ctx: Ctx, siteId: string): Promise<void> {
   }
 }
 
+/** "" or a trailing slash: the URL names a directory, served by its index. */
+function isDirectoryRequest(relPath: string): boolean {
+  const path = relPath.replace(/^\/+/, "");
+  return path === "" || path.endsWith("/");
+}
+
+/**
+ * The caller's own site, or a 404. getSite leaves out a site whose delete has
+ * started, so nothing can read, republish, or touch it mid-delete.
+ */
+function ownSite(db: Ctx["db"], id: string, userId: string): SiteRow {
+  const row = getSite(db, id);
+  if (!row || row.owner_user_id !== userId) {
+    throw new HttpError(404, "not_found", "site not found");
+  }
+  return row;
+}
+
 /**
  * Resolve a requested path with the same sanitizer that builds S3 keys, so
  * anything the sanitizer rejects (drive letters, backslashes, null bytes,
@@ -1502,7 +1635,7 @@ async function pruneOldVersions(ctx: Ctx, siteId: string): Promise<void> {
  */
 function normalizeServePath(relPath: string): string | null {
   let path = relPath.replace(/^\/+/, "");
-  if (path === "" || path.endsWith("/")) {
+  if (isDirectoryRequest(path)) {
     path = `${path}index.html`;
   }
   try {
@@ -1569,32 +1702,42 @@ async function serveSitePath(
     }
   }
 
-  const path = normalizeServePath(relPath);
-  if (path === null) {
+  const requested = normalizeServePath(relPath);
+  if (requested === null) {
     await reply.status(400).send({ error: { code: "invalid_path", message: "invalid path" } });
     return;
   }
+  const bucket = ctx.config.s3.bucket;
+  const versionId = site.current_version_id;
+  const keyFor = (p: string) => s3ObjectKey(site.id, versionId, p);
 
-  const key = s3ObjectKey(site.id, site.current_version_id, path);
-  const obj = await getObject(ctx.s3, ctx.config.s3.bucket, key);
-
-  // A directory hit has to bounce to the trailing-slash URL rather than serve
-  // the index here: at /s/:id/docs the browser resolves "./style.css" against
-  // /s/:id/, one level too high. Redirect off the request URL so vanity slugs
-  // and the query string survive, and keep it temporary — a later version may
-  // publish a real file at this path.
-  if (!obj && !path.endsWith("index.html")) {
+  let path = requested;
+  let obj = await getObject(ctx.s3, bucket, keyFor(path));
+  if (!obj && isDirectoryRequest(relPath)) {
+    // A directory URL also serves index.htm, which uploads accept as an index.
+    path = path.slice(0, -1);
+    obj = await getObject(ctx.s3, bucket, keyFor(path));
+  } else if (!obj && !path.endsWith("index.html")) {
+    // A directory hit has to bounce to the trailing-slash URL rather than serve
+    // the index here: at /s/:id/docs the browser resolves "./style.css" against
+    // /s/:id/, one level too high. Redirect off the request URL so vanity slugs
+    // and the query string survive, and keep it temporary — a later version may
+    // publish a real file at this path. Existence only, so HEAD, both at once.
     const indexPath = normalizeServePath(`${path}/index.html`);
-    if (indexPath !== null) {
-      const idxKey = s3ObjectKey(site.id, site.current_version_id, indexPath);
-      if (await getObject(ctx.s3, ctx.config.s3.bucket, idxKey)) {
-        const { path: reqPath, query } = splitQuery(req.url);
-        setSiteHeaders(reply, site);
-        // Collapse leading slashes so "//host" can never become a
-        // scheme-relative Location; the redirect stays on this origin.
-        await reply.redirect(`${reqPath.replace(/^\/+/, "/")}/${query}`, 302);
-        return;
-      }
+    const found =
+      indexPath !== null &&
+      (
+        await Promise.all(
+          [indexPath, indexPath.slice(0, -1)].map((p) => objectExists(ctx.s3, bucket, keyFor(p))),
+        )
+      ).some(Boolean);
+    if (found) {
+      const { path: reqPath, query } = splitQuery(req.url);
+      setSiteHeaders(reply, site);
+      // Collapse leading slashes so "//host" can never become a
+      // scheme-relative Location; the redirect stays on this origin.
+      await reply.redirect(`${reqPath.replace(/^\/+/, "/")}/${query}`, 302);
+      return;
     }
   }
 

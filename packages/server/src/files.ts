@@ -1,5 +1,7 @@
 import {
   PathError,
+  encodeSitePathForUrl,
+  escapeHtml,
   isAllowedUploadPath,
   sanitizeSitePath,
   type SiteFileInput,
@@ -98,11 +100,14 @@ export function ensureIndexHtml(files: PreparedFile[]): PreparedFile[] {
       return [{ path: "index.html", body: only.body }];
     }
     const isImage = /\.(png|jpe?g|gif|webp|avif|svg)$/i.test(only.path);
+    // The name goes into a URL, so it is percent-encoded per segment first:
+    // "#", "?", "%" or a space would otherwise point the page at another file.
+    const href = escapeHtml(encodeSitePathForUrl(only.path));
     let body: string;
     if (isImage) {
-      body = `<!doctype html><meta charset="utf-8"><title>${escapeHtml(only.path)}</title><style>body{margin:0;background:#111;display:grid;place-items:center;min-height:100vh}img{max-width:100%;max-height:100vh}</style><img src="${escapeAttr(only.path)}" alt="">`;
+      body = `<!doctype html><meta charset="utf-8"><title>${escapeHtml(only.path)}</title><style>body{margin:0;background:#111;display:grid;place-items:center;min-height:100vh}img{max-width:100%;max-height:100vh}</style><img src="${href}" alt="">`;
     } else {
-      body = `<!doctype html><meta charset="utf-8"><title>${escapeHtml(only.path)}</title><style>body{font-family:system-ui;max-width:40rem;margin:2rem auto;padding:0 1rem}</style><p><a href="${escapeAttr(only.path)}">Download ${escapeHtml(only.path)}</a></p>`;
+      body = `<!doctype html><meta charset="utf-8"><title>${escapeHtml(only.path)}</title><style>body{font-family:system-ui;max-width:40rem;margin:2rem auto;padding:0 1rem}</style><p><a href="${href}">Download ${escapeHtml(only.path)}</a></p>`;
     }
     return [only, { path: "index.html", body: Buffer.from(body, "utf8") }];
   }
@@ -130,17 +135,6 @@ function decodeBase64(value: string, path: string): Buffer {
   return Buffer.from(unpadded, "base64");
 }
 
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
-function escapeAttr(s: string): string {
-  return escapeHtml(s).replace(/'/g, "&#39;");
-}
 
 export class FileError extends Error {
   override readonly name = "FileError";

@@ -1,6 +1,6 @@
 import { mkdirSync } from "node:fs";
 import path from "node:path";
-import { isHostLabel, siteLabelFromHost } from "@shareplan/core";
+import { isHostLabel, parseTtl, siteLabelFromHost } from "@shareplan/core";
 import { hashApiKey } from "./db.js";
 
 export const WORKOS_CALLBACK_PATH = "/v1/auth/workos/callback";
@@ -22,8 +22,12 @@ export interface Config {
     endpoint?: string;
     region: string;
     bucket: string;
-    accessKeyId: string;
-    secretAccessKey: string;
+    /**
+     * Static keys from SHAREPLAN_S3_ACCESS_KEY / SHAREPLAN_S3_SECRET_KEY.
+     * Unset leaves credentials to the AWS SDK's default chain (AWS_* env vars
+     * including AWS_SESSION_TOKEN, profiles, and instance or task roles).
+     */
+    credentials?: { accessKeyId: string; secretAccessKey: string };
     forcePathStyle: boolean;
   };
   maxSiteBytes: number;
@@ -31,10 +35,20 @@ export interface Config {
   defaultTtl: string | null;
   /** SHA-256 hex of SHAREPLAN_ADMIN_TOKEN; null if unset. */
   adminTokenHash: string | null;
-  /** HMAC pepper for client IP buckets. Null disables register / free-- IP limits. */
+  /**
+   * HMAC pepper for client IP buckets. Null turns open registration off (it
+   * answers 503 unless the request carries an organization join token) and
+   * drops the per-IP publish limit for organization members, who are then held
+   * by their own and their organization's buckets.
+   */
   ipHashPepper: string | null;
-  /** Trust CF-Connecting-IP / X-Forwarded-For. Off unless behind a known proxy. */
+  /** Trust one proxy hop of X-Forwarded-For. Off unless behind a known proxy. */
   trustForwarded: boolean;
+  /**
+   * A header that carries the client address, such as cf-connecting-ip behind
+   * Cloudflare. Read only when trustForwarded is on. Lowercase; null if unset.
+   */
+  clientIpHeader: string | null;
   registerPerDay: number;
   /** Org-token registers and org-admin key mints per organization per day. */
   orgRegisterPerDay: number;
@@ -95,11 +109,23 @@ export function loadConfig(envSource: NodeJS.ProcessEnv = process.env): Config {
     publicBaseUrl,
   );
 
-  const accessKeyId = env("SHAREPLAN_S3_ACCESS_KEY", env("AWS_ACCESS_KEY_ID", "minioadmin"))!;
-  const secretAccessKey = env(
-    "SHAREPLAN_S3_SECRET_KEY",
-    env("AWS_SECRET_ACCESS_KEY", "minioadmin"),
-  )!;
+  const trustForwarded = envBool("SHAREPLAN_TRUST_FORWARDED", false);
+  const clientIpHeader = normalizeClientIpHeader(env("SHAREPLAN_CLIENT_IP_HEADER"));
+  if (clientIpHeader !== null && !trustForwarded) {
+    // Read only behind a trusted proxy; ignoring it silently would leave the
+    // limits keyed on the proxy while the operator thinks they are per client.
+    throw new Error("SHAREPLAN_CLIENT_IP_HEADER needs SHAREPLAN_TRUST_FORWARDED=true");
+  }
+  const credentials = s3Credentials(env("SHAREPLAN_S3_ACCESS_KEY"), env("SHAREPLAN_S3_SECRET_KEY"));
+  const defaultTtl = env("SHAREPLAN_DEFAULT_TTL") ?? null;
+  if (defaultTtl !== null) {
+    // Checked here so a typo fails at startup, not as a 500 on every publish.
+    try {
+      parseTtl(defaultTtl);
+    } catch {
+      throw new Error(`SHAREPLAN_DEFAULT_TTL must be a duration like 7d or 12h, got "${defaultTtl}"`);
+    }
+  }
 
   return {
     host,
@@ -112,22 +138,51 @@ export function loadConfig(envSource: NodeJS.ProcessEnv = process.env): Config {
       endpoint: env("SHAREPLAN_S3_ENDPOINT"),
       region: env("SHAREPLAN_S3_REGION", "auto")!,
       bucket: env("SHAREPLAN_S3_BUCKET", "shareplan")!,
-      accessKeyId,
-      secretAccessKey,
+      ...(credentials ? { credentials } : {}),
       forcePathStyle: envBool("SHAREPLAN_S3_FORCE_PATH_STYLE", true),
     },
     maxSiteBytes: envInt("SHAREPLAN_MAX_SITE_BYTES", 52_428_800),
     maxFileCount: envInt("SHAREPLAN_MAX_FILE_COUNT", 200),
-    defaultTtl: env("SHAREPLAN_DEFAULT_TTL") ?? null,
+    defaultTtl,
     adminTokenHash: adminToken ? hashApiKey(adminToken) : null,
     ipHashPepper: env("SHAREPLAN_IP_HASH_PEPPER") ?? null,
-    trustForwarded: envBool("SHAREPLAN_TRUST_FORWARDED", false),
+    trustForwarded,
+    clientIpHeader,
     registerPerDay: Math.max(1, envInt("SHAREPLAN_REGISTER_PER_DAY", 10)),
     orgRegisterPerDay: Math.max(1, envInt("SHAREPLAN_ORG_REGISTER_PER_DAY", 100)),
     versionRetention: Math.max(1, envInt("SHAREPLAN_VERSION_RETENTION", 2)),
-    reapIntervalMs: Math.max(0, envInt("SHAREPLAN_REAP_INTERVAL_SEC", 300)) * 1000,
+    // setInterval takes a signed 32-bit delay and treats anything larger as 1 ms.
+    reapIntervalMs: Math.min(
+      Math.max(0, envInt("SHAREPLAN_REAP_INTERVAL_SEC", 300)) * 1000,
+      MAX_TIMER_MS,
+    ),
     workos,
   };
+}
+
+/** Largest delay setInterval honours; longer ones fire after 1 ms. */
+const MAX_TIMER_MS = 2_147_483_647;
+
+/** Both keys or neither: half a pair is a misconfiguration, not a fallback. */
+export function s3Credentials(
+  accessKeyId: string | undefined,
+  secretAccessKey: string | undefined,
+): { accessKeyId: string; secretAccessKey: string } | undefined {
+  if (accessKeyId === undefined && secretAccessKey === undefined) return undefined;
+  if (accessKeyId === undefined || secretAccessKey === undefined) {
+    throw new Error("SHAREPLAN_S3_ACCESS_KEY and SHAREPLAN_S3_SECRET_KEY must be set together");
+  }
+  return { accessKeyId, secretAccessKey };
+}
+
+export function normalizeClientIpHeader(raw: string | undefined): string | null {
+  if (raw === undefined) return null;
+  const name = raw.trim().toLowerCase();
+  if (name === "") return null;
+  if (!/^[a-z0-9-]+$/.test(name)) {
+    throw new Error(`SHAREPLAN_CLIENT_IP_HEADER must be a header name like cf-connecting-ip, got "${raw}"`);
+  }
+  return name;
 }
 
 export function normalizeWorkOSConfig(
