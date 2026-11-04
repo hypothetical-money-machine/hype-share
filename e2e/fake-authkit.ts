@@ -14,7 +14,7 @@ export interface FakeIdentity {
   user: { id: string; email: string; emailVerified: boolean };
   authenticationMethod?: string;
   organizationId?: string;
-  impersonator?: { email: string; reason?: string };
+  impersonator?: { email: string; reason: string | null };
   accessToken: string;
 }
 
@@ -52,6 +52,7 @@ export class FakeAuthKit {
   readonly authorizationCalls: AuthorizationOptions[] = [];
   readonly authorizationParams: Record<string, string>[] = [];
   readonly authenticationCalls: AuthenticationOptions[] = [];
+  readonly logoutCalls: { sessionId: string; returnTo?: string }[] = [];
   private nextIdentity: FakeIdentity | undefined;
   private readonly authorizations = new Map<string, Authorization>();
   private readonly codes = new Map<string, Authorization>();
@@ -94,6 +95,16 @@ export class FakeAuthKit {
         }
         return structuredClone(authorization.identity);
       },
+      getLogoutUrl: (options) => {
+        this.logoutCalls.push(structuredClone(options));
+        const url = new URL("/logout", AUTHKIT_ORIGIN);
+        url.searchParams.set("session_id", options.sessionId);
+        if (options.returnTo !== undefined) url.searchParams.set("return_to", options.returnTo);
+        return url.href;
+      },
+    },
+    organizations: {
+      getOrganization: async (id) => ({ id, name: `Fake ${id}` }),
     },
   };
 
