@@ -10,3 +10,5 @@ data/
 coverage/
 .turbo/
 *.tsbuildinfo
+test-results/
+playwright-report/
