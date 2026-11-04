@@ -354,7 +354,7 @@ These settings apply to self-hosted instances. See [`.env.example`](.env.example
 | `WORKOS_CLIENT_ID` | WorkOS AuthKit client ID |
 | `WORKOS_REDIRECT_URI` | Exact AuthKit callback URL: `<SHAREPLAN_PUBLIC_BASE_URL>/v1/auth/workos/callback` |
 
-Configure AuthKit to offer email codes, GitHub, and Google. The server rejects other
+Configure AuthKit to offer email codes, GitHub, Google, and company SSO. The server rejects other
 authentication methods and asks the user to reopen the original claim link.
 
 ### Storage lifecycle

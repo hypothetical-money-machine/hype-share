@@ -595,7 +595,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
           reply,
           403,
           "Login method not supported",
-          "Use an email code, GitHub, or Google to claim this account.",
+          "Use an email code, GitHub, Google, or company SSO to claim this account.",
         );
       }
 

@@ -124,7 +124,8 @@ export function tierForAuthenticationMethod(
   method: string | undefined,
 ): "free-" | "free" | null {
   if (method === "MagicAuth") return "free-";
-  if (method === "GitHubOAuth" || method === "GoogleOAuth") return "free";
+  if (method === "GitHubOAuth" || method === "GoogleOAuth" || method === "SSO")
+    return "free";
   return null;
 }
 

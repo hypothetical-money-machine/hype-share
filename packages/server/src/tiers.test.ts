@@ -62,6 +62,7 @@ describe("tierForAuthenticationMethod", () => {
     expect(tierForAuthenticationMethod("MagicAuth")).toBe("free-");
     expect(tierForAuthenticationMethod("GitHubOAuth")).toBe("free");
     expect(tierForAuthenticationMethod("GoogleOAuth")).toBe("free");
+    expect(tierForAuthenticationMethod("SSO")).toBe("free");
   });
 
   it("rejects login methods outside the account policy", () => {
