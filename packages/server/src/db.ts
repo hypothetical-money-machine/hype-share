@@ -1,6 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import { createHash, randomBytes } from "node:crypto";
-import { RESERVED_HOST_LABELS, type Visibility } from "@shareplan/core";
+import { isHostLabel, RESERVED_HOST_LABELS, type Visibility } from "@shareplan/core";
 import { RATE_LIMIT_WINDOWS, type RateLimitAction } from "./rate-limit.js";
 import { HttpError } from "./errors.js";
 import {
@@ -105,6 +105,12 @@ export interface SiteRow {
   audience_workos_org_id: string | null;
   /** The version the audience was set for; any later write that skips it cancels it. */
   audience_version_id: string | null;
+  /**
+   * Set when a delete (the owner's, or the sweeper's) has started. From then on
+   * the site is gone to every reader and writer, and the sweeper retries until
+   * its objects and row are both removed.
+   */
+  deleting_at: number | null;
 }
 
 /** The audience columns, all set or all null. */
@@ -126,8 +132,11 @@ export interface VersionRow {
 }
 
 const SITE_COLS = `id, owner_key_id, owner_user_id, slug, title, visibility, current_version_id,
-       created_at, updated_at, expires_at, byte_size, file_count,
+       created_at, updated_at, expires_at, byte_size, file_count, deleting_at,
        audience_org_id, audience_workos_org_id, audience_version_id`;
+
+/** Appended to a site lookup's WHERE to leave out sites being deleted. */
+const LIVE = " AND deleting_at IS NULL";
 
 const CLEAR_AUDIENCE = `audience_org_id = NULL, audience_workos_org_id = NULL,
        audience_version_id = NULL`;
@@ -184,6 +193,17 @@ export function resolveCaseFoldedSlugs(db: DatabaseSync): { id: string; slug: st
   const clear = db.prepare(`UPDATE sites SET slug = NULL WHERE id = ?`);
   for (const row of losers) clear.run(row.id);
   return losers;
+}
+
+/** Clear slugs that are not hostname labels once lowercased; returns them. */
+function clearInvalidSlugs(db: DatabaseSync): { id: string; slug: string }[] {
+  const rows = db
+    .prepare(`SELECT id, slug FROM sites WHERE slug IS NOT NULL ORDER BY created_at, id`)
+    .all() as { id: string; slug: string }[];
+  const bad = rows.filter((r) => !isHostLabel(r.slug.toLowerCase()));
+  const clear = db.prepare(`UPDATE sites SET slug = NULL WHERE id = ?`);
+  for (const row of bad) clear.run(row.id);
+  return bad;
 }
 
 function clearReservedSlugs(db: DatabaseSync): void {
@@ -257,6 +277,9 @@ function migrate(db: DatabaseSync): void {
  * Versioned steps for databases created by an earlier schema. PRAGMA
  * user_version records the last step applied, so each runs once.
  */
+/** The user_version upgrade() leaves a database at; additive DDL never bumps it. */
+export const SCHEMA_VERSION = 4;
+
 export function upgrade(db: DatabaseSync): void {
   let version = (db.prepare("PRAGMA user_version").get() as { user_version: number })
     .user_version;
@@ -283,6 +306,34 @@ export function upgrade(db: DatabaseSync): void {
     version = 2;
   }
   addColumn(db, "site_versions", "pruned_at", "INTEGER");
+  addColumn(db, "sites", "deleting_at", "INTEGER");
+  // Ids of deleted sites, kept for good: a slug must never take over an old
+  // id's URL (links to it live on in chats and browser storage).
+  // An upload's S3 prefix is recorded before its first object goes up and
+  // dropped in the transaction that commits its rows, so objects no row points
+  // at (a failed publish whose cleanup also failed, or a crash) stay findable.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS retired_site_ids (
+      id TEXT PRIMARY KEY,
+      retired_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS pending_uploads (
+      prefix TEXT PRIMARY KEY,
+      started_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_pending_uploads_started ON pending_uploads(started_at);
+    -- A slug freed by a delete, a rename or a tier clamp stays its owner's:
+    -- links to it, and visitors' storage for its origin, outlive the site.
+    CREATE TABLE IF NOT EXISTS retired_slugs (
+      slug TEXT PRIMARY KEY,
+      owner_user_id TEXT NOT NULL,
+      retired_at INTEGER NOT NULL
+    );
+  `);
+  // Set when the sweeper starts removing an abandoned upload, which stops the
+  // publish (if one is somehow still running) from committing; the record
+  // stays until the objects are gone, so a crash mid-delete is retried.
+  addColumn(db, "pending_uploads", "abandoned_at", "INTEGER");
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS users (
@@ -319,6 +370,10 @@ export function upgrade(db: DatabaseSync): void {
       admin_token_hash TEXT NOT NULL,
       expires_at INTEGER NOT NULL
     );
+    CREATE INDEX IF NOT EXISTS idx_users_claim_token
+      ON users(claim_token_hash) WHERE claim_token_hash IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_rate_limits_window
+      ON rate_limits(action, window_start);
   `);
 
   addColumn(db, "claim_auth_flows", "browser_nonce_hash", "TEXT");
@@ -340,6 +395,23 @@ export function upgrade(db: DatabaseSync): void {
         ON users(email COLLATE NOCASE) WHERE email IS NOT NULL;
       PRAGMA user_version = 3;
     `);
+    version = 3;
+  }
+  if (version < 4) {
+    // Slugs became hostname labels after some were stored, and step 1 only
+    // settled case. A slug that is not a label even lowercased (a dot, an
+    // underscore, too long) can never be served from a site host.
+    // Labels reserved since step 2 are released the same way.
+    clearReservedSlugs(db);
+    const cleared = clearInvalidSlugs(db);
+    if (cleared.length > 0) {
+      console.warn(
+        `cleared ${cleared.length} slug(s) that are not hostname labels: ` +
+          cleared.map((c) => `${c.slug} (site ${c.id})`).join(", "),
+      );
+    }
+    db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
+    version = SCHEMA_VERSION;
   }
 
   // orgs must exist before users.org_id references it: with foreign_keys ON the
@@ -367,6 +439,7 @@ export function upgrade(db: DatabaseSync): void {
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_users_org ON users(org_id) WHERE org_id IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_sites_permanent ON sites(owner_user_id) WHERE expires_at IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_sites_deleting ON sites(deleting_at) WHERE deleting_at IS NOT NULL;
   `);
 
   // Org-private viewing: a shareplan org may be linked to one WorkOS org.
@@ -792,7 +865,7 @@ type AudienceColumns = "audience_org_id" | "audience_workos_org_id" | "audience_
 
 export function insertSite(
   db: DatabaseSync,
-  site: Omit<SiteRow, "byte_size" | "file_count" | AudienceColumns> & {
+  site: Omit<SiteRow, "byte_size" | "file_count" | "deleting_at" | AudienceColumns> & {
     byte_size?: number;
     file_count?: number;
     audience?: SiteAudience | null;
@@ -920,7 +993,7 @@ export function countHonouredAudiences(db: DatabaseSync): number {
   const row = db.prepare(`SELECT COUNT(*) AS n FROM sites s
     JOIN orgs o ON o.id = s.audience_org_id
     JOIN users u ON u.id = s.owner_user_id
-    WHERE s.visibility = 'private'
+    WHERE s.visibility = 'private' AND s.deleting_at IS NULL
       AND s.audience_workos_org_id IS NOT NULL
       AND s.audience_version_id IS NOT NULL
       AND s.current_version_id = s.audience_version_id
@@ -956,9 +1029,14 @@ export function insertVersion(db: DatabaseSync, version: VersionRow): void {
   );
 }
 
-export function getSite(db: DatabaseSync, id: string): SiteRow | null {
+/**
+ * A site by id. A site whose delete has started is gone to every reader, so it
+ * is left out unless `includeDeleting` (collision checks, which must still see
+ * the row until it is really gone).
+ */
+export function getSite(db: DatabaseSync, id: string, includeDeleting = false): SiteRow | null {
   const row = db
-    .prepare(`SELECT ${SITE_COLS} FROM sites WHERE id = ?`)
+    .prepare(`SELECT ${SITE_COLS} FROM sites WHERE id = ?${includeDeleting ? "" : LIVE}`)
     .get(id) as SiteRow | undefined;
   return row ?? null;
 }
@@ -967,11 +1045,18 @@ export function getSite(db: DatabaseSync, id: string): SiteRow | null {
  * Case-insensitive, served by idx_sites_slug_nocase: a slug is a hostname
  * label, and a mixed-case slug stored before slugs were forced lowercase must
  * still resolve from its lowercase hostname. The index is unique, so there is
- * at most one match. Uniqueness checks go through here too.
+ * at most one match. Uniqueness checks go through here too, with
+ * `includeDeleting`, since a row mid-delete still holds its slug.
  */
-export function getSiteBySlug(db: DatabaseSync, slug: string): SiteRow | null {
+export function getSiteBySlug(
+  db: DatabaseSync,
+  slug: string,
+  includeDeleting = false,
+): SiteRow | null {
   const row = db
-    .prepare(`SELECT ${SITE_COLS} FROM sites WHERE slug = ? COLLATE NOCASE`)
+    .prepare(
+      `SELECT ${SITE_COLS} FROM sites WHERE slug = ? COLLATE NOCASE${includeDeleting ? "" : LIVE}`,
+    )
     .get(slug) as SiteRow | undefined;
   return row ?? null;
 }
@@ -981,20 +1066,77 @@ export function getSiteByIdOrSlug(db: DatabaseSync, value: string): SiteRow | nu
   return getSite(db, value) ?? getSiteBySlug(db, value);
 }
 
+/** Set or clear a site's slug; a slug it gives up is retired for its owner. */
 export function updateSiteSlug(
   db: DatabaseSync,
   siteId: string,
   slug: string | null,
+  now = Date.now(),
 ): void {
+  const old = db
+    .prepare(`SELECT slug, owner_user_id FROM sites WHERE id = ?`)
+    .get(siteId) as { slug: string | null; owner_user_id: string } | undefined;
+  if (old?.slug && old.slug.toLowerCase() !== slug?.toLowerCase()) {
+    retireSlug(db, old.slug, old.owner_user_id, now);
+  }
   db.prepare(`UPDATE sites SET slug = ? WHERE id = ?`).run(slug, siteId);
 }
 
+function retireSlug(db: DatabaseSync, slug: string, ownerUserId: string, now: number): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO retired_slugs (slug, owner_user_id, retired_at) VALUES (?, ?, ?)`,
+  ).run(slug.toLowerCase(), ownerUserId, now);
+}
+
+/**
+ * How long a freed slug stays with its owner. Long enough that old links have
+ * gone quiet, short enough that renaming cannot squat names for good.
+ */
+export const RETIRED_SLUG_HOLD_MS = 90 * 86_400_000;
+
+/** Who a freed slug still belongs to, or null if it is free to anyone. */
+export function retiredSlugOwner(
+  db: DatabaseSync,
+  slug: string,
+  now = Date.now(),
+): string | null {
+  const row = db
+    .prepare(`SELECT owner_user_id FROM retired_slugs WHERE slug = ? AND retired_at > ?`)
+    .get(slug.toLowerCase(), now - RETIRED_SLUG_HOLD_MS) as { owner_user_id: string } | undefined;
+  return row?.owner_user_id ?? null;
+}
+
+/** Sites the sweeper should remove: expired, or a delete that did not finish. */
 export function listExpiredSites(db: DatabaseSync, now = Date.now()): SiteRow[] {
   return db
     .prepare(
-      `SELECT ${SITE_COLS} FROM sites WHERE expires_at IS NOT NULL AND expires_at <= ?`,
+      `SELECT ${SITE_COLS} FROM sites
+       WHERE (expires_at IS NOT NULL AND expires_at <= ?) OR deleting_at IS NOT NULL`,
     )
     .all(now) as unknown as SiteRow[];
+}
+
+/**
+ * Start deleting a site: from here on it is gone to readers and writers, so a
+ * publish that is still uploading cannot land on a row whose objects are being
+ * removed. With `expiredBy`, only claims a site that is still expired at that
+ * time (or already being deleted), so a republish that just extended it wins.
+ * Returns whether the site is now marked.
+ */
+export function markSiteDeleting(
+  db: DatabaseSync,
+  id: string,
+  now: number,
+  expiredBy?: number,
+): boolean {
+  const result = db
+    .prepare(
+      `UPDATE sites SET deleting_at = COALESCE(deleting_at, ?)
+       WHERE id = ?
+         AND (?3 IS NULL OR deleting_at IS NOT NULL OR (expires_at IS NOT NULL AND expires_at <= ?3))`,
+    )
+    .run(now, id, expiredBy ?? null);
+  return (result.changes ?? 0) > 0;
 }
 
 /**
@@ -1038,14 +1180,99 @@ export function markVersionPruned(
 export function listSitesForUser(db: DatabaseSync, ownerUserId: string): SiteRow[] {
   return db
     .prepare(
-      `SELECT ${SITE_COLS} FROM sites WHERE owner_user_id = ? ORDER BY updated_at DESC`,
+      `SELECT ${SITE_COLS} FROM sites
+       WHERE owner_user_id = ? AND deleting_at IS NULL
+       ORDER BY updated_at DESC`,
     )
     .all(ownerUserId) as unknown as SiteRow[];
 }
 
-export function deleteSite(db: DatabaseSync, id: string): boolean {
-  const result = db.prepare(`DELETE FROM sites WHERE id = ?`).run(id);
+/**
+ * Drop the row and retire its id (for good) and its slug (for its owner), so
+ * neither can come back serving someone else's page at an old link.
+ */
+export function deleteSite(db: DatabaseSync, id: string, now = Date.now()): boolean {
+  return transaction(db, () => {
+    db.prepare(`INSERT OR IGNORE INTO retired_site_ids (id, retired_at) VALUES (?, ?)`).run(
+      id,
+      now,
+    );
+    const row = db
+      .prepare(`SELECT slug, owner_user_id FROM sites WHERE id = ?`)
+      .get(id) as { slug: string | null; owner_user_id: string } | undefined;
+    if (row?.slug) retireSlug(db, row.slug, row.owner_user_id, now);
+    const result = db.prepare(`DELETE FROM sites WHERE id = ?`).run(id);
+    return (result.changes ?? 0) > 0;
+  });
+}
+
+/** Record an upload before its first object goes up. */
+export function beginUpload(db: DatabaseSync, prefix: string, now = Date.now()): void {
+  db.prepare(`INSERT OR REPLACE INTO pending_uploads (prefix, started_at) VALUES (?, ?)`).run(
+    prefix,
+    now,
+  );
+}
+
+/**
+ * Commit an upload: drop its record, inside the publish's transaction. False
+ * if the sweeper has taken it as abandoned and is removing its objects, so
+ * the publish must not commit.
+ */
+export function commitUploadRecord(db: DatabaseSync, prefix: string): boolean {
+  const result = db
+    .prepare(`DELETE FROM pending_uploads WHERE prefix = ? AND abandoned_at IS NULL`)
+    .run(prefix);
   return (result.changes ?? 0) > 0;
+}
+
+/** Drop an upload's record once its objects are gone. */
+export function endUpload(db: DatabaseSync, prefix: string): void {
+  db.prepare(`DELETE FROM pending_uploads WHERE prefix = ?`).run(prefix);
+}
+
+/**
+ * Uploads to clean up: started before `before` and never committed, or
+ * already taken by an earlier sweep that did not finish. Each is marked
+ * abandoned here, which stops a late commit; the record itself stays until
+ * endUpload, after its objects are deleted.
+ */
+export function takeAbandonedUploads(db: DatabaseSync, before: number, now: number): string[] {
+  return (
+    db
+      .prepare(
+        `UPDATE pending_uploads SET abandoned_at = COALESCE(abandoned_at, ?)
+         WHERE started_at < ? OR abandoned_at IS NOT NULL
+         RETURNING prefix`,
+      )
+      .all(now, before) as { prefix: string }[]
+  ).map((r) => r.prefix);
+}
+
+/**
+ * Versions past the retention window that still hold objects, across every
+ * site: the ones a publish failed to prune. The sweeper retries them.
+ */
+export function listAllPrunableVersions(
+  db: DatabaseSync,
+  keep: number,
+): { site_id: string; id: string }[] {
+  return db
+    .prepare(
+      `SELECT v.site_id, v.id FROM (
+         SELECT site_id, id, pruned_at,
+                ROW_NUMBER() OVER (PARTITION BY site_id ORDER BY rowid DESC) AS rank
+         FROM site_versions WHERE pruned_at IS NULL
+       ) v
+       JOIN sites s ON s.id = v.site_id
+       WHERE v.rank > ? AND v.id IS NOT s.current_version_id AND s.deleting_at IS NULL`,
+    )
+    .all(keep) as { site_id: string; id: string }[];
+}
+
+/** True if a deleted site once had this id. Ids and slugs are both lowercase. */
+export function isRetiredSiteId(db: DatabaseSync, id: string): boolean {
+  return db.prepare(`SELECT 1 FROM retired_site_ids WHERE id = ?`).get(id) !== undefined;
 }
 
 export function isExpired(site: SiteRow, now = Date.now()): boolean {
@@ -1177,7 +1404,8 @@ export function listOrgMembers(db: DatabaseSync, orgId: string): OrgMemberRow[] 
   const members = db
     .prepare(
       `SELECT u.id, u.tier, u.org_role, u.email, u.created_at, u.claimed_at,
-              (SELECT COUNT(*) FROM sites s WHERE s.owner_user_id = u.id) AS sites
+              (SELECT COUNT(*) FROM sites s
+               WHERE s.owner_user_id = u.id AND s.deleting_at IS NULL) AS sites
        FROM users u WHERE u.org_id = ? ORDER BY u.created_at, u.id`,
     )
     .all(orgId) as unknown as Omit<OrgMemberRow, "keys">[];
@@ -1207,7 +1435,7 @@ export function countOrgSites(
     .prepare(
       `SELECT COUNT(*) AS total, COALESCE(SUM(s.expires_at IS NULL), 0) AS permanent
        FROM sites s JOIN users u ON u.id = s.owner_user_id
-       WHERE u.org_id = ?`,
+       WHERE u.org_id = ? AND s.deleting_at IS NULL`,
     )
     .get(orgId) as { total: number; permanent: number };
   return { total: Number(row.total), permanent: Number(row.permanent) };
@@ -1218,7 +1446,7 @@ export function listSitesForOrg(db: DatabaseSync, orgId: string): SiteRow[] {
     .prepare(
       `SELECT ${ORG_SITE_COLS}
        FROM sites s JOIN users u ON u.id = s.owner_user_id
-       WHERE u.org_id = ? ORDER BY s.updated_at DESC, s.id`,
+       WHERE u.org_id = ? AND s.deleting_at IS NULL ORDER BY s.updated_at DESC, s.id`,
     )
     .all(orgId) as unknown as SiteRow[];
 }
@@ -1584,7 +1812,7 @@ export function clampSitesToPolicy(
     collect(
       db
         .prepare(
-          `UPDATE sites SET expires_at = ? WHERE owner_user_id = ? AND expires_at IS NULL
+          `UPDATE sites SET expires_at = ? WHERE owner_user_id = ? AND deleting_at IS NULL AND expires_at IS NULL
            RETURNING id`,
         )
         .all(cap, ownerUserId),
@@ -1595,17 +1823,22 @@ export function clampSitesToPolicy(
     collect(
       db
         .prepare(
-          `UPDATE sites SET expires_at = ? WHERE owner_user_id = ? AND expires_at > ?
+          `UPDATE sites SET expires_at = ? WHERE owner_user_id = ? AND deleting_at IS NULL AND expires_at > ?
            RETURNING id`,
         )
         .all(max, ownerUserId, max),
     );
   }
   if (!policy.slugs) {
+    db.prepare(
+      `INSERT OR REPLACE INTO retired_slugs (slug, owner_user_id, retired_at)
+       SELECT lower(slug), owner_user_id, ? FROM sites
+       WHERE owner_user_id = ? AND deleting_at IS NULL AND slug IS NOT NULL`,
+    ).run(now, ownerUserId);
     collect(
       db
         .prepare(
-          `UPDATE sites SET slug = NULL WHERE owner_user_id = ? AND slug IS NOT NULL
+          `UPDATE sites SET slug = NULL WHERE owner_user_id = ? AND deleting_at IS NULL AND slug IS NOT NULL
            RETURNING id`,
         )
         .all(ownerUserId),
@@ -1616,7 +1849,7 @@ export function clampSitesToPolicy(
       db
         .prepare(
           `UPDATE sites SET visibility = 'unlisted'
-           WHERE owner_user_id = ? AND visibility = 'public'
+           WHERE owner_user_id = ? AND deleting_at IS NULL AND visibility = 'public'
            RETURNING id`,
         )
         .all(ownerUserId),
@@ -1704,7 +1937,7 @@ export function reconcilePermanentSites(
        FROM sites s
        JOIN users u ON u.id = s.owner_user_id
        LEFT JOIN orgs o ON o.id = u.org_id
-       WHERE s.expires_at IS NULL
+       WHERE s.expires_at IS NULL AND s.deleting_at IS NULL
          AND u.tier NOT IN (${placeholders(permanentTiers)})
          AND (o.comp_tier IS NULL OR o.comp_tier NOT IN (${placeholders(permanentOrgTiers)}))
          AND (o.billing_tier IS NULL OR o.billing_tier NOT IN (${placeholders(permanentOrgTiers)}))`,

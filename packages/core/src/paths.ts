@@ -15,6 +15,16 @@ export function sanitizeSitePath(raw: string): string {
   if (raw.includes("\0")) {
     throw new PathError("path contains null byte");
   }
+  // S3 names keys in XML bodies (DeleteObjects, listings), and XML 1.0 cannot
+  // carry C0 controls, U+FFFE/U+FFFF, or lone surrogates. A key like that
+  // uploads fine (PutObject percent-encodes it into the URL) but can never be
+  // deleted again, and a lone surrogate makes the SDK throw mid-upload.
+  if (/[\u0001-\u001f\u007f\ufffe\uffff]/.test(raw)) {
+    throw new PathError("path contains a control character");
+  }
+  if (LONE_SURROGATE_RE.test(raw)) {
+    throw new PathError("path is not valid Unicode");
+  }
 
   const p = raw.replace(/\\/g, "/").trim();
   if (p.startsWith("/")) {
@@ -35,6 +45,11 @@ export function sanitizeSitePath(raw: string): string {
     if (seg === "..") {
       throw new PathError("path traversal is not allowed");
     }
+    // Filesystem-backed stores (MinIO, Garage) map each segment to a file
+    // name, and those stop at 255 bytes.
+    if (Buffer.byteLength(seg, "utf8") > MAX_SEGMENT_BYTES) {
+      throw new PathError("path segment too long");
+    }
   }
 
   const normalized = segments.join("/");
@@ -49,11 +64,21 @@ export function sanitizeSitePath(raw: string): string {
   return normalized;
 }
 
+const MAX_SEGMENT_BYTES = 255;
+// Matched on UTF-16 code units (no u flag): a high surrogate not followed by a
+// low one, or a low surrogate not preceded by a high one.
+const LONE_SURROGATE_RE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+
 export class PathError extends Error {
   override readonly name = "PathError";
   constructor(message: string) {
     super(message);
   }
+}
+
+/** A site path as a relative URL: each segment percent-encoded. */
+export function encodeSitePathForUrl(path: string): string {
+  return path.split("/").map(encodeURIComponent).join("/");
 }
 
 export function s3ObjectKey(siteId: string, versionId: string, relPath: string): string {

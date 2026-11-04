@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { loadConfig } from "./config.js";
+import { describeConfigGaps, loadConfig } from "./config.js";
 import { openDb } from "./db.js";
 import { createS3Client, ensureBucket } from "./storage.js";
 import { buildApp } from "./app.js";
@@ -7,8 +7,10 @@ import { startReaper } from "./reap.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
+  for (const gap of describeConfigGaps(config)) console.warn(`Warning: ${gap}`);
   const db = openDb(config.dbPath);
   const s3 = createS3Client(config);
+  const serveS3 = createS3Client(config, "serve");
 
   try {
     await ensureBucket(s3, config.s3.bucket);
@@ -19,7 +21,7 @@ async function main(): Promise<void> {
     );
   }
 
-  const app = await buildApp({ config, db, s3 });
+  const app = await buildApp({ config, db, s3, serveS3 });
   const stopReaper = startReaper({
     config,
     db,

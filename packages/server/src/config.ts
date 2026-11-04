@@ -1,6 +1,6 @@
 import { mkdirSync } from "node:fs";
 import path from "node:path";
-import { isHostLabel, siteLabelFromHost } from "@shareplan/core";
+import { isHostLabel, parseTtl, siteLabelFromHost } from "@shareplan/core";
 import { hashApiKey } from "./db.js";
 
 export const WORKOS_CALLBACK_PATH = "/v1/auth/workos/callback";
@@ -22,8 +22,12 @@ export interface Config {
     endpoint?: string;
     region: string;
     bucket: string;
-    accessKeyId: string;
-    secretAccessKey: string;
+    /**
+     * Static keys from SHAREPLAN_S3_ACCESS_KEY / SHAREPLAN_S3_SECRET_KEY.
+     * Unset leaves credentials to the AWS SDK's default chain (AWS_* env vars
+     * including AWS_SESSION_TOKEN, profiles, and instance or task roles).
+     */
+    credentials?: { accessKeyId: string; secretAccessKey: string };
     forcePathStyle: boolean;
   };
   maxSiteBytes: number;
@@ -31,10 +35,20 @@ export interface Config {
   defaultTtl: string | null;
   /** SHA-256 hex of SHAREPLAN_ADMIN_TOKEN; null if unset. */
   adminTokenHash: string | null;
-  /** HMAC pepper for client IP buckets. Null disables register / free-- IP limits. */
+  /**
+   * HMAC pepper for client IP buckets. Null turns open registration off (it
+   * answers 503 unless the request carries an organization join token) and
+   * drops the per-IP publish limit for organization members, who are then held
+   * by their own and their organization's buckets.
+   */
   ipHashPepper: string | null;
-  /** Trust CF-Connecting-IP / X-Forwarded-For. Off unless behind a known proxy. */
+  /** Trust one proxy hop of X-Forwarded-For. Off unless behind a known proxy. */
   trustForwarded: boolean;
+  /**
+   * A header that carries the client address, such as cf-connecting-ip behind
+   * Cloudflare. Read only when trustForwarded is on. Lowercase; null if unset.
+   */
+  clientIpHeader: string | null;
   registerPerDay: number;
   /** Org-token registers and org-admin key mints per organization per day. */
   orgRegisterPerDay: number;
@@ -65,27 +79,39 @@ export function loadConfig(envSource: NodeJS.ProcessEnv = process.env): Config {
     return v === "1" || v.toLowerCase() === "true" || v.toLowerCase() === "yes";
   };
 
-  const envInt = (name: string, fallback: number): number => {
+  const envInt = (name: string, fallback: number, min = -Infinity, max = Infinity): number => {
     const v = env(name);
     if (v === undefined) return fallback;
     const n = Number(v);
     if (!Number.isFinite(n)) throw new Error(`${name} must be a number`);
+    if (!Number.isInteger(n) || n < min || n > max) {
+      const range = max === Infinity ? `at least ${min}` : `${min} to ${max}`;
+      throw new Error(`${name} must be a whole number, ${range}; got "${v}"`);
+    }
     return n;
   };
 
   const dataDir = path.resolve(env("SHAREPLAN_DATA_DIR", "./data")!);
   mkdirSync(dataDir, { recursive: true });
 
-  const port = envInt("SHAREPLAN_PORT", 8788);
+  const port = envInt("SHAREPLAN_PORT", 8788, 0, 65_535);
   const host = env("SHAREPLAN_HOST", "127.0.0.1")!;
   const publicBaseUrl = (env("SHAREPLAN_PUBLIC_BASE_URL", `http://${host}:${port}`)!).replace(
     /\/$/,
     "",
   );
 
+  assertBareOrigin(publicBaseUrl);
   const siteHostSuffix = normalizeSiteHostSuffix(env("SHAREPLAN_SITE_HOST_SUFFIX"));
   assertPublicBaseUrlIsApiHost(publicBaseUrl, siteHostSuffix);
   const adminToken = env("SHAREPLAN_ADMIN_TOKEN") ?? null;
+  if (adminToken !== null && adminToken.length < MIN_ADMIN_TOKEN_LENGTH) {
+    // It mints ops keys and is only SHA-256 hashed at rest, so a short one
+    // falls to guessing online or offline.
+    throw new Error(
+      `SHAREPLAN_ADMIN_TOKEN must be at least ${MIN_ADMIN_TOKEN_LENGTH} characters; use a long random secret`,
+    );
+  }
   const workos = normalizeWorkOSConfig(
     {
       apiKey: env("WORKOS_API_KEY"),
@@ -95,11 +121,24 @@ export function loadConfig(envSource: NodeJS.ProcessEnv = process.env): Config {
     publicBaseUrl,
   );
 
-  const accessKeyId = env("SHAREPLAN_S3_ACCESS_KEY", env("AWS_ACCESS_KEY_ID", "minioadmin"))!;
-  const secretAccessKey = env(
-    "SHAREPLAN_S3_SECRET_KEY",
-    env("AWS_SECRET_ACCESS_KEY", "minioadmin"),
-  )!;
+  const trustForwarded = envBool("SHAREPLAN_TRUST_FORWARDED", false);
+  const clientIpHeader = normalizeClientIpHeader(env("SHAREPLAN_CLIENT_IP_HEADER"));
+  if (clientIpHeader !== null && !trustForwarded) {
+    // Read only behind a trusted proxy; ignoring it silently would leave the
+    // limits keyed on the proxy while the operator thinks they are per client.
+    throw new Error("SHAREPLAN_CLIENT_IP_HEADER needs SHAREPLAN_TRUST_FORWARDED=true");
+  }
+  const s3Endpoint = env("SHAREPLAN_S3_ENDPOINT");
+  const credentials = s3Credentials(env("SHAREPLAN_S3_ACCESS_KEY"), env("SHAREPLAN_S3_SECRET_KEY"));
+  const defaultTtl = env("SHAREPLAN_DEFAULT_TTL") ?? null;
+  if (defaultTtl !== null) {
+    // Checked here so a typo fails at startup, not as a 500 on every publish.
+    try {
+      parseTtl(defaultTtl);
+    } catch {
+      throw new Error(`SHAREPLAN_DEFAULT_TTL must be a duration like 7d or 12h, got "${defaultTtl}"`);
+    }
+  }
 
   return {
     host,
@@ -109,25 +148,115 @@ export function loadConfig(envSource: NodeJS.ProcessEnv = process.env): Config {
     dataDir,
     dbPath: path.join(dataDir, "shareplan.sqlite"),
     s3: {
-      endpoint: env("SHAREPLAN_S3_ENDPOINT"),
-      region: env("SHAREPLAN_S3_REGION", "auto")!,
+      endpoint: s3Endpoint,
+      // "auto" suits R2 and MinIO; on AWS itself (no custom endpoint) the
+      // SDK needs the real region, which the AWS_* variables already carry.
+      region:
+        env("SHAREPLAN_S3_REGION") ??
+        (s3Endpoint === undefined ? env("AWS_REGION") ?? env("AWS_DEFAULT_REGION") : undefined) ??
+        "auto",
       bucket: env("SHAREPLAN_S3_BUCKET", "shareplan")!,
-      accessKeyId,
-      secretAccessKey,
+      ...(credentials ? { credentials } : {}),
       forcePathStyle: envBool("SHAREPLAN_S3_FORCE_PATH_STYLE", true),
     },
-    maxSiteBytes: envInt("SHAREPLAN_MAX_SITE_BYTES", 52_428_800),
-    maxFileCount: envInt("SHAREPLAN_MAX_FILE_COUNT", 200),
-    defaultTtl: env("SHAREPLAN_DEFAULT_TTL") ?? null,
+    maxSiteBytes: envInt("SHAREPLAN_MAX_SITE_BYTES", 52_428_800, 1),
+    maxFileCount: envInt("SHAREPLAN_MAX_FILE_COUNT", 200, 1),
+    defaultTtl,
     adminTokenHash: adminToken ? hashApiKey(adminToken) : null,
     ipHashPepper: env("SHAREPLAN_IP_HASH_PEPPER") ?? null,
-    trustForwarded: envBool("SHAREPLAN_TRUST_FORWARDED", false),
+    trustForwarded,
+    clientIpHeader,
     registerPerDay: Math.max(1, envInt("SHAREPLAN_REGISTER_PER_DAY", 10)),
     orgRegisterPerDay: Math.max(1, envInt("SHAREPLAN_ORG_REGISTER_PER_DAY", 100)),
     versionRetention: Math.max(1, envInt("SHAREPLAN_VERSION_RETENTION", 2)),
-    reapIntervalMs: Math.max(0, envInt("SHAREPLAN_REAP_INTERVAL_SEC", 300)) * 1000,
+    // setInterval takes a signed 32-bit delay and treats anything larger as 1 ms.
+    reapIntervalMs: Math.min(
+      Math.max(0, envInt("SHAREPLAN_REAP_INTERVAL_SEC", 300)) * 1000,
+      MAX_TIMER_MS,
+    ),
     workos,
   };
+}
+
+const MIN_ADMIN_TOKEN_LENGTH = 16;
+
+/**
+ * Routes are mounted at the root and every link is built as
+ * `${publicBaseUrl}/...`, so a path, query or credentials in the base URL
+ * would only produce broken links.
+ */
+export function assertBareOrigin(publicBaseUrl: string): void {
+  let url: URL;
+  try {
+    url = new URL(publicBaseUrl);
+  } catch {
+    throw new Error("SHAREPLAN_PUBLIC_BASE_URL must be an absolute URL");
+  }
+  if (
+    !/^https?:$/.test(url.protocol) ||
+    url.pathname !== "/" ||
+    url.search !== "" ||
+    url.hash !== "" ||
+    url.username !== "" ||
+    url.password !== ""
+  ) {
+    throw new Error(
+      `SHAREPLAN_PUBLIC_BASE_URL must be a bare http(s) origin like https://share.example.com, got "${publicBaseUrl}"`,
+    );
+  }
+}
+
+/** Features this config leaves off or unsafe, for one line each at startup. */
+export function describeConfigGaps(config: Config): string[] {
+  const gaps: string[] = [];
+  if (config.siteHostSuffix === null) {
+    gaps.push(
+      "SHAREPLAN_SITE_HOST_SUFFIX is unset: every site shares one origin (development only), and claiming and the owner portal are off",
+    );
+  }
+  if (config.adminTokenHash === null) {
+    gaps.push("SHAREPLAN_ADMIN_TOKEN is unset: the admin API and owner portal are off");
+  }
+  if (config.ipHashPepper === null) {
+    gaps.push("SHAREPLAN_IP_HASH_PEPPER is unset: open registration is off");
+  }
+  if (config.workos === null) {
+    gaps.push("WorkOS is not configured: account claiming and org viewing are off");
+  }
+  if (config.reapIntervalMs === 0) {
+    gaps.push("SHAREPLAN_REAP_INTERVAL_SEC is 0: expired sites and abandoned uploads are never removed");
+  }
+  if (/^https?:\/\/(0\.0\.0\.0|\[::\])(:|$)/.test(config.publicBaseUrl)) {
+    gaps.push(
+      `SHAREPLAN_PUBLIC_BASE_URL is ${config.publicBaseUrl}, which clients cannot reach; set the public URL`,
+    );
+  }
+  return gaps;
+}
+
+/** Largest delay setInterval honours; longer ones fire after 1 ms. */
+const MAX_TIMER_MS = 2_147_483_647;
+
+/** Both keys or neither: half a pair is a misconfiguration, not a fallback. */
+export function s3Credentials(
+  accessKeyId: string | undefined,
+  secretAccessKey: string | undefined,
+): { accessKeyId: string; secretAccessKey: string } | undefined {
+  if (accessKeyId === undefined && secretAccessKey === undefined) return undefined;
+  if (accessKeyId === undefined || secretAccessKey === undefined) {
+    throw new Error("SHAREPLAN_S3_ACCESS_KEY and SHAREPLAN_S3_SECRET_KEY must be set together");
+  }
+  return { accessKeyId, secretAccessKey };
+}
+
+export function normalizeClientIpHeader(raw: string | undefined): string | null {
+  if (raw === undefined) return null;
+  const name = raw.trim().toLowerCase();
+  if (name === "") return null;
+  if (!/^[a-z0-9-]+$/.test(name)) {
+    throw new Error(`SHAREPLAN_CLIENT_IP_HEADER must be a header name like cf-connecting-ip, got "${raw}"`);
+  }
+  return name;
 }
 
 export function normalizeWorkOSConfig(

@@ -3,13 +3,25 @@ import type { S3Client } from "@aws-sdk/client-s3";
 import type { Config } from "./config.js";
 import {
   deleteSite,
+  endUpload,
+  listAllPrunableVersions,
   listExpiredSites,
+  markSiteDeleting,
+  markVersionPruned,
   pruneClaimAuthFlows,
   pruneRateLimits,
   reconcilePermanentSites,
+  takeAbandonedUploads,
 } from "./db.js";
 import { pruneViewerAuth } from "./viewer-db.js";
-import { deleteSiteObjects } from "./storage.js";
+import { deletePrefix, deleteSiteObjects, deleteVersionObjects } from "./storage.js";
+
+/**
+ * An upload this old that never committed was abandoned: its publish failed
+ * and could not clean up, or the process died. Far longer than any upload of
+ * a size-capped site, so a live one is never taken.
+ */
+export const ABANDONED_UPLOAD_MS = 60 * 60 * 1000;
 
 export interface Logger {
   info(msg: string): void;
@@ -29,6 +41,11 @@ export interface ReapDeps {
  *
  * Objects go before the row: if the delete fails we keep the row and retry on
  * the next sweep, whereas the reverse would orphan the objects permanently.
+ *
+ * Each site is first marked as deleting, and only if it is still expired at
+ * that moment: a republish or touch that extended it since the listing wins,
+ * and once marked, no publish can land on it while its objects go. Sites whose
+ * owner delete did not finish are already marked and are retried here too.
  */
 export async function reapExpiredSites(
   deps: ReapDeps,
@@ -54,6 +71,7 @@ export async function reapExpiredSites(
 
   for (const site of expired) {
     try {
+      if (!markSiteDeleting(deps.db, site.id, Date.now(), now)) continue;
       objects += await deleteSiteObjects(deps.s3, deps.config.s3.bucket, site.id);
       deleteSite(deps.db, site.id);
       sites += 1;
@@ -66,6 +84,35 @@ export async function reapExpiredSites(
 
   if (sites > 0) {
     deps.log?.info(`reap: removed ${sites} expired site(s), ${objects} object(s)`);
+  }
+
+  // Marked first, which stops a late commit; the record stays until its
+  // objects are gone, so a sweep that dies mid-delete is retried by the next.
+  for (const prefix of takeAbandonedUploads(deps.db, now - ABANDONED_UPLOAD_MS, Date.now())) {
+    try {
+      objects += await deletePrefix(deps.s3, deps.config.s3.bucket, prefix);
+      endUpload(deps.db, prefix);
+    } catch (err) {
+      deps.log?.warn(`reap: could not remove abandoned upload ${prefix}: ${errMessage(err)}`);
+    }
+  }
+
+  // A publish prunes old versions itself, but only once: one that failed
+  // (S3 down, a per-key error) would otherwise keep its objects for good.
+  for (const version of listAllPrunableVersions(deps.db, deps.config.versionRetention)) {
+    try {
+      objects += await deleteVersionObjects(
+        deps.s3,
+        deps.config.s3.bucket,
+        version.site_id,
+        version.id,
+      );
+      markVersionPruned(deps.db, version.id);
+    } catch (err) {
+      deps.log?.warn(
+        `reap: could not prune version ${version.id} of ${version.site_id}: ${errMessage(err)}`,
+      );
+    }
   }
   return { sites, objects };
 }

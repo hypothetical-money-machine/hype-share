@@ -19,25 +19,26 @@ export function getOwnerStats(db: DatabaseSync, now = Date.now()) {
     COALESCE(SUM(expires_at IS NULL), 0) AS permanent,
     COALESCE(SUM(byte_size), 0) AS currentBytes,
     COALESCE(SUM(file_count), 0) AS currentFiles
-    FROM sites`).get(now, now, now, now + 7 * DAY) as {
+    FROM sites WHERE deleting_at IS NULL`).get(now, now, now, now + 7 * DAY) as {
       total: number; active: number; expired: number; expiringNext7Days: number;
       permanent: number; currentBytes: number; currentFiles: number;
     };
   const versions = db.prepare(`SELECT COUNT(*) AS publishes,
-    COALESCE(SUM(pruned_at IS NULL), 0) AS retained,
-    COALESCE(SUM(CASE WHEN pruned_at IS NULL THEN byte_size ELSE 0 END), 0) AS retainedBytes
-    FROM site_versions`).get() as { publishes: number; retained: number; retainedBytes: number };
+    COALESCE(SUM(v.pruned_at IS NULL), 0) AS retained,
+    COALESCE(SUM(CASE WHEN v.pruned_at IS NULL THEN v.byte_size ELSE 0 END), 0) AS retainedBytes
+    FROM site_versions v JOIN sites s ON s.id = v.site_id WHERE s.deleting_at IS NULL`).get() as { publishes: number; retained: number; retainedBytes: number };
   const keys = db.prepare(`SELECT COUNT(*) AS active FROM api_keys WHERE revoked_at IS NULL`).get() as { active: number };
   const tierRows = db.prepare(`SELECT tier, COUNT(*) AS count FROM users GROUP BY tier`).all() as { tier: string; count: number }[];
   const tiers = Object.keys(TIER_POLICIES).map(tier => ({ tier, count: tierRows.find(row => row.tier === tier)?.count ?? 0 }));
   // Stored counts, then org sites moved out of private through the same check every read uses.
-  const stored = db.prepare(`SELECT visibility, COUNT(*) AS count FROM sites GROUP BY visibility`).all() as { visibility: string; count: number }[];
+  const stored = db.prepare(`SELECT visibility, COUNT(*) AS count FROM sites WHERE deleting_at IS NULL GROUP BY visibility`).all() as { visibility: string; count: number }[];
   const orgSites = countHonouredAudiences(db);
   const visibility = [...stored.map(row => row.visibility === "private" ? { ...row, count: row.count - orgSites } : row), { visibility: "org", count: orgSites }]
     .filter(row => row.count > 0)
     .sort((a, b) => a.visibility.localeCompare(b.visibility));
-  const activityRows = db.prepare(`SELECT CAST(created_at / ? AS INTEGER) * ? AS day, COUNT(*) AS publishes
-    FROM site_versions WHERE created_at >= ? GROUP BY day`).all(DAY, DAY, since) as { day: number; publishes: number }[];
+  const activityRows = db.prepare(`SELECT CAST(v.created_at / ? AS INTEGER) * ? AS day, COUNT(*) AS publishes
+    FROM site_versions v JOIN sites s ON s.id = v.site_id
+    WHERE v.created_at >= ? AND s.deleting_at IS NULL GROUP BY day`).all(DAY, DAY, since) as { day: number; publishes: number }[];
   const activity = Array.from({ length: 30 }, (_, i) => {
     const day = since + i * DAY;
     return { date: new Date(day).toISOString().slice(0, 10), publishes: activityRows.find(row => row.day === day)?.publishes ?? 0 };
@@ -45,7 +46,7 @@ export function getOwnerStats(db: DatabaseSync, now = Date.now()) {
   const recentRows = db.prepare(`SELECT id, title, visibility, byte_size AS byteSize,
     updated_at AS updatedAt, expires_at AS expiresAt, owner_user_id, current_version_id,
     audience_org_id, audience_workos_org_id, audience_version_id
-    FROM sites ORDER BY updated_at DESC, id LIMIT 20`).all() as unknown as (AudienceFields & {
+    FROM sites WHERE deleting_at IS NULL ORDER BY updated_at DESC, id LIMIT 20`).all() as unknown as (AudienceFields & {
       id: string; title: string | null; byteSize: number; updatedAt: number; expiresAt: number | null;
     })[];
   const recentSites = recentRows.map(row => ({
@@ -67,8 +68,8 @@ export function getOwnerStats(db: DatabaseSync, now = Date.now()) {
     o.max_members AS maxMembers, o.publish_per_hour AS publishPerHour, o.join_token_hash IS NOT NULL AS joinEnabled,
     o.workos_organization_id IS NOT NULL AS workosLinked, o.created_at AS createdAt,
     (SELECT COUNT(*) FROM users u WHERE u.org_id = o.id) AS members,
-    (SELECT COUNT(*) FROM sites s JOIN users u ON u.id = s.owner_user_id WHERE u.org_id = o.id) AS sites,
-    (SELECT COUNT(*) FROM sites s JOIN users u ON u.id = s.owner_user_id WHERE u.org_id = o.id AND s.expires_at IS NULL) AS permanent
+    (SELECT COUNT(*) FROM sites s JOIN users u ON u.id = s.owner_user_id WHERE u.org_id = o.id AND s.deleting_at IS NULL) AS sites,
+    (SELECT COUNT(*) FROM sites s JOIN users u ON u.id = s.owner_user_id WHERE u.org_id = o.id AND s.expires_at IS NULL AND s.deleting_at IS NULL) AS permanent
     FROM orgs o ORDER BY members DESC, o.created_at, o.id LIMIT 20`).all() as {
       id: string; name: string; compTier: string | null; billingTier: string | null; maxMembers: number;
       publishPerHour: number | null; joinEnabled: number; workosLinked: number; createdAt: number; members: number; sites: number; permanent: number;

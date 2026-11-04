@@ -1,4 +1,5 @@
 import type { FastifyReply } from "fastify";
+import { escapeHtml } from "@shareplan/core";
 
 export function claimRedirectPage(reply: FastifyReply, authorizationUrl: string, action = "sign-in"): FastifyReply {
   // Chromium applies the confirmation form's form-action policy to HTTP redirects.
@@ -22,7 +23,9 @@ export function claimRedirectPage(reply: FastifyReply, authorizationUrl: string,
 
 export function setAuthPageHeaders(reply: FastifyReply, allowForm: boolean): void {
   reply.header("Cache-Control", "no-store");
-  reply.header("Referrer-Policy", "no-referrer");
+  // The confirmation form needs a real Origin on its POST (no-referrer would
+  // send "Origin: null"); same-origin still keeps the claim URL from leaving.
+  reply.header("Referrer-Policy", allowForm ? "same-origin" : "no-referrer");
   reply.header("X-Content-Type-Options", "nosniff");
   reply.header("X-Robots-Tag", "noindex, nofollow");
   reply.header(
@@ -31,10 +34,4 @@ export function setAuthPageHeaders(reply: FastifyReply, allowForm: boolean): voi
   );
 }
 
-export function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
+export { escapeHtml } from "@shareplan/core";

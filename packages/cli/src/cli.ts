@@ -74,11 +74,21 @@ program
     try {
       const orgToken = resolveOrgToken(opts.orgToken, process.env.SHAREPLAN_ORG_TOKEN);
       const created = await registerAccount(url, opts.name, orgToken);
-      saveCliConfig({ url, token: created.token });
+      // Printed before the save: the server shows a token once, so a config
+      // write that fails must not take the only copy with it.
       console.log(created.token);
       console.error(registerLine(created));
       console.error(`claim=${created.claimUrl}`);
       console.error("Save this token; it will not be shown again.");
+      try {
+        saveCliConfig({ url, token: created.token });
+      } catch (e) {
+        console.error(
+          `Could not save the config (${e instanceof Error ? e.message : String(e)}); ` +
+            "use the token above with shareplan login or SHAREPLAN_TOKEN.",
+        );
+        process.exitCode = 1;
+      }
     } catch (e) {
       fail(e);
     }
@@ -149,7 +159,9 @@ program
     }
 
     const files = st.isDirectory()
-      ? collectDirectory(pathArg)
+      ? collectDirectory(pathArg, {
+          onSkip: (rel, reason) => console.error(`skipped ${rel} (${reason})`),
+        })
       : collectSingleFile(pathArg);
 
     try {

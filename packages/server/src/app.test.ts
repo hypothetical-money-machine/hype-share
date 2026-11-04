@@ -5,8 +5,9 @@ import type {
   LightMyRequestResponse,
 } from "fastify";
 import net from "node:net";
+import { Readable, Writable } from "node:stream";
 import type { DatabaseSync } from "node:sqlite";
-import { buildApp, type WorkOSAuthClient } from "./app.js";
+import { buildApp, redactRequestUrl, type WorkOSAuthClient } from "./app.js";
 import type { Config } from "./config.js";
 import {
   createApiKeyRecord,
@@ -15,11 +16,14 @@ import {
   createUser,
   getUser,
   hashApiKey,
+  markSiteDeleting,
   openDb,
   setUserTier,
 } from "./db.js";
-import { reapExpiredSites } from "./reap.js";
+import { getOwnerStats } from "./owner-stats.js";
+import { ABANDONED_UPLOAD_MS, reapExpiredSites } from "./reap.js";
 import { createFakeS3, type FakeS3 } from "./testing/fake-s3.js";
+import { gate, tick } from "./testing/gate.js";
 
 const TOKEN = "sp_test_token";
 const ADMIN = "admin-token";
@@ -60,8 +64,7 @@ async function setup(
     s3: {
       region: "auto",
       bucket: "test",
-      accessKeyId: "a",
-      secretAccessKey: "b",
+      credentials: { accessKeyId: "a", secretAccessKey: "b" },
       forcePathStyle: true,
     },
     maxSiteBytes: 1_000_000,
@@ -70,6 +73,7 @@ async function setup(
     adminTokenHash: hashApiKey(ADMIN),
     ipHashPepper: "test-pepper",
     trustForwarded: false,
+    clientIpHeader: null,
     registerPerDay: 10,
     orgRegisterPerDay: 100,
     versionRetention: 2,
@@ -77,10 +81,16 @@ async function setup(
     workos: null,
     ...overrides,
   };
+  // Claiming refuses to run on a shared origin, so a WorkOS setup gets
+  // isolated site hosts unless the test says otherwise.
+  if (config.workos !== null && !("siteHostSuffix" in overrides)) {
+    config.siteHostSuffix = "sites.test.local";
+  }
 
   const db = openDb(":memory:");
   const s3 = createFakeS3();
   const app = await buildApp({ config, db, s3: s3.client, logger: false, workos });
+  apiOrigins.set(app, new URL(config.publicBaseUrl).origin);
   const { key } = createOpsKey(db, { name: "test", token: TOKEN });
 
   const harness: Harness = { app, db, s3, config, keyId: key.id };
@@ -146,11 +156,22 @@ function createFakeWorkOS(method: string | undefined = "MagicAuth"): FakeWorkOS 
 
 const auth = (token = TOKEN) => ({ authorization: `Bearer ${token}` });
 
-/** Narrows fastify's chainable inject() overloads to the promise form. */
+const apiOrigins = new WeakMap<FastifyInstance, string>();
+
+/**
+ * Narrows fastify's chainable inject() overloads to the promise form. A claim
+ * POST comes from the confirmation page, so like a browser it carries the API
+ * origin unless the test sets its own.
+ */
 function inject(
   app: FastifyInstance,
   opts: InjectOptions,
 ): Promise<LightMyRequestResponse> {
+  if (opts.method === "POST" && typeof opts.url === "string" && opts.url.startsWith("/claim/")) {
+    const headers = { ...(opts.headers ?? {}) };
+    if (!("origin" in headers)) headers.origin = apiOrigins.get(app) ?? "http://test.local";
+    return app.inject({ ...opts, headers });
+  }
   return app.inject(opts);
 }
 
@@ -230,30 +251,16 @@ const helloSite = (html = "<h1>hello</h1>") => ({
   files: [{ path: "index.html", content: html }],
 });
 
-type Send = (cmd: { constructor: { name: string } }) => Promise<unknown>;
-
 /** Makes every upload fail, so publishes die halfway through. */
 function breakUploads(s3: FakeS3): void {
-  const stub = s3.client as unknown as { send: Send };
-  const original = stub.send;
-  stub.send = (cmd) => {
-    if (cmd.constructor.name === "PutObjectCommand") {
-      return Promise.reject(new Error("s3 unavailable"));
-    }
-    return original(cmd);
+  s3.hooks.beforePut = () => {
+    throw new Error("s3 unavailable");
   };
 }
 
 /** Holds uploads open long enough for two publishes to interleave. */
 function slowUploads(s3: FakeS3, ms = 20): void {
-  const stub = s3.client as unknown as { send: Send };
-  const original = stub.send;
-  stub.send = async (cmd) => {
-    if (cmd.constructor.name === "PutObjectCommand") {
-      await new Promise((resolve) => setTimeout(resolve, ms));
-    }
-    return original(cmd);
-  };
+  s3.hooks.beforePut = () => new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 describe("auth", () => {
@@ -891,10 +898,28 @@ describe("request limits", () => {
       method: "POST",
       url: "/api/v1/sites",
       headers: { ...auth(), "content-type": "application/json" },
-      payload: "x".repeat((app.initialConfig.bodyLimit ?? 0) + 1024),
+      // The publish routes' own limit: maxSiteBytes as base64 plus 1 MiB.
+      payload: "x".repeat(Math.ceil(1000 / 3) * 4 + 1_048_576 + 1024),
     });
     expect(res.statusCode).toBe(413);
     expect(res.json<{ error: { code: string } }>().error.code).toBe("payload_too_large");
+  });
+
+  it("keeps the large body limit to the publish routes", async () => {
+    const { app } = await setup();
+    const big = JSON.stringify({ name: "x".repeat(100 * 1024) });
+    for (const url of ["/api/v1/register", "/api/v1/org/join", "/api/v1/admin/orgs"]) {
+      const res = await inject(app, {
+        method: "POST",
+        url,
+        headers: { "content-type": "application/json" },
+        payload: big,
+      });
+      expect(res.statusCode, url).toBe(413);
+    }
+    // A publish of the same size is still parsed (and then validated).
+    const publishRes = await publish(app, { files: [{ path: "index.html", content: "x".repeat(100 * 1024) }] });
+    expect(publishRes.statusCode).toBe(201);
   });
 
   it("reports a content type it cannot parse as a 415", async () => {
@@ -1834,7 +1859,12 @@ describe("register and tiers", () => {
       headers: auth("sp_paid2"),
     });
     expect(touched.statusCode).toBe(200);
-    expect(touched.json<{ expiresAt: string | null }>().expiresAt).toBe(site.expiresAt);
+    // Not cleared to permanent, but extended: a tier with no maximum has
+    // nothing to reset to, so touch moves the expiry a year out.
+    const expiresAt = touched.json<{ expiresAt: string | null }>().expiresAt;
+    expect(expiresAt).not.toBeNull();
+    expect(Date.parse(expiresAt!)).toBeGreaterThan(Date.parse(site.expiresAt));
+    expect(Date.parse(expiresAt!) - Date.now()).toBeGreaterThan(364 * 86_400_000);
   });
 
   it("does not spend quota on a 404 or a tier rejection", async () => {
@@ -1923,5 +1953,688 @@ describe("register and tiers", () => {
     const res = await publish(app, helloSite());
     expect(res.statusCode).toBe(400);
     expect(res.json<{ error: { code: string } }>().error.code).toBe("invalid_tier");
+  });
+});
+
+describe("retired site ids", () => {
+  it("never lets a slug take over a deleted site's id", async () => {
+    const { app } = await setup();
+    const site = (await publish(app, helloSite("old"))).json<{ id: string }>();
+    const del = await inject(app, {
+      method: "DELETE",
+      url: `/api/v1/sites/${site.id}`,
+      headers: auth(),
+    });
+    expect(del.statusCode).toBe(204);
+
+    const takeover = await publish(app, { ...helloSite("new"), slug: site.id });
+    expect(takeover.statusCode).toBe(409);
+    expect(takeover.json<{ error: { code: string } }>().error.code).toBe("slug_taken");
+    const served = await inject(app, { method: "GET", url: `/s/${site.id}/` });
+    expect(served.statusCode).toBe(404);
+  });
+
+  it("retires ids the sweeper removes too", async () => {
+    const h = await setup();
+    const site = (await publish(h.app, { ...helloSite(), ttl: "1h" })).json<{ id: string }>();
+    await reapExpiredSites(
+      { config: h.config, db: h.db, s3: h.s3.client },
+      Date.now() + 2 * 3_600_000,
+    );
+    expect((await publish(h.app, { ...helloSite(), slug: site.id })).statusCode).toBe(409);
+  });
+});
+
+describe("client address", () => {
+  it("reads the configured header behind a trusted proxy, one bucket per client", async () => {
+    const { app } = await setup({
+      trustForwarded: true,
+      clientIpHeader: "cf-connecting-ip",
+      registerPerDay: 1,
+    });
+    // Same edge (socket peer and X-Forwarded-For hop), different clients.
+    const from = (client: string) =>
+      inject(app, {
+        method: "POST",
+        url: "/api/v1/register",
+        payload: { name: "a" },
+        remoteAddress: "127.0.0.1",
+        headers: { "x-forwarded-for": "198.51.100.7", "cf-connecting-ip": client },
+      });
+    expect((await from("203.0.113.1")).statusCode).toBe(201);
+    expect((await from("203.0.113.2")).statusCode).toBe(201);
+    expect((await from("203.0.113.1")).statusCode).toBe(429);
+  });
+
+  it("ignores the header unless forwarding is trusted", async () => {
+    const { app } = await setup({ clientIpHeader: "cf-connecting-ip", registerPerDay: 1 });
+    const from = (client: string) =>
+      inject(app, {
+        method: "POST",
+        url: "/api/v1/register",
+        payload: { name: "a" },
+        remoteAddress: "203.0.113.50",
+        headers: { "cf-connecting-ip": client },
+      });
+    expect((await from("203.0.113.1")).statusCode).toBe(201);
+    expect((await from("203.0.113.2")).statusCode).toBe(429);
+  });
+});
+
+describe("publish failures", () => {
+  it("rejects a path S3 could not delete again", async () => {
+    const { app } = await setup();
+    for (const path of ["a\u0001b.html", "x\ud800.html", `${"n".repeat(256)}.css`]) {
+      const res = await publish(app, {
+        files: [{ path: "index.html", content: "hi" }, { path, content: "x" }],
+      });
+      expect(res.statusCode, JSON.stringify(path)).toBe(400);
+      expect(res.json<{ error: { code: string } }>().error.code).toBe("invalid_path");
+    }
+  });
+
+  it("removes what a failed create uploaded", async () => {
+    const { app, s3 } = await setup();
+    let puts = 0;
+    s3.hooks.beforePut = () => {
+      puts += 1;
+      if (puts === 2) throw new Error("s3 unavailable");
+    };
+    const res = await publish(app, {
+      files: [
+        { path: "index.html", content: "hi" },
+        { path: "a.css", content: "a{}" },
+        { path: "b.css", content: "b{}" },
+      ],
+    });
+    expect(res.statusCode).toBe(500);
+    expect(s3.keysUnder("sites/")).toEqual([]);
+  });
+
+  it("answers a create slug race with 409 and removes the loser's objects", async () => {
+    const { app, s3 } = await setup();
+    const held = gate();
+    let first = true;
+    s3.hooks.beforePut = async () => {
+      if (first) {
+        first = false;
+        await held.wait;
+      }
+    };
+    const slow = publish(app, { ...helloSite("slow"), slug: "launch" });
+    await tick();
+    const fast = await publish(app, { ...helloSite("fast"), slug: "launch" });
+    expect(fast.statusCode).toBe(201);
+    held.open();
+    const lost = await slow;
+    expect(lost.statusCode).toBe(409);
+    const winner = fast.json<{ id: string }>().id;
+    expect(s3.keysUnder("sites/").every((k) => k.startsWith(`sites/${winner}/`))).toBe(true);
+  });
+
+  it("spends no publish quota on a request it rejects", async () => {
+    const { app, db } = await setup();
+    const token = (await register(app)).json<{ token: string }>().token;
+    const rejected = [
+      { ...helloSite(), ttl: null },
+      { files: [{ path: "x.map", content: "{}" }] },
+      { files: [{ path: "a.css", content: "a" }, { path: "b.css", content: "b" }] },
+      { files: [{ path: "x.png", contentBase64: "!!!" }] },
+    ];
+    for (const body of rejected) {
+      expect((await publish(app, body, token)).statusCode).toBe(400);
+    }
+    expect(db.prepare(`SELECT count FROM rate_limits WHERE action = 'publish'`).all()).toEqual([]);
+  });
+});
+
+describe("republish and touch", () => {
+  it("refuses to republish an expired site, without spending quota", async () => {
+    const { app, db } = await setup();
+    const site = (await publish(app, { ...helloSite(), ttl: "1h" })).json<{ id: string }>();
+    db.prepare(`UPDATE sites SET expires_at = ? WHERE id = ?`).run(Date.now() - 1000, site.id);
+    const before = db.prepare(`SELECT sum(count) AS n FROM rate_limits WHERE action = 'publish'`).get();
+    const put = await inject(app, {
+      method: "PUT",
+      url: `/api/v1/sites/${site.id}`,
+      headers: auth(),
+      payload: { ...helloSite("again"), ttl: "7d" },
+    });
+    expect(put.statusCode).toBe(410);
+    expect(db.prepare(`SELECT sum(count) AS n FROM rate_limits WHERE action = 'publish'`).get()).toEqual(
+      before,
+    );
+  });
+
+  it("extends an ops site by the configured default ttl on touch", async () => {
+    const { app } = await setup({ defaultTtl: "30d" });
+    const site = (await publish(app, helloSite())).json<{ id: string; expiresAt: string }>();
+    const later = Date.parse(site.expiresAt);
+    const touched = await inject(app, {
+      method: "POST",
+      url: `/api/v1/sites/${site.id}/touch`,
+      headers: auth(),
+    });
+    expect(touched.statusCode).toBe(200);
+    const expiresAt = Date.parse(touched.json<{ expiresAt: string }>().expiresAt);
+    expect(expiresAt).toBeGreaterThanOrEqual(later);
+    expect(expiresAt - Date.now()).toBeGreaterThan(29 * 86_400_000);
+  });
+
+  it("does not let a publish land on a site deleted during its upload", async () => {
+    const { app, db, s3 } = await setup();
+    const site = (await publish(app, helloSite("v1"))).json<{ id: string }>();
+    const held = gate();
+    s3.hooks.beforePut = () => held.wait;
+    const put = inject(app, {
+      method: "PUT",
+      url: `/api/v1/sites/${site.id}`,
+      headers: auth(),
+      payload: helloSite("v2"),
+    });
+    await tick();
+    s3.hooks.beforePut = undefined;
+    const del = await inject(app, { method: "DELETE", url: `/api/v1/sites/${site.id}`, headers: auth() });
+    expect(del.statusCode).toBe(204);
+    held.open();
+    expect((await put).statusCode).toBe(404);
+    expect(db.prepare(`SELECT count(*) AS n FROM sites`).get()).toEqual({ n: 0 });
+    expect(s3.keysUnder(`sites/${site.id}/`)).toEqual([]);
+  });
+
+  it("refuses a republish whose site expired while it uploaded, and discards it", async () => {
+    const { app, db, s3 } = await setup();
+    const site = (await publish(app, { ...helloSite("v1"), ttl: "1h" })).json<{ id: string }>();
+    const before = s3.keysUnder(`sites/${site.id}/`);
+    const held = gate();
+    s3.hooks.beforePut = () => held.wait;
+    const put = inject(app, {
+      method: "PUT",
+      url: `/api/v1/sites/${site.id}`,
+      headers: auth(),
+      payload: { ...helloSite("v2"), ttl: "7d" },
+    });
+    await tick();
+    db.prepare(`UPDATE sites SET expires_at = ? WHERE id = ?`).run(Date.now() - 1, site.id);
+    held.open();
+    expect((await put).statusCode).toBe(410);
+    expect(s3.keysUnder(`sites/${site.id}/`)).toEqual(before);
+  });
+
+  it("lets a republish that extended a site win over a sweep that listed it", async () => {
+    const h = await setup();
+    const site = (await publish(h.app, { ...helloSite(), ttl: "1h" })).json<{ id: string }>();
+    const sweepAt = Date.now() + 2 * 3_600_000;
+    // The sweep listed the site as expired; before it claims it, a touch lands.
+    h.db.prepare(`UPDATE sites SET expires_at = ? WHERE id = ?`).run(sweepAt + 86_400_000, site.id);
+    expect(markSiteDeleting(h.db, site.id, Date.now(), sweepAt)).toBe(false);
+    await reapExpiredSites({ config: h.config, db: h.db, s3: h.s3.client }, sweepAt);
+    expect((await inject(h.app, { method: "GET", url: `/s/${site.id}/` })).statusCode).toBe(200);
+  });
+});
+
+describe("abandoned uploads", () => {
+  it("leaves a failed publish whose cleanup failed for the sweeper to finish", async () => {
+    const h = await setup();
+    let puts = 0;
+    h.s3.hooks.beforePut = () => {
+      puts += 1;
+      if (puts === 2) throw new Error("s3 unavailable");
+    };
+    h.s3.hooks.deleteError = () => true;
+    const res = await publish(h.app, {
+      files: [
+        { path: "index.html", content: "hi" },
+        { path: "a.css", content: "a{}" },
+      ],
+    });
+    expect(res.statusCode).toBe(500);
+    expect(h.s3.keysUnder("sites/")).toHaveLength(1);
+    h.s3.hooks.beforePut = undefined;
+    h.s3.hooks.deleteError = undefined;
+
+    const deps = { config: h.config, db: h.db, s3: h.s3.client };
+    // Too fresh to be abandoned: a live upload must never be taken.
+    await reapExpiredSites(deps);
+    expect(h.s3.keysUnder("sites/")).toHaveLength(1);
+    await reapExpiredSites(deps, Date.now() + ABANDONED_UPLOAD_MS + 1000);
+    expect(h.s3.keysUnder("sites/")).toEqual([]);
+    expect(h.db.prepare(`SELECT count(*) AS n FROM pending_uploads`).get()).toEqual({ n: 0 });
+  });
+
+  it("clears the record of every publish that commits", async () => {
+    const { app, db } = await setup();
+    const site = (await publish(app, helloSite())).json<{ id: string }>();
+    await inject(app, { method: "PUT", url: `/api/v1/sites/${site.id}`, headers: auth(), payload: helloSite("v2") });
+    expect(db.prepare(`SELECT count(*) AS n FROM pending_uploads`).get()).toEqual({ n: 0 });
+  });
+});
+
+describe("partial delete failures", () => {
+  it("keeps the row for the sweeper when S3 reports per-key errors", async () => {
+    const h = await setup();
+    const site = (await publish(h.app, helloSite())).json<{ id: string }>();
+    h.s3.hooks.deleteError = () => true;
+    const del = await inject(h.app, { method: "DELETE", url: `/api/v1/sites/${site.id}`, headers: auth() });
+    expect(del.statusCode).toBe(204);
+    // Gone to everyone, but the row survives until the objects do.
+    expect((await inject(h.app, { method: "GET", url: `/s/${site.id}/` })).statusCode).toBe(404);
+    const listed = await inject(h.app, { method: "GET", url: "/api/v1/sites", headers: auth() });
+    expect(listed.json<{ sites: unknown[] }>().sites).toEqual([]);
+    const stats = getOwnerStats(h.db);
+    expect(stats.sites).toMatchObject({ total: 0, active: 0 });
+    expect(stats.recentSites).toEqual([]);
+    expect(stats.versions).toMatchObject({ publishes: 0, retained: 0 });
+    expect(stats.activity.reduce((n, d) => n + d.publishes, 0)).toBe(0);
+    expect(h.db.prepare(`SELECT count(*) AS n FROM sites`).get()).toEqual({ n: 1 });
+    expect(h.s3.keysUnder(`sites/${site.id}/`)).not.toEqual([]);
+
+    await reapExpiredSites({ config: h.config, db: h.db, s3: h.s3.client });
+    expect(h.db.prepare(`SELECT count(*) AS n FROM sites`).get()).toEqual({ n: 1 });
+    h.s3.hooks.deleteError = undefined;
+    await reapExpiredSites({ config: h.config, db: h.db, s3: h.s3.client });
+    expect(h.db.prepare(`SELECT count(*) AS n FROM sites`).get()).toEqual({ n: 0 });
+    expect(h.s3.keysUnder(`sites/${site.id}/`)).toEqual([]);
+  });
+});
+
+describe("claim hardening", () => {
+  it("refuses a claim POST from any origin but the API's", async () => {
+    const workos = createFakeWorkOS();
+    const { app } = await setup({ workos: WORKOS_CONFIG }, workos.client);
+    const created = (await register(app)).json<{ claimUrl: string }>();
+    const claimPath = new URL(created.claimUrl).pathname;
+    const confirmation = await inject(app, { method: "GET", url: claimPath });
+    expect(confirmation.headers["referrer-policy"]).toBe("same-origin");
+    for (const origin of ["http://abc123.sites.test.local", "null"]) {
+      const res = await inject(app, {
+        method: "POST",
+        url: claimPath,
+        headers: {
+          origin,
+          cookie: cookiePair(confirmation, "shareplan_claim_confirm"),
+          "content-type": "application/x-www-form-urlencoded",
+        },
+        payload: "",
+      });
+      expect(res.statusCode, origin).toBe(403);
+    }
+    expect(workos.authorizationCalls).toHaveLength(0);
+  });
+
+  it("is unavailable when sites share the API origin", async () => {
+    const workos = createFakeWorkOS();
+    const { app } = await setup({ workos: WORKOS_CONFIG, siteHostSuffix: null }, workos.client);
+    const created = (await register(app)).json<{ claimUrl: string }>();
+    const res = await inject(app, { method: "GET", url: new URL(created.claimUrl).pathname });
+    expect(res.statusCode).toBe(503);
+    expect(setCookieHeaders(res)).toEqual([]);
+  });
+
+  it("keeps claim tokens out of the real log output, however the URL is spelled", async () => {
+    const lines: string[] = [];
+    const logStream = new Writable({
+      write(chunk, _enc, done) {
+        lines.push(String(chunk));
+        done();
+      },
+    });
+    const workos = createFakeWorkOS();
+    const config = { ...(await setup()).config, workos: WORKOS_CONFIG, siteHostSuffix: "sites.test.local" };
+    const db = openDb(":memory:");
+    const app = await buildApp({ config, db, s3: createFakeS3().client, workos: workos.client, logStream });
+    const secret = "abcdefghijklmnopqrstuv";
+    for (const [method, url] of [
+      ["GET", `/claim/${secret}`],
+      ["HEAD", `/claim/${secret}`],
+      ["HEAD", `/cl%61im/${secret}`],
+      ["GET", `/cl%61im/${secret}/`],
+      ["GET", `//claim/${secret}`],
+      ["GET", `/CLAIM/${secret}`],
+      ["GET", `/v1/auth/workos/callback/?code=${secret}&state=s`],
+      ["GET", `/v1/auth/workos/callback?code=${secret}&state=s`],
+    ] as const) {
+      await app.inject({ method, url });
+    }
+    await app.close();
+    db.close();
+    expect(lines.length).toBeGreaterThan(0);
+    expect(lines.filter((l) => l.includes(secret))).toEqual([]);
+  });
+
+  it("keeps claim tokens out of request logs and 404 bodies", async () => {
+    expect(redactRequestUrl("/claim/abcdefghijklmnopqrstuv")).toBe("/claim/[redacted]");
+    expect(redactRequestUrl("/claim/abcdefghijklmnopqrstuv/?x=1")).toBe("/claim/[redacted]");
+    expect(redactRequestUrl("/v1/auth/workos/callback?code=c&state=s")).toBe(
+      "/v1/auth/workos/callback?[redacted]",
+    );
+    expect(redactRequestUrl("/api/v1/sites?x=1")).toBe("/api/v1/sites?x=1");
+
+    const { app } = await setup();
+    const res = await inject(app, { method: "GET", url: "/claim/abcdefghijklmnopqrstuv/" });
+    expect(res.statusCode).toBe(404);
+    expect(res.body).not.toContain("abcdefghijklmnopqrstuv");
+  });
+});
+
+describe("index.htm", () => {
+  it("serves a bundle whose index is index.htm at its own url", async () => {
+    const { app } = await setup();
+    const site = (
+      await publish(app, {
+        files: [
+          { path: "index.htm", content: "root htm" },
+          { path: "docs/index.htm", content: "docs htm" },
+          { path: "style.css", content: "body{}" },
+        ],
+      })
+    ).json<{ id: string }>();
+    const root = await inject(app, { method: "GET", url: `/s/${site.id}/` });
+    expect(root.statusCode).toBe(200);
+    expect(root.body).toBe("root htm");
+    expect(root.headers["content-security-policy"]).toContain("default-src 'self'");
+    const docs = await inject(app, { method: "GET", url: `/s/${site.id}/docs` });
+    expect(docs.statusCode).toBe(302);
+    expect((await inject(app, { method: "GET", url: `/s/${site.id}/docs/` })).body).toBe("docs htm");
+  });
+});
+
+describe("council round 1", () => {
+  /** A slug-capable second account, so slug ownership can be told apart. */
+  function otherAccount(db: DatabaseSync, token = "sp_other_owner") {
+    const user = createUser(db, { tier: "free-" });
+    createApiKeyRecord(db, { name: "other", token, userId: user.id });
+    return token;
+  }
+
+  it("keeps a slug freed by a delete or a rename for its previous owner", async () => {
+    const { app, db } = await setup();
+    const other = otherAccount(db);
+    const first = (await publish(app, { ...helloSite("a"), slug: "acme-plan" })).json<{ id: string }>();
+    await inject(app, { method: "DELETE", url: `/api/v1/sites/${first.id}`, headers: auth() });
+    const taken = await publish(app, { ...helloSite("m"), slug: "acme-plan" }, other);
+    expect(taken.statusCode).toBe(409);
+    expect((await publish(app, { ...helloSite("a2"), slug: "acme-plan" })).statusCode).toBe(201);
+
+    const second = (await publish(app, { ...helloSite("b"), slug: "team-notes" })).json<{ id: string }>();
+    const renamed = await inject(app, {
+      method: "PUT",
+      url: `/api/v1/sites/${second.id}`,
+      headers: auth(),
+      payload: { ...helloSite("b2"), slug: "team-notes-2" },
+    });
+    expect(renamed.statusCode).toBe(200);
+    expect((await publish(app, { ...helloSite("m"), slug: "team-notes" }, other)).statusCode).toBe(409);
+  });
+
+  it("reserves sign-in and account labels", async () => {
+    const { app } = await setup();
+    for (const slug of ["login", "auth", "billing", "support"]) {
+      expect((await publish(app, { ...helloSite(), slug })).statusCode, slug).toBe(409);
+    }
+  });
+
+  it("keeps an abandoned upload's record until its objects are really gone", async () => {
+    const h = await setup();
+    h.s3.hooks.deleteError = () => true;
+    // The first file lands, the second fails, and the cleanup fails too.
+    let puts = 0;
+    h.s3.hooks.beforePut = () => {
+      puts += 1;
+      if (puts === 2) throw new Error("s3 unavailable");
+    };
+    await publish(h.app, { files: [{ path: "index.html", content: "hi" }, { path: "a.css", content: "a" }] });
+    h.s3.hooks.beforePut = undefined;
+    const deps = { config: h.config, db: h.db, s3: h.s3.client };
+    const later = Date.now() + ABANDONED_UPLOAD_MS + 1000;
+    // The sweep takes it but the delete fails: the record must survive.
+    await reapExpiredSites(deps, later);
+    const pending = h.db.prepare(`SELECT abandoned_at FROM pending_uploads`).all() as { abandoned_at: number | null }[];
+    expect(pending).toHaveLength(1);
+    expect(pending[0]!.abandoned_at).not.toBeNull();
+    h.s3.hooks.deleteError = undefined;
+    // A later sweep, even an early one, retries it because it is marked.
+    await reapExpiredSites(deps);
+    expect(h.s3.keysUnder("sites/")).toEqual([]);
+    expect(h.db.prepare(`SELECT count(*) AS n FROM pending_uploads`).get()).toEqual({ n: 0 });
+  });
+
+  it("retries a prune that failed during a publish", async () => {
+    const h = await setup({ versionRetention: 1 });
+    const site = (await publish(h.app, helloSite("v1"))).json<{ id: string; versionId: string }>();
+    h.s3.hooks.deleteError = () => true;
+    const put = await inject(h.app, {
+      method: "PUT",
+      url: `/api/v1/sites/${site.id}`,
+      headers: auth(),
+      payload: helloSite("v2"),
+    });
+    expect(put.statusCode).toBe(200);
+    expect(h.s3.keysUnder(`sites/${site.id}/v/${site.versionId}/`)).not.toEqual([]);
+    h.s3.hooks.deleteError = undefined;
+    await reapExpiredSites({ config: h.config, db: h.db, s3: h.s3.client });
+    expect(h.s3.keysUnder(`sites/${site.id}/v/${site.versionId}/`)).toEqual([]);
+    expect(
+      h.db.prepare(`SELECT pruned_at FROM site_versions WHERE id = ?`).get(site.versionId),
+    ).not.toEqual({ pruned_at: null });
+  });
+
+  it("answers a publish that committed even if the site is deleted while it prunes", async () => {
+    const h = await setup({ versionRetention: 1 });
+    const site = (await publish(h.app, helloSite("v1"))).json<{ id: string }>();
+    const held = gate();
+    let first = true;
+    h.s3.hooks.beforeDelete = async () => {
+      if (first) {
+        first = false;
+        await held.wait;
+      }
+    };
+    const put = inject(h.app, {
+      method: "PUT",
+      url: `/api/v1/sites/${site.id}`,
+      headers: auth(),
+      payload: helloSite("v2"),
+    });
+    await tick();
+    const del = await inject(h.app, { method: "DELETE", url: `/api/v1/sites/${site.id}`, headers: auth() });
+    expect(del.statusCode).toBe(204);
+    held.open();
+    expect((await put).statusCode).toBe(200);
+  });
+
+  it("refuses an address after ten wrong admin tokens, even with the right one", async () => {
+    const { app } = await setup();
+    const call = (token: string) =>
+      inject(app, { method: "GET", url: "/api/v1/admin/keys", headers: { "x-admin-token": token } });
+    for (let i = 0; i < 10; i++) expect((await call(`wrong-${i}`)).statusCode).toBe(401);
+    expect((await call("wrong-again")).statusCode).toBe(429);
+    expect((await call(ADMIN)).statusCode).toBe(429);
+  });
+
+  it("answers HEAD without downloading the object", async () => {
+    const { app, s3 } = await setup();
+    const site = (await publish(app, helloSite("<h1>sized</h1>"))).json<{ id: string }>();
+    s3.sent.length = 0;
+    const head = await inject(app, { method: "HEAD", url: `/s/${site.id}/` });
+    expect(head.statusCode).toBe(200);
+    expect(head.headers["content-length"]).toBe(String("<h1>sized</h1>".length));
+    expect(s3.sent).not.toContain("GetObjectCommand");
+    const get = await inject(app, { method: "GET", url: `/s/${site.id}/` });
+    expect(get.body).toBe("<h1>sized</h1>");
+  });
+
+  it("puts a private site's headers on its errors and hides whether it expired", async () => {
+    const { app, db } = await setup();
+    const site = (
+      await publish(app, { ...helloSite(), visibility: "private", ttl: "1h" })
+    ).json<{ id: string }>();
+    const denied = await inject(app, { method: "GET", url: `/s/${site.id}/` });
+    expect(denied.statusCode).toBe(401);
+    expect(denied.headers["cache-control"]).toBe("private, no-store");
+    expect(denied.headers["x-content-type-options"]).toBe("nosniff");
+    db.prepare(`UPDATE sites SET expires_at = ? WHERE id = ?`).run(Date.now() - 1, site.id);
+    expect((await inject(app, { method: "GET", url: `/s/${site.id}/` })).statusCode).toBe(401);
+    const owner = await inject(app, { method: "GET", url: `/s/${site.id}/`, headers: auth() });
+    expect(owner.statusCode).toBe(410);
+  });
+});
+
+describe("council round 2", () => {
+  it("counts parallel wrong admin tokens before any of them is answered", async () => {
+    const { app } = await setup();
+    const call = (token: string) =>
+      inject(app, { method: "GET", url: "/api/v1/admin/keys", headers: { "x-admin-token": token } });
+    const results = await Promise.all(Array.from({ length: 30 }, (_, i) => call(`wrong-${i}`)));
+    const codes = results.map((r) => r.statusCode);
+    expect(codes.filter((c) => c === 401)).toHaveLength(10);
+    expect(codes.filter((c) => c === 429)).toHaveLength(20);
+    expect((await call(ADMIN)).statusCode).toBe(429);
+  });
+
+  it("does not let owner-session 401s or missing tokens lock out the admin token", async () => {
+    const { app } = await setup();
+    for (let i = 0; i < 15; i++) {
+      await inject(app, { method: "GET", url: "/api/v1/admin/stats" });
+      await inject(app, { method: "GET", url: "/api/v1/admin/keys" });
+    }
+    const ok = await inject(app, {
+      method: "GET",
+      url: "/api/v1/admin/keys",
+      headers: { "x-admin-token": ADMIN },
+    });
+    expect(ok.statusCode).toBe(200);
+  });
+
+  it("keeps a privacy change that lands while a content-only republish uploads", async () => {
+    const { app, s3 } = await setup();
+    const site = (await publish(app, helloSite("v1"))).json<{ id: string }>();
+    const held = gate();
+    let first = true;
+    s3.hooks.beforePut = async () => {
+      if (first) {
+        first = false;
+        await held.wait;
+      }
+    };
+    const slow = inject(app, {
+      method: "PUT",
+      url: `/api/v1/sites/${site.id}`,
+      headers: auth(),
+      payload: helloSite("content only"),
+    });
+    await tick();
+    const fast = await inject(app, {
+      method: "PUT",
+      url: `/api/v1/sites/${site.id}`,
+      headers: auth(),
+      payload: { ...helloSite("now private"), visibility: "private" },
+    });
+    expect(fast.statusCode).toBe(200);
+    held.open();
+    const res = await slow;
+    expect(res.statusCode).toBe(200);
+    expect(res.json<{ visibility: string }>().visibility).toBe("private");
+    expect((await inject(app, { method: "GET", url: `/s/${site.id}/` })).statusCode).toBe(401);
+  });
+
+  it("refuses a new site whose id was claimed as a slug while it uploaded", async () => {
+    const { app, db, s3 } = await setup();
+    const held = gate();
+    let first = true;
+    s3.hooks.beforePut = async () => {
+      if (first) {
+        first = false;
+        await held.wait;
+      }
+    };
+    const slow = publish(app, helloSite("slow"));
+    await tick();
+    const prefix = (db.prepare(`SELECT prefix FROM pending_uploads`).get() as { prefix: string }).prefix;
+    const pendingId = /^sites\/([^/]+)\//.exec(prefix)![1]!;
+    const squatter = await publish(app, { ...helloSite("squat"), slug: pendingId });
+    expect(squatter.statusCode).toBe(201);
+    held.open();
+    const res = await slow;
+    expect(res.statusCode).toBe(409);
+    expect(s3.keysUnder(`sites/${pendingId}/`)).toEqual([]);
+  });
+
+  it("frees a retired slug for anyone once its hold has passed", async () => {
+    const { app, db } = await setup();
+    const other = createUser(db, { tier: "free-" });
+    createApiKeyRecord(db, { name: "other", token: "sp_other2", userId: other.id });
+    const site = (await publish(app, { ...helloSite(), slug: "old-name" })).json<{ id: string }>();
+    await inject(app, { method: "DELETE", url: `/api/v1/sites/${site.id}`, headers: auth() });
+    expect((await publish(app, { ...helloSite(), slug: "old-name" }, "sp_other2")).statusCode).toBe(409);
+    db.prepare(`UPDATE retired_slugs SET retired_at = ?`).run(Date.now() - 91 * 86_400_000);
+    expect((await publish(app, { ...helloSite(), slug: "old-name" }, "sp_other2")).statusCode).toBe(201);
+  });
+
+  it("answers a stream that fails before its first byte with a JSON error", async () => {
+    const { app, s3 } = await setup();
+    const site = (await publish(app, helloSite("<h1>big</h1>"))).json<{ id: string }>();
+    s3.hooks.getResponse = () => ({
+      ContentLength: 5 * 1024 * 1024,
+      Body: new Readable({
+        read() {
+          this.destroy(new Error("s3 connection reset"));
+        },
+      }),
+    });
+    const res = await inject(app, { method: "GET", url: `/s/${site.id}/` });
+    expect(res.statusCode).toBe(500);
+    expect(res.headers["content-type"]).toContain("application/json");
+    expect(res.json<{ error: { code: string } }>().error.code).toBe("internal_error");
+  });
+
+  it("puts a private site's headers on errors from its host before serving starts", async () => {
+    const { app } = await setup({ siteHostSuffix: "sites.test", publicBaseUrl: "https://api.test" });
+    const site = (await publish(app, { ...helloSite(), visibility: "private" })).json<{ id: string }>();
+    const host = { host: `${site.id}.sites.test` };
+    const post = await inject(app, { method: "POST", url: "/", headers: host });
+    expect(post.statusCode).toBe(405);
+    expect(post.headers["cache-control"]).toBe("private, no-store");
+    expect(post.headers["x-content-type-options"]).toBe("nosniff");
+    const bad = await inject(app, { method: "GET", url: "/%E0%A4%A", headers: host });
+    expect(bad.statusCode).toBe(400);
+    expect(bad.headers["cache-control"]).toBe("private, no-store");
+  });
+});
+
+describe("council round 3", () => {
+  it("never lets a CDN cache a server error from a public site", async () => {
+    const { app, s3 } = await setup();
+    const site = (await publish(app, { ...helloSite("<h1>pub</h1>") })).json<{ id: string }>();
+    s3.hooks.getResponse = () => ({
+      ContentLength: 10,
+      Body: new Readable({
+        read() {
+          this.destroy(new Error("s3 connection reset"));
+        },
+      }),
+    });
+    const res = await inject(app, { method: "GET", url: `/s/${site.id}/` });
+    expect(res.statusCode).toBe(500);
+    expect(res.headers["cache-control"]).toBe("no-store");
+  });
+
+  it("leaves a site host's admin-path requests to the site, with its headers", async () => {
+    const { app } = await setup({ siteHostSuffix: "sites.test", publicBaseUrl: "https://api.test" });
+    const site = (await publish(app, { ...helloSite(), visibility: "private" })).json<{ id: string }>();
+    for (let i = 0; i < 10; i++) {
+      await inject(app, {
+        method: "GET",
+        url: "/api/v1/admin/keys",
+        headers: { host: "api.test", "x-admin-token": `wrong-${i}` },
+      });
+    }
+    const onSite = await inject(app, {
+      method: "GET",
+      url: "/api/v1/admin/keys",
+      headers: { host: `${site.id}.sites.test` },
+    });
+    expect(onSite.statusCode).not.toBe(429);
+    expect(onSite.headers["cache-control"]).toBe("private, no-store");
   });
 });
