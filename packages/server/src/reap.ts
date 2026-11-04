@@ -8,6 +8,7 @@ import {
   pruneRateLimits,
   reconcilePermanentSites,
 } from "./db.js";
+import { pruneViewerAuth } from "./viewer-db.js";
 import { deleteSiteObjects } from "./storage.js";
 
 export interface Logger {
@@ -35,6 +36,7 @@ export async function reapExpiredSites(
 ): Promise<{ sites: number; objects: number }> {
   pruneRateLimits(deps.db, now);
   pruneClaimAuthFlows(deps.db, now);
+  pruneViewerAuth(deps.db, now);
   // Guarded so a reconcile failure never blocks expired-site deletion.
   try {
     const { clamped } = reconcilePermanentSites(deps.db, now, deps.log);

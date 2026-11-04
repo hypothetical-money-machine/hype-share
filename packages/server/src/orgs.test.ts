@@ -131,6 +131,7 @@ function createFakeWorkOS(method: string | undefined = "MagicAuth"): FakeWorkOS 
   };
   fake.client = {
     userManagement: {
+      getLogoutUrl: () => "https://auth.test/logout",
       getAuthorizationUrlWithPKCE: async () => {
         flow += 1;
         return {
@@ -146,6 +147,7 @@ function createFakeWorkOS(method: string | undefined = "MagicAuth"): FakeWorkOS 
           emailVerified: true,
         },
         authenticationMethod: fake.method,
+        accessToken: "unused-claim-token",
       }),
     },
     organizations: {

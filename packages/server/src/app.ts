@@ -65,6 +65,9 @@ import {
   type StoredVisibility,
 } from "./db.js";
 import { AuthError, requireAccount, requireAdmin, type Account } from "./auth.js";
+import { claimRedirectPage, escapeHtml, setAuthPageHeaders } from "./auth-pages.js";
+import { siteScheme, siteUrl } from "./site-url.js";
+import { registerViewerRoutes } from "./viewer.js";
 import { registerOwnerPortal } from "./owner.js";
 import { HttpError } from "./errors.js";
 import { hashIp, requestIp } from "./ip.js";
@@ -154,7 +157,7 @@ export interface AppDeps {
   s3: S3Client;
   /** Fastify options passthrough, mainly so tests can silence the logger. */
   logger?: boolean;
-  /** Test override for the WorkOS methods used by claiming and org linking. */
+  /** Test override for the WorkOS methods used by claims, viewers and org linking. */
   workos?: WorkOSAuthClient;
 }
 
@@ -164,7 +167,9 @@ export interface WorkOSAuthClient {
       clientId: string;
       provider: "authkit";
       redirectUri: string;
-      screenHint: "sign-up";
+      screenHint?: "sign-up";
+      organizationId?: string;
+      maxAge?: number;
     }): Promise<{ url: string; state: string; codeVerifier: string }>;
     authenticateWithCode(options: {
       clientId: string;
@@ -175,7 +180,11 @@ export interface WorkOSAuthClient {
     }): Promise<{
       user: { id: string; email: string; emailVerified: boolean };
       authenticationMethod?: string;
+      organizationId?: string;
+      impersonator?: { email: string; reason: string | null };
+      accessToken: string;
     }>;
+    getLogoutUrl(options: { sessionId: string; returnTo?: string }): string;
   };
   organizations: {
     /** The WorkOS organization, or null when WorkOS has no organization with this id. */
@@ -210,7 +219,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     "application/x-www-form-urlencoded",
     { parseAs: "string" },
     (req, body, done) => {
-      if (req.method === "POST" && ["/owner/login", "/owner/logout"].includes(splitQuery(req.url).path)) {
+      if (req.method === "POST" && ["/owner/login", "/owner/logout", "/v1/view/logout"].includes(splitQuery(req.url).path)) {
         done(null, Object.fromEntries(new URLSearchParams(body as string)));
         return;
       }
@@ -288,6 +297,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 
   app.get("/healthz", async () => ({ ok: true }));
   registerOwnerPortal(app, deps.config, deps.db);
+  registerViewerRoutes(app, deps.config, deps.db, workos);
   registerOrgRoutes(app, {
     config: deps.config,
     db: deps.db,
@@ -315,7 +325,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   <h1>shareplan</h1>
   <p>Small S3-backed microsite host for agents and humans.</p>
   <p>Publish with the CLI or <code>POST /api/v1/sites</code>. Sites live at <code>${siteUrlShape(deps.config)}</code>.</p>
-  <p><a href="/healthz">healthz</a> · <a href="/docs/agents">agent docs</a> · <a href="/owner">owner portal</a></p>
+  <p><a href="/healthz">healthz</a> · <a href="/docs/agents">agent docs</a> · <a href="/owner">owner portal</a> · <a href="/v1/view/">viewer sign-in</a></p>
 </body>
 </html>`;
   });
@@ -336,6 +346,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       "Returns `token` (`sp_...`), `claimUrl`, and account metadata. Rate-limited to 10/day per IP hash.",
       "",
       "Optional `\"orgToken\"`: an organization join token; the key then publishes at the organization's tier.",
+      "",
+      "Viewer sign-in and sign-out: [/v1/view/](/v1/view/). Org sites remain owner-key-only until the site handoff ships. See PLAN.md, Org-private viewing.",
       "",
       "## Auth",
       "`Authorization: Bearer sp_...`",
@@ -852,6 +864,7 @@ function createWorkOSAuthClient(config: Config): WorkOSAuthClient | null {
   });
   return {
     userManagement: {
+      getLogoutUrl: (options) => client.userManagement.getLogoutUrl(options),
       getAuthorizationUrlWithPKCE: (options) =>
         client.userManagement.getAuthorizationUrlWithPKCE(options),
       authenticateWithCode: async (options) => {
@@ -863,6 +876,9 @@ function createWorkOSAuthClient(config: Config): WorkOSAuthClient | null {
             emailVerified: result.user.emailVerified,
           },
           authenticationMethod: result.authenticationMethod,
+          organizationId: result.organizationId,
+          impersonator: result.impersonator,
+          accessToken: result.accessToken,
         };
       },
     },
@@ -950,36 +966,6 @@ function claimConfirmationPage(reply: FastifyReply): FastifyReply {
 </html>`);
 }
 
-function claimRedirectPage(reply: FastifyReply, authorizationUrl: string): FastifyReply {
-  // Chromium applies the confirmation form's form-action policy to HTTP redirects.
-  // Finish the same-origin POST before navigating to the external sign-in page.
-  setAuthPageHeaders(reply, false);
-  const url = escapeHtml(authorizationUrl);
-  return reply.type("text/html; charset=utf-8").status(200).send(`<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="0;url=${url}">
-  <title>Opening sign-in · shareplan</title>
-</head>
-<body>
-  <p><a href="${url}">Continue to sign in</a></p>
-</body>
-</html>`);
-}
-
-function setAuthPageHeaders(reply: FastifyReply, allowForm: boolean): void {
-  reply.header("Cache-Control", "no-store");
-  reply.header("Referrer-Policy", "no-referrer");
-  reply.header("X-Content-Type-Options", "nosniff");
-  reply.header("X-Robots-Tag", "noindex, nofollow");
-  reply.header(
-    "Content-Security-Policy",
-    `default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action ${allowForm ? "'self'" : "'none'"}; frame-ancestors 'none'`,
-  );
-}
-
 function claimCookieName(config: Config, name: string): string {
   return new URL(config.publicBaseUrl).protocol === "https:" ? `__Host-${name}` : name;
 }
@@ -1032,14 +1018,6 @@ function clearClaimCallbackCookie(reply: FastifyReply, config: Config): void {
     secure: claimCookiesAreSecure(config),
     path: "/",
   });
-}
-
-function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
 }
 
 /** Request URL split at the "?", with the query keeping its "?" (or ""). */
@@ -1585,21 +1563,6 @@ async function serveSitePath(
   }
 
   await reply.send(obj.body);
-}
-
-/**
- * Sites share the API host's scheme; a plain-http deployment behind no TLS
- * would otherwise hand out https links that do not resolve.
- */
-function siteScheme(config: Config): "http" | "https" {
-  return config.publicBaseUrl.startsWith("http://") ? "http" : "https";
-}
-
-function siteUrl(config: Config, id: string): string {
-  if (config.siteHostSuffix === null) {
-    return `${config.publicBaseUrl}/s/${id}/`;
-  }
-  return `${siteScheme(config)}://${id}.${config.siteHostSuffix}/`;
 }
 
 /** How the landing page describes site URLs, without inventing an id. */

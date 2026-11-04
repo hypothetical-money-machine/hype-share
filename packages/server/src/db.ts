@@ -383,6 +383,35 @@ export function upgrade(db: DatabaseSync): void {
     CREATE INDEX IF NOT EXISTS idx_sites_audience_org
       ON sites(audience_org_id) WHERE audience_org_id IS NOT NULL;
   `);
+  // Viewer identities are deliberately separate from publishing users. Additive
+  // DDL stays at the end of upgrade(), with no user_version bump.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS viewer_auth_flows (
+      state_hash TEXT PRIMARY KEY,
+      browser_nonce_hash TEXT NOT NULL,
+      code_verifier TEXT NOT NULL,
+      workos_org_id TEXT NOT NULL,
+      site_id TEXT NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+      return_path TEXT NOT NULL,
+      site_nonce_hash TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_viewer_auth_flows_expires ON viewer_auth_flows(expires_at);
+    CREATE TABLE IF NOT EXISTS viewer_sessions (
+      token_hash TEXT PRIMARY KEY,
+      workos_user_id TEXT NOT NULL,
+      email TEXT NOT NULL,
+      workos_org_id TEXT NOT NULL,
+      workos_session_id TEXT NOT NULL,
+      auth_time INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      revoked_at INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_viewer_sessions_org ON viewer_sessions(workos_org_id);
+    CREATE INDEX IF NOT EXISTS idx_viewer_sessions_expires ON viewer_sessions(expires_at);
+  `);
   // Cancelling an audience must stick, even on a binary that predates these
   // columns: honouredAudience compares current values, so detach then
   // re-attach, or link A to B and back, would otherwise revive it. Triggers
@@ -1247,8 +1276,14 @@ export function updateOrg(
       // granted. honouredAudience already refuses the old link, and
       // trg_orgs_link_change_clears_audience clears the columns on the write
       // below; clearing them first here is what lets us count them. Viewer
-      // sign-in will also revoke viewer sessions for the old WorkOS org here.
+      // sessions for the old WorkOS org are revoked in this same transaction;
+      // slice 5 must check viewer liveness on every site request.
       clearOrgAudiences(db, id, touched);
+      if (before.workos_organization_id !== null) {
+        db.prepare(`UPDATE viewer_sessions SET revoked_at = ?
+          WHERE workos_org_id = ? AND revoked_at IS NULL`)
+          .run(now, before.workos_organization_id);
+      }
     }
     try {
       db.prepare(`UPDATE orgs SET ${sets.join(", ")} WHERE id = ?`).run(...values, id);
@@ -1280,6 +1315,12 @@ export function deleteOrg(db: DatabaseSync, id: string, now: number): ClampSumma
     // also catches a site whose owner left the org without a clamp.
     const touched = new Set<string>();
     clearOrgAudiences(db, id, touched);
+    if (org.workos_organization_id !== null) {
+      // Deleting is a link change too: another org may later link this WorkOS org.
+      db.prepare(`UPDATE viewer_sessions SET revoked_at = ?
+        WHERE workos_org_id = ? AND revoked_at IS NULL`)
+        .run(now, org.workos_organization_id);
+    }
     // Detaching cancels every member's audiences (the users trigger would
     // too); cleared first so they are counted.
     for (const member of members) clearOwnerAudiences(db, member, touched);
