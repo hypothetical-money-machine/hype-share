@@ -8,9 +8,12 @@ import type { DatabaseSync } from "node:sqlite";
 import { buildApp, type WorkOSAuthClient } from "./app.js";
 import type { Config } from "./config.js";
 import {
+  countHonouredAudiences,
   createApiKeyRecord,
   createOpsKey,
   createUser,
+  honouredAudience,
+  type AudienceFields,
   getUser,
   hashApiKey,
   openDb,
@@ -1703,6 +1706,741 @@ describe("operator: link a WorkOS organization", () => {
     const linked = Object.fromEntries(stats.orgList.map((o) => [o.name, o.workosLinked]));
     expect(linked).toEqual({ Linked: 1, Plain: 0 });
     expect(JSON.stringify(stats)).not.toContain(WORKOS_ORG_A);
+  });
+});
+
+interface SiteBody {
+  id: string;
+  url: string;
+  versionId: string;
+  slug: string | null;
+  visibility: string;
+}
+
+/** A paid org linked to WORKOS_ORG_A with one token-registered member. */
+async function linkedOrgSetup() {
+  const workos = createFakeWorkOS();
+  const harness = await setup({ workos: WORKOS_CONFIG }, workos.client);
+  const { org, joinToken } = await createOrg(harness.app, {
+    name: "SkySlope",
+    compTier: "paid",
+    workosOrganizationId: WORKOS_ORG_A,
+  });
+  const member = await joinAsMember(harness.app, joinToken);
+  return { ...harness, workos, org, joinToken, member };
+}
+
+function republish(
+  app: FastifyInstance,
+  id: string,
+  body: object,
+  token: string,
+): Promise<LightMyRequestResponse> {
+  return inject(app, {
+    method: "PUT",
+    url: `/api/v1/sites/${id}`,
+    headers: auth(token),
+    payload: body,
+    remoteAddress: IP,
+  });
+}
+
+async function publishOrgSite(app: FastifyInstance, token: string): Promise<SiteBody> {
+  const res = await publish(app, { ...helloSite(), visibility: "org" }, token);
+  expect(res.statusCode).toBe(201);
+  return res.json<SiteBody>();
+}
+
+function rawSite(db: DatabaseSync, id: string) {
+  return db
+    .prepare(
+      `SELECT visibility, slug, current_version_id, audience_org_id, audience_workos_org_id,
+              audience_version_id
+       FROM sites WHERE id = ?`,
+    )
+    .get(id) as {
+    visibility: string;
+    slug: string | null;
+    current_version_id: string;
+    audience_org_id: string | null;
+    audience_workos_org_id: string | null;
+    audience_version_id: string | null;
+  };
+}
+
+const NO_AUDIENCE = {
+  audience_org_id: null,
+  audience_workos_org_id: null,
+  audience_version_id: null,
+};
+
+async function apiVisibility(app: FastifyInstance, id: string, token: string): Promise<string> {
+  const res = await inject(app, { method: "GET", url: `/api/v1/sites/${id}`, headers: auth(token) });
+  expect(res.statusCode).toBe(200);
+  return res.json<SiteBody>().visibility;
+}
+
+/**
+ * Hold the next S3 put until release(), so a test can run another write while
+ * a publish is mid-upload. Only the first put pauses; the rest pass through.
+ */
+function pauseNextUpload(s3: FakeS3): { started: Promise<void>; release: () => void } {
+  const client = s3.client as unknown as {
+    send: (cmd: { constructor: { name: string } }) => Promise<unknown>;
+  };
+  const original = client.send;
+  let open!: () => void;
+  let markStarted!: () => void;
+  const gate = new Promise<void>((resolve) => (open = resolve));
+  const started = new Promise<void>((resolve) => (markStarted = resolve));
+  let paused = false;
+  client.send = async (cmd) => {
+    if (!paused && cmd.constructor.name === "PutObjectCommand") {
+      paused = true;
+      markStarted();
+      await gate;
+    }
+    return original(cmd);
+  };
+  return {
+    started,
+    release: () => {
+      client.send = original;
+      open();
+    },
+  };
+}
+
+/** Every version prefix in S3 belongs to a recorded version: no orphaned upload. */
+function expectNoOrphanedVersions(db: DatabaseSync, s3: FakeS3, siteId: string): void {
+  const stored = new Set(
+    s3.keysUnder(`sites/${siteId}/v/`).map((key) => key.split("/")[3]!),
+  );
+  const recorded = new Set(
+    (
+      db.prepare(`SELECT id FROM site_versions WHERE site_id = ?`).all(siteId) as { id: string }[]
+    ).map((r) => r.id),
+  );
+  for (const version of stored) expect(recorded.has(version)).toBe(true);
+}
+
+describe("org visibility: create", () => {
+  it("stores an org site as private plus an audience and reports it as org", async () => {
+    const { app, db, org, member } = await linkedOrgSetup();
+    const site = await publishOrgSite(app, member.token);
+    expect(site.visibility).toBe("org");
+    expect(site.slug).toBeNull();
+
+    // The raw row is private, so anything that misses the audience fails closed.
+    expect(rawSite(db, site.id)).toEqual({
+      visibility: "private",
+      slug: null,
+      current_version_id: site.versionId,
+      audience_org_id: org.id,
+      audience_workos_org_id: WORKOS_ORG_A,
+      audience_version_id: site.versionId,
+    });
+
+    expect(await apiVisibility(app, site.id, member.token)).toBe("org");
+    const list = await inject(app, { method: "GET", url: "/api/v1/sites", headers: auth(member.token) });
+    expect(list.json<{ sites: SiteBody[] }>().sites.map((s) => s.visibility)).toEqual(["org"]);
+    const lead = await mintAdmin(app, org.id);
+    const orgSites = await inject(app, {
+      method: "GET",
+      url: "/api/v1/org/sites",
+      headers: auth(lead.token),
+    });
+    expect(orgSites.json<{ sites: SiteBody[] }>().sites.map((s) => s.visibility)).toEqual(["org"]);
+  });
+
+  it("serves an org site exactly like a private one: owner key only", async () => {
+    const { app, member } = await linkedOrgSetup();
+    const site = await publishOrgSite(app, member.token);
+    const anonymous = await inject(app, { method: "GET", url: `/s/${site.id}/` });
+    expect(anonymous.statusCode).toBe(401);
+    const otherKey = await inject(app, { method: "GET", url: `/s/${site.id}/`, headers: auth() });
+    expect(otherKey.statusCode).toBe(404);
+    const owner = await inject(app, {
+      method: "GET",
+      url: `/s/${site.id}/`,
+      headers: auth(member.token),
+    });
+    expect(owner.statusCode).toBe(200);
+    expect(owner.body).toContain("hello");
+    expect(owner.headers["cache-control"]).toBe("private, no-store");
+  });
+
+  it("needs the caller's org linked to WorkOS", async () => {
+    const workos = createFakeWorkOS();
+    const { app } = await setup({ workos: WORKOS_CONFIG }, workos.client);
+    const { joinToken } = await createOrg(app, { name: "Unlinked", compTier: "paid" });
+    const member = await joinAsMember(app, joinToken);
+    const unlinked = await publish(app, { ...helloSite(), visibility: "org" }, member.token);
+    expect(unlinked.statusCode).toBe(400);
+    expect(errorCode(unlinked)).toBe("visibility_not_allowed");
+
+    // An account outside any org, here the operator key.
+    const noOrg = await publish(app, { ...helloSite(), visibility: "org" });
+    expect(noOrg.statusCode).toBe(400);
+    expect(errorCode(noOrg)).toBe("visibility_not_allowed");
+  });
+
+  it("is refused when WorkOS is not configured, even with a leftover link", async () => {
+    const { app, db } = await setup();
+    const { org, joinToken } = await createOrg(app, { name: "SkySlope", compTier: "paid" });
+    db.prepare(`UPDATE orgs SET workos_organization_id = ? WHERE id = ?`).run(WORKOS_ORG_A, org.id);
+    const member = await joinAsMember(app, joinToken);
+    const res = await publish(app, { ...helloSite(), visibility: "org" }, member.token);
+    expect(res.statusCode).toBe(400);
+    expect(errorCode(res)).toBe("visibility_not_allowed");
+  });
+
+  it("never takes a vanity slug, even on a tier that allows slugs", async () => {
+    const { app, s3, member } = await linkedOrgSetup();
+    const res = await publish(app, { ...helloSite(), visibility: "org", slug: "plan" }, member.token);
+    expect(res.statusCode).toBe(400);
+    expect(errorCode(res)).toBe("slug_not_allowed");
+    // The same member may still take a slug on an ordinary site.
+    expect((await publish(app, { ...helloSite(), slug: "plan" }, member.token)).statusCode).toBe(201);
+    expect(s3.keysUnder("sites/").length).toBe(1);
+  });
+});
+
+describe("org visibility: republish", () => {
+  it("keeps org when visibility is omitted or org, on the new version", async () => {
+    const { app, db, org, member } = await linkedOrgSetup();
+    const site = await publishOrgSite(app, member.token);
+
+    const omitted = await republish(app, site.id, helloSite("<h1>v2</h1>"), member.token);
+    expect(omitted.statusCode).toBe(200);
+    const v2 = omitted.json<SiteBody>();
+    expect(v2.visibility).toBe("org");
+    expect(rawSite(db, site.id)).toMatchObject({
+      visibility: "private",
+      audience_org_id: org.id,
+      audience_workos_org_id: WORKOS_ORG_A,
+      audience_version_id: v2.versionId,
+    });
+
+    const explicit = await republish(
+      app,
+      site.id,
+      { ...helloSite("<h1>v3</h1>"), visibility: "org" },
+      member.token,
+    );
+    expect(explicit.statusCode).toBe(200);
+    expect(explicit.json<SiteBody>().visibility).toBe("org");
+    expect(rawSite(db, site.id).audience_version_id).toBe(explicit.json<SiteBody>().versionId);
+  });
+
+  it("any other explicit visibility clears the audience", async () => {
+    const { app, db, member } = await linkedOrgSetup();
+    for (const visibility of ["private", "unlisted", "public"]) {
+      const site = await publishOrgSite(app, member.token);
+      const res = await republish(app, site.id, { ...helloSite(), visibility }, member.token);
+      expect(res.statusCode).toBe(200);
+      expect(res.json<SiteBody>().visibility).toBe(visibility);
+      expect(rawSite(db, site.id)).toMatchObject({ visibility, ...NO_AUDIENCE });
+      // Once it is not org, it cannot go back in place.
+      const back = await republish(app, site.id, { ...helloSite(), visibility: "org" }, member.token);
+      expect(back.statusCode).toBe(400);
+      expect(errorCode(back)).toBe("org_requires_new_site");
+    }
+  });
+
+  it("refuses org on a site that is not org now", async () => {
+    const { app, db, s3, member } = await linkedOrgSetup();
+    for (const visibility of ["unlisted", "private", "public"]) {
+      const site = (await publish(app, { ...helloSite(), visibility }, member.token)).json<SiteBody>();
+      const res = await republish(app, site.id, { ...helloSite(), visibility: "org" }, member.token);
+      expect(res.statusCode).toBe(400);
+      expect(errorCode(res)).toBe("org_requires_new_site");
+      expect(rawSite(db, site.id)).toMatchObject({ visibility, ...NO_AUDIENCE });
+      expect(s3.keysUnder(`sites/${site.id}/`)).toHaveLength(1);
+    }
+  });
+
+  it("refuses a slug on an org site", async () => {
+    const { app, db, member } = await linkedOrgSetup();
+    const site = await publishOrgSite(app, member.token);
+    for (const body of [
+      { ...helloSite(), slug: "plan" },
+      { ...helloSite(), slug: "plan", visibility: "public" },
+    ]) {
+      const res = await republish(app, site.id, body, member.token);
+      expect(res.statusCode).toBe(400);
+      expect(errorCode(res)).toBe("slug_not_allowed");
+    }
+    expect(rawSite(db, site.id)).toMatchObject({ slug: null, audience_version_id: site.versionId });
+  });
+
+  it("an omitted visibility on a site whose audience lapsed stays owner-only private", async () => {
+    const { app, db, org, member } = await linkedOrgSetup();
+    const site = await publishOrgSite(app, member.token);
+    // Out of band, as an older binary would relink.
+    db.prepare(`UPDATE orgs SET workos_organization_id = ? WHERE id = ?`).run(WORKOS_ORG_B, org.id);
+    const res = await republish(app, site.id, helloSite("<h1>v2</h1>"), member.token);
+    expect(res.statusCode).toBe(200);
+    expect(res.json<SiteBody>().visibility).toBe("private");
+    // Never rebinds to the new link.
+    expect(rawSite(db, site.id)).toMatchObject({ visibility: "private", ...NO_AUDIENCE });
+  });
+
+  it("touch keeps the audience", async () => {
+    const { app, db, member } = await linkedOrgSetup();
+    const site = await publishOrgSite(app, member.token);
+    const before = rawSite(db, site.id);
+    const res = await inject(app, {
+      method: "POST",
+      url: `/api/v1/sites/${site.id}/touch`,
+      headers: auth(member.token),
+      remoteAddress: IP,
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json<SiteBody>().visibility).toBe("org");
+    expect(rawSite(db, site.id)).toEqual(before);
+  });
+});
+
+describe("reserved __shareplan/ paths", () => {
+  it("are refused on create and republish, for every visibility", async () => {
+    const { app, s3, member } = await linkedOrgSetup();
+    const reserved = (path: string) => ({
+      files: [
+        { path: "index.html", content: "<h1>hi</h1>" },
+        { path, content: "x" },
+      ],
+    });
+    for (const path of ["__shareplan/session.html", "__SHAREPLAN/x.css", "__shareplan/nested/a.js"]) {
+      for (const visibility of ["org", "unlisted"]) {
+        const res = await publish(app, { ...reserved(path), visibility }, member.token);
+        expect(res.statusCode).toBe(400);
+        expect(errorCode(res)).toBe("reserved_path");
+      }
+    }
+    expect(s3.keysUnder("sites/")).toEqual([]);
+
+    const orgSite = await publishOrgSite(app, member.token);
+    const plain = (await publish(app, helloSite(), member.token)).json<SiteBody>();
+    for (const id of [orgSite.id, plain.id]) {
+      const res = await republish(app, id, reserved("__shareplan/x.html"), member.token);
+      expect(res.statusCode).toBe(400);
+      expect(errorCode(res)).toBe("reserved_path");
+      expect(s3.keysUnder(`sites/${id}/`)).toHaveLength(1);
+    }
+    // A name that only starts like it is fine.
+    const near = await publish(app, reserved("__shareplanned/x.html"), member.token);
+    expect(near.statusCode).toBe(201);
+  });
+});
+
+describe("org visibility: create race", () => {
+  const changes: [string, (h: Awaited<ReturnType<typeof linkedOrgSetup>>) => Promise<void>][] = [
+    [
+      "detach",
+      async ({ app, member }) => {
+        const res = await admin(app, "PUT", `/api/v1/admin/users/${member.userId}/org`, { orgId: null });
+        expect(res.statusCode).toBe(200);
+      },
+    ],
+    [
+      "relink",
+      async ({ app, org }) => {
+        const res = await admin(app, "PUT", `/api/v1/admin/orgs/${org.id}`, {
+          workosOrganizationId: WORKOS_ORG_B,
+        });
+        expect(res.statusCode).toBe(200);
+      },
+    ],
+  ];
+
+  it("a paused org create loses to a detach or relink, and writes nothing", async () => {
+    for (const [label, change] of changes) {
+      const h = await linkedOrgSetup();
+      const pause = pauseNextUpload(h.s3);
+      const slow = publish(h.app, { ...helloSite(), visibility: "org" }, h.member.token);
+      await pause.started;
+      await change(h);
+      pause.release();
+      const res = await slow;
+      expect(res.statusCode, label).toBe(409);
+      expect(errorCode(res), label).toBe("site_changed");
+      expect(h.db.prepare(`SELECT COUNT(*) AS n FROM sites`).get(), label).toEqual({ n: 0 });
+      expect(h.db.prepare(`SELECT COUNT(*) AS n FROM site_versions`).get(), label).toEqual({ n: 0 });
+      expect(h.s3.keysUnder("sites/"), label).toEqual([]);
+    }
+  });
+
+  it("re-attaching after a lost create does not leave an org site behind", async () => {
+    const h = await linkedOrgSetup();
+    const pause = pauseNextUpload(h.s3);
+    const slow = publish(h.app, { ...helloSite(), visibility: "org" }, h.member.token);
+    await pause.started;
+    await changes[0]![1](h);
+    pause.release();
+    expect((await slow).statusCode).toBe(409);
+    const back = await admin(h.app, "PUT", `/api/v1/admin/users/${h.member.userId}/org`, {
+      orgId: h.org.id,
+    });
+    expect(back.statusCode).toBe(200);
+    const list = await inject(h.app, { method: "GET", url: "/api/v1/sites", headers: auth(h.member.token) });
+    expect(list.json<{ sites: SiteBody[] }>().sites).toEqual([]);
+  });
+
+  it("a paused org create with nothing in between still lands", async () => {
+    const { app, db, s3, org, member } = await linkedOrgSetup();
+    const pause = pauseNextUpload(s3);
+    const slow = publish(app, { ...helloSite(), visibility: "org" }, member.token);
+    await pause.started;
+    pause.release();
+    const res = await slow;
+    expect(res.statusCode).toBe(201);
+    const site = res.json<SiteBody>();
+    expect(site.visibility).toBe("org");
+    expect(rawSite(db, site.id)).toMatchObject({ audience_org_id: org.id, audience_version_id: site.versionId });
+  });
+});
+
+describe("org visibility: republish race", () => {
+  it("a paused org republish loses to a concurrent public, private, or relink write", async () => {
+    const concurrent: [string, (h: Awaited<ReturnType<typeof linkedOrgSetup>>, id: string) => Promise<void>][] = [
+      [
+        "public publish",
+        async ({ app, member }, id) => {
+          const res = await republish(app, id, { ...helloSite("<h1>pub</h1>"), visibility: "public" }, member.token);
+          expect(res.statusCode).toBe(200);
+        },
+      ],
+      [
+        "private publish",
+        async ({ app, member }, id) => {
+          const res = await republish(app, id, { ...helloSite("<h1>pri</h1>"), visibility: "private" }, member.token);
+          expect(res.statusCode).toBe(200);
+        },
+      ],
+      [
+        "relink",
+        async ({ app, org }) => {
+          const res = await admin(app, "PUT", `/api/v1/admin/orgs/${org.id}`, {
+            workosOrganizationId: WORKOS_ORG_B,
+          });
+          expect(res.statusCode).toBe(200);
+        },
+      ],
+    ];
+    for (const [label, write] of concurrent) {
+      const h = await linkedOrgSetup();
+      const site = await publishOrgSite(h.app, h.member.token);
+      const pause = pauseNextUpload(h.s3);
+      const slow = republish(h.app, site.id, helloSite("<h1>slow</h1>"), h.member.token);
+      await pause.started;
+      await write(h, site.id);
+      const afterWrite = h.db.prepare(`SELECT * FROM sites WHERE id = ?`).get(site.id);
+      pause.release();
+      const res = await slow;
+      expect(res.statusCode, label).toBe(409);
+      expect(errorCode(res), label).toBe("site_changed");
+      expect(h.db.prepare(`SELECT * FROM sites WHERE id = ?`).get(site.id), label).toEqual(afterWrite);
+      expect(await apiVisibility(h.app, site.id, h.member.token), label).not.toBe("org");
+      expectNoOrphanedVersions(h.db, h.s3, site.id);
+      const versions = h.db
+        .prepare(`SELECT COUNT(*) AS n FROM site_versions WHERE site_id = ?`)
+        .get(site.id) as { n: number };
+      expect(Number(versions.n), label).toBe(label === "relink" ? 1 : 2);
+    }
+  });
+
+  it("a paused org republish loses to a concurrent org republish", async () => {
+    const { app, db, s3, org, member } = await linkedOrgSetup();
+    const site = await publishOrgSite(app, member.token);
+    const pause = pauseNextUpload(s3);
+    const slow = republish(app, site.id, helloSite("<h1>slow</h1>"), member.token);
+    await pause.started;
+    const fast = await republish(app, site.id, helloSite("<h1>fast</h1>"), member.token);
+    expect(fast.statusCode).toBe(200);
+    const v2 = fast.json<SiteBody>();
+    expect(v2.visibility).toBe("org");
+    const afterFast = db.prepare(`SELECT * FROM sites WHERE id = ?`).get(site.id);
+    pause.release();
+    const res = await slow;
+    expect(res.statusCode).toBe(409);
+    expect(errorCode(res)).toBe("site_changed");
+    // The faster version stands, with its audience, and the slower upload is gone.
+    expect(db.prepare(`SELECT * FROM sites WHERE id = ?`).get(site.id)).toEqual(afterFast);
+    expect(rawSite(db, site.id)).toMatchObject({
+      current_version_id: v2.versionId,
+      audience_org_id: org.id,
+      audience_version_id: v2.versionId,
+    });
+    expectNoOrphanedVersions(db, s3, site.id);
+    const owner = await inject(app, { method: "GET", url: `/s/${site.id}/`, headers: auth(member.token) });
+    expect(owner.body).toContain("fast");
+  });
+
+  it("a paused org republish with nothing in between still lands", async () => {
+    const { app, db, s3, member } = await linkedOrgSetup();
+    const site = await publishOrgSite(app, member.token);
+    const pause = pauseNextUpload(s3);
+    const slow = republish(app, site.id, helloSite("<h1>slow</h1>"), member.token);
+    await pause.started;
+    pause.release();
+    const res = await slow;
+    expect(res.statusCode).toBe(200);
+    expect(res.json<SiteBody>().visibility).toBe("org");
+    expect(rawSite(db, site.id).audience_version_id).toBe(res.json<SiteBody>().versionId);
+  });
+
+  it("plain republishes stay last-writer-wins", async () => {
+    const { app, db, s3, member } = await linkedOrgSetup();
+    const site = (await publish(app, helloSite(), member.token)).json<SiteBody>();
+    const pause = pauseNextUpload(s3);
+    const slow = republish(app, site.id, { ...helloSite("<h1>slow</h1>"), visibility: "private" }, member.token);
+    await pause.started;
+    const fast = await republish(app, site.id, { ...helloSite("<h1>fast</h1>"), visibility: "public" }, member.token);
+    expect(fast.statusCode).toBe(200);
+    pause.release();
+    const res = await slow;
+    expect(res.statusCode).toBe(200);
+    expect(rawSite(db, site.id).visibility).toBe("private");
+  });
+});
+
+describe("org visibility fails closed", () => {
+  it("an old-style write of visibility and version without the audience makes it owner-only", async () => {
+    const { app, db, member } = await linkedOrgSetup();
+    const site = await publishOrgSite(app, member.token);
+    // What the previous binary's republish writes: it knows nothing of audiences.
+    db.prepare(
+      `INSERT INTO site_versions (id, site_id, created_at, byte_size, file_count, note)
+       VALUES ('v_old_binary', ?, ?, 1, 1, NULL)`,
+    ).run(site.id, Date.now());
+    db.prepare(
+      `UPDATE sites SET current_version_id = 'v_old_binary', visibility = COALESCE(NULL, visibility)
+       WHERE id = ?`,
+    ).run(site.id);
+    expect(rawSite(db, site.id)).toMatchObject({
+      visibility: "private",
+      audience_version_id: site.versionId,
+    });
+    expect(await apiVisibility(app, site.id, member.token)).toBe("private");
+    // And a later republish on this binary does not revive it.
+    const res = await republish(app, site.id, helloSite(), member.token);
+    expect(res.json<SiteBody>().visibility).toBe("private");
+    expect(rawSite(db, site.id)).toMatchObject(NO_AUDIENCE);
+  });
+
+  it("a relink, an unlink, a detach, and a delete each make it owner-only", async () => {
+    const steps: [string, (h: Awaited<ReturnType<typeof linkedOrgSetup>>) => Promise<LightMyRequestResponse>][] = [
+      ["relink", ({ app, org }) => admin(app, "PUT", `/api/v1/admin/orgs/${org.id}`, { workosOrganizationId: WORKOS_ORG_B })],
+      ["unlink", ({ app, org }) => admin(app, "PUT", `/api/v1/admin/orgs/${org.id}`, { workosOrganizationId: null })],
+      ["detach", ({ app, member }) => admin(app, "PUT", `/api/v1/admin/users/${member.userId}/org`, { orgId: null })],
+      ["remove", async ({ app, org, member }) => {
+        const lead = await mintAdmin(app, org.id);
+        return inject(app, { method: "DELETE", url: `/api/v1/org/members/${member.userId}`, headers: auth(lead.token) });
+      }],
+      ["delete", ({ app, org }) => admin(app, "DELETE", `/api/v1/admin/orgs/${org.id}`)],
+    ];
+    for (const [label, step] of steps) {
+      const h = await linkedOrgSetup();
+      const site = await publishOrgSite(h.app, h.member.token);
+      const res = await step(h);
+      expect(res.statusCode, label).toBe(200);
+      expect(rawSite(h.db, site.id), label).toMatchObject({ visibility: "private", ...NO_AUDIENCE });
+      expect(await apiVisibility(h.app, site.id, h.member.token), label).toBe("private");
+      const anonymous = await inject(h.app, { method: "GET", url: `/s/${site.id}/` });
+      expect(anonymous.statusCode, label).toBe(401);
+    }
+  });
+
+  it("the link-change and delete clamps report the cleared sites", async () => {
+    const h = await linkedOrgSetup();
+    await publishOrgSite(h.app, h.member.token);
+    await publishOrgSite(h.app, h.member.token);
+    const relink = await admin(h.app, "PUT", `/api/v1/admin/orgs/${h.org.id}`, {
+      workosOrganizationId: WORKOS_ORG_B,
+    });
+    expect(relink.json<{ clamped: object }>().clamped).toEqual({ users: 0, sites: 2, skipped: 0 });
+    // Re-sending the same link is not a change.
+    const same = await admin(h.app, "PUT", `/api/v1/admin/orgs/${h.org.id}`, {
+      workosOrganizationId: WORKOS_ORG_B,
+    });
+    expect(same.json<{ clamped: object }>().clamped).toEqual({ users: 0, sites: 0, skipped: 0 });
+
+    await publishOrgSite(h.app, h.member.token);
+    const deleted = await admin(h.app, "DELETE", `/api/v1/admin/orgs/${h.org.id}`);
+    expect(deleted.statusCode).toBe(200);
+    // One audience cleared; the paid member's three permanent sites get expiries.
+    expect(deleted.json<{ clamped: object }>().clamped).toEqual({ users: 1, sites: 3, skipped: 0 });
+  });
+
+  // Raw SQL stands in for a rolled-back binary: it writes users and orgs
+  // without knowing the audience columns, so only the triggers can clear them.
+  it("an old binary's detach then re-attach does not revive the audience", async () => {
+    const { app, db, org, member } = await linkedOrgSetup();
+    const site = await publishOrgSite(app, member.token);
+    db.prepare(`UPDATE users SET org_id = NULL, org_role = NULL WHERE id = ?`).run(member.userId);
+    expect(rawSite(db, site.id)).toMatchObject({ visibility: "private", ...NO_AUDIENCE });
+    expect(await apiVisibility(app, site.id, member.token)).toBe("private");
+    // Every value honouredAudience compares is back as it was.
+    db.prepare(`UPDATE users SET org_id = ?, org_role = 'member' WHERE id = ?`).run(org.id, member.userId);
+    expect(rawSite(db, site.id)).toMatchObject({ visibility: "private", ...NO_AUDIENCE });
+    expect(await apiVisibility(app, site.id, member.token)).toBe("private");
+    expect((await inject(app, { method: "GET", url: `/s/${site.id}/` })).statusCode).toBe(401);
+  });
+
+  it("an old binary's relink A to B and back to A does not revive the audience", async () => {
+    const { app, db, org, member } = await linkedOrgSetup();
+    const site = await publishOrgSite(app, member.token);
+    const other = await publishOrgSite(app, member.token);
+    db.prepare(`UPDATE orgs SET workos_organization_id = ? WHERE id = ?`).run(WORKOS_ORG_B, org.id);
+    expect(rawSite(db, site.id)).toMatchObject(NO_AUDIENCE);
+    expect(await apiVisibility(app, site.id, member.token)).toBe("private");
+    db.prepare(`UPDATE orgs SET workos_organization_id = ? WHERE id = ?`).run(WORKOS_ORG_A, org.id);
+    for (const id of [site.id, other.id]) {
+      expect(rawSite(db, id)).toMatchObject({ visibility: "private", ...NO_AUDIENCE });
+      expect(await apiVisibility(app, id, member.token)).toBe("private");
+    }
+    // Unlink and relink to A through slice 2's own method: same result.
+    const third = await publishOrgSite(app, member.token);
+    for (const workosOrganizationId of [null, WORKOS_ORG_A]) {
+      const res = await admin(app, "PUT", `/api/v1/admin/orgs/${org.id}`, { workosOrganizationId });
+      expect(res.statusCode).toBe(200);
+    }
+    expect(rawSite(db, third.id)).toMatchObject(NO_AUDIENCE);
+    expect(await apiVisibility(app, third.id, member.token)).toBe("private");
+    // A write that keeps the link, or touches other columns, keeps the audience.
+    const kept = await publishOrgSite(app, member.token);
+    db.prepare(`UPDATE orgs SET workos_organization_id = ?, name = 'Renamed' WHERE id = ?`).run(
+      WORKOS_ORG_A,
+      org.id,
+    );
+    db.prepare(`UPDATE users SET org_role = 'admin' WHERE id = ?`).run(member.userId);
+    expect(await apiVisibility(app, kept.id, member.token)).toBe("org");
+  });
+
+  it("an old binary's delete clears audiences naming the org instead of failing", async () => {
+    const { app, db, org, member } = await linkedOrgSetup();
+    await publishOrgSite(app, member.token);
+    // A leftover audience on a site whose owner is not in the org: detaching
+    // the members does not reach it, so only the delete trigger can.
+    const stray = (await publish(app, { ...helloSite(), visibility: "private" })).json<SiteBody>();
+    db.prepare(
+      `UPDATE sites SET audience_org_id = ?, audience_workos_org_id = ?, audience_version_id = ?
+       WHERE id = ?`,
+    ).run(org.id, WORKOS_ORG_A, stray.versionId, stray.id);
+    db.prepare(`UPDATE users SET org_id = NULL, org_role = NULL WHERE org_id = ?`).run(org.id);
+    // Foreign keys are on; without the trigger this would fail.
+    db.prepare(`DELETE FROM orgs WHERE id = ?`).run(org.id);
+    expect(rawSite(db, stray.id)).toMatchObject({ visibility: "private", ...NO_AUDIENCE });
+    expect(
+      db.prepare(`SELECT COUNT(*) AS n FROM sites WHERE audience_org_id IS NOT NULL`).get(),
+    ).toEqual({ n: 0 });
+  });
+
+  it("the per-request check refuses a stale audience on its own", async () => {
+    const { app, db, org, member } = await linkedOrgSetup();
+    // Without the triggers, as on a database they never reached.
+    db.exec(`
+      DROP TRIGGER trg_users_org_change_clears_audience;
+      DROP TRIGGER trg_orgs_link_change_clears_audience;
+    `);
+    const site = await publishOrgSite(app, member.token);
+    db.prepare(`UPDATE orgs SET workos_organization_id = ? WHERE id = ?`).run(WORKOS_ORG_B, org.id);
+    expect(rawSite(db, site.id).audience_workos_org_id).toBe(WORKOS_ORG_A);
+    expect(await apiVisibility(app, site.id, member.token)).toBe("private");
+    db.prepare(`UPDATE orgs SET workos_organization_id = ? WHERE id = ?`).run(WORKOS_ORG_A, org.id);
+    db.prepare(`UPDATE users SET org_id = NULL, org_role = NULL WHERE id = ?`).run(member.userId);
+    expect(rawSite(db, site.id).audience_org_id).toBe(org.id);
+    expect(await apiVisibility(app, site.id, member.token)).toBe("private");
+  });
+
+  it("detach and remove count a cleared audience once", async () => {
+    for (const label of ["detach", "remove"]) {
+      const h = await linkedOrgSetup();
+      await publishOrgSite(h.app, h.member.token);
+      const lead = await mintAdmin(h.app, h.org.id);
+      const res =
+        label === "detach"
+          ? await admin(h.app, "PUT", `/api/v1/admin/users/${h.member.userId}/org`, { orgId: null })
+          : await inject(h.app, {
+              method: "DELETE",
+              url: `/api/v1/org/members/${h.member.userId}`,
+              headers: auth(lead.token),
+            });
+      expect(res.statusCode, label).toBe(200);
+      // The audience and the expiry clamp land on the same site.
+      expect(res.json<{ clampedSites: number }>().clampedSites, label).toBe(1);
+    }
+  });
+
+  it("clamps only audiences that no longer match", async () => {
+    const h = await linkedOrgSetup();
+    const site = await publishOrgSite(h.app, h.member.token);
+    // A tier change runs the member clamp, but the audience still matches.
+    const tier = await admin(h.app, "PUT", `/api/v1/admin/orgs/${h.org.id}`, { compTier: "free" });
+    expect(tier.statusCode).toBe(200);
+    expect(rawSite(h.db, site.id).audience_version_id).toBe(site.versionId);
+    expect(await apiVisibility(h.app, site.id, h.member.token)).toBe("org");
+    // A role change too.
+    const role = await admin(h.app, "PUT", `/api/v1/admin/users/${h.member.userId}/org`, {
+      orgId: h.org.id,
+      role: "admin",
+    });
+    expect(role.statusCode).toBe(200);
+    expect(await apiVisibility(h.app, site.id, h.member.token)).toBe("org");
+  });
+
+  it("clears a stale audience on detach even when the owner's own tier is unknown", async () => {
+    const { app, db, member } = await linkedOrgSetup();
+    const site = await publishOrgSite(app, member.token);
+    db.prepare(`UPDATE users SET tier = 'mystery' WHERE id = ?`).run(member.userId);
+    const res = await admin(app, "PUT", `/api/v1/admin/users/${member.userId}/org`, { orgId: null });
+    expect(res.statusCode).toBe(200);
+    expect(rawSite(db, site.id)).toMatchObject(NO_AUDIENCE);
+    // The tier clamp is skipped, but the cleared audience still counts.
+    expect(res.json<{ clampedSites: number }>().clampedSites).toBe(1);
+  });
+
+  it("owner stats count org sites through the same check", async () => {
+    const { app, db, org, member } = await linkedOrgSetup();
+    const site = await publishOrgSite(app, member.token);
+    await publish(app, { ...helloSite(), visibility: "private" }, member.token);
+    await publish(app, helloSite(), member.token);
+    const counts = () => Object.fromEntries(getOwnerStats(db).visibility.map((v) => [v.visibility, v.count]));
+    expect(counts()).toEqual({ org: 1, private: 1, unlisted: 1 });
+    expect(getOwnerStats(db).recentSites.find((s) => s.id === site.id)!.visibility).toBe("org");
+    db.prepare(`UPDATE orgs SET workos_organization_id = ? WHERE id = ?`).run(WORKOS_ORG_B, org.id);
+    expect(counts()).toEqual({ private: 2, unlisted: 1 });
+    expect(getOwnerStats(db).recentSites.find((s) => s.id === site.id)!.visibility).toBe("private");
+  });
+});
+
+describe("countHonouredAudiences", () => {
+  it("agrees with honouredAudience across every condition", async () => {
+    const { app, db, member } = await linkedOrgSetup();
+    const { org: other } = await createOrg(app, { name: "Other", compTier: "paid", workosOrganizationId: WORKOS_ORG_B });
+    const published: string[] = [];
+    for (let i = 0; i < 5; i++) published.push((await publishOrgSite(app, member.token)).id);
+    const ids = published as [string, string, string, string, string];
+    await publish(app, { ...helloSite(), visibility: "private" }, member.token);
+    await publish(app, helloSite(), member.token);
+    const jsCount = () => (db.prepare(`SELECT * FROM sites`).all() as unknown as AudienceFields[])
+      .filter((site) => honouredAudience(db, site) !== null).length;
+    const agree = (expected: number) => {
+      expect(jsCount()).toBe(expected);
+      expect(countHonouredAudiences(db)).toBe(expected);
+    };
+    agree(5);
+    // Break one condition per site with raw writes the triggers don't touch.
+    db.prepare(`UPDATE sites SET visibility = 'unlisted' WHERE id = ?`).run(ids[1]);
+    db.prepare(`UPDATE sites SET audience_version_id = 'version_other' WHERE id = ?`).run(ids[2]);
+    db.prepare(`UPDATE sites SET audience_workos_org_id = ? WHERE id = ?`).run(WORKOS_ORG_B, ids[3]);
+    db.prepare(`UPDATE sites SET audience_org_id = ?, audience_workos_org_id = ? WHERE id = ?`).run(other.id, WORKOS_ORG_B, ids[4]);
+    agree(1);
+    // The owner leaving the org, with the triggers gone (as on an old binary).
+    db.exec(`DROP TRIGGER trg_users_org_change_clears_audience`);
+    db.prepare(`UPDATE users SET org_id = NULL, org_role = NULL WHERE id = (SELECT owner_user_id FROM sites WHERE id = ?)`).run(ids[0]);
+    agree(0);
   });
 });
 

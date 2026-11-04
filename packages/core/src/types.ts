@@ -1,4 +1,9 @@
-export type Visibility = "public" | "unlisted" | "private";
+/**
+ * "org" exists only in the API: the server stores an org site as "private"
+ * plus an audience, so anything that does not understand the audience
+ * (an older server, a missing link) treats it as owner-only.
+ */
+export type Visibility = "public" | "unlisted" | "private" | "org";
 
 export interface SiteFileInput {
   path: string;

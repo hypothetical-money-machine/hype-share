@@ -203,6 +203,10 @@ describe("upgrade", () => {
     site(db, "s1", "plan", 10, a.key.id, a.user.id);
     const before = getSite(db, "s1");
     db.exec(`
+      -- A database from before slice 3 has no audience triggers.
+      DROP TRIGGER trg_users_org_change_clears_audience;
+      DROP TRIGGER trg_orgs_link_change_clears_audience;
+      DROP TRIGGER trg_orgs_delete_clears_audience;
       DROP INDEX idx_users_org;
       ALTER TABLE users DROP COLUMN org_id;
       ALTER TABLE users DROP COLUMN org_role;
@@ -229,6 +233,10 @@ describe("upgrade", () => {
     const db = openDb(":memory:");
     const org = createOrg(db, { name: "SkySlope", compTier: "paid", joinToken: "org_x" });
     db.exec(`
+      -- A database from before slice 3 has no audience triggers.
+      DROP TRIGGER trg_users_org_change_clears_audience;
+      DROP TRIGGER trg_orgs_link_change_clears_audience;
+      DROP TRIGGER trg_orgs_delete_clears_audience;
       DROP INDEX idx_orgs_workos_org;
       ALTER TABLE orgs DROP COLUMN workos_organization_id;
     `);
@@ -240,6 +248,44 @@ describe("upgrade", () => {
     expect(columnNames(db, "orgs")).toContain("workos_organization_id");
     expect(schemaNames(db, "index")).toContain("idx_orgs_workos_org");
     expect(getOrg(db, org.id)).toMatchObject({ name: "SkySlope", workos_organization_id: null });
+    expect((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(3);
+    db.close();
+  });
+
+  it("adds site audiences to an existing sites table, leaving rows owner-only", () => {
+    const db = openDb(":memory:");
+    const a = createOpsKey(db, { name: "a", token: "sp_a" });
+    site(db, "s1", "plan", 10, a.key.id, a.user.id);
+    db.exec(`
+      -- A database from before slice 3 has no audience triggers.
+      DROP TRIGGER trg_users_org_change_clears_audience;
+      DROP TRIGGER trg_orgs_link_change_clears_audience;
+      DROP TRIGGER trg_orgs_delete_clears_audience;
+      DROP INDEX idx_sites_audience_org;
+      ALTER TABLE sites DROP COLUMN audience_org_id;
+      ALTER TABLE sites DROP COLUMN audience_workos_org_id;
+      ALTER TABLE sites DROP COLUMN audience_version_id;
+    `);
+
+    upgrade(db);
+    upgrade(db);
+
+    expect(columnNames(db, "sites")).toEqual(
+      expect.arrayContaining(["audience_org_id", "audience_workos_org_id", "audience_version_id"]),
+    );
+    expect(schemaNames(db, "index")).toContain("idx_sites_audience_org");
+    expect(schemaNames(db, "trigger")).toEqual(
+      expect.arrayContaining([
+        "trg_users_org_change_clears_audience",
+        "trg_orgs_link_change_clears_audience",
+        "trg_orgs_delete_clears_audience",
+      ]),
+    );
+    expect(getSite(db, "s1")).toMatchObject({
+      audience_org_id: null,
+      audience_workos_org_id: null,
+      audience_version_id: null,
+    });
     expect((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(3);
     db.close();
   });
@@ -279,7 +325,7 @@ describe("upgrade", () => {
   });
 });
 
-function schemaNames(db: Db, type: "table" | "index"): string[] {
+function schemaNames(db: Db, type: "table" | "index" | "trigger"): string[] {
   return (
     db.prepare(`SELECT name FROM sqlite_master WHERE type = ?`).all(type) as { name: string }[]
   ).map((r) => r.name);

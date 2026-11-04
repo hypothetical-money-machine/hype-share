@@ -37,14 +37,17 @@ import {
   completeClaim,
   deleteClaimAuthFlow,
   deleteSite,
+  effectiveVisibility,
   findOrgByJoinToken,
   findUserByClaimToken,
   getClaimAuthFlow,
   getOrg,
   getSite,
   getSiteByIdOrSlug,
+  getUser,
   getSiteBySlug,
   hashApiKey,
+  honouredAudience,
   insertSite,
   insertVersion,
   isExpired,
@@ -53,10 +56,13 @@ import {
   listSitesForUser,
   markVersionPruned,
   revokeApiKey,
+  transaction,
   updateSiteExpiry,
   updateSiteSlug,
   updateSiteVersion,
+  type SiteAudience,
   type SiteRow,
+  type StoredVisibility,
 } from "./db.js";
 import { AuthError, requireAccount, requireAdmin, type Account } from "./auth.js";
 import { registerOwnerPortal } from "./owner.js";
@@ -105,7 +111,7 @@ const createSiteSchema = z.object({
     .string()
     .regex(HOST_LABEL_RE, "slug must be a lowercase hostname label (a-z, 0-9, hyphens)")
     .optional(),
-  visibility: z.enum(["public", "unlisted", "private"]).optional(),
+  visibility: z.enum(["public", "unlisted", "private", "org"]).optional(),
   ttl: z.union([z.string(), z.number(), z.null()]).optional(),
   note: z.string().max(500).optional(),
   files: z.array(fileInputSchema).min(1),
@@ -286,7 +292,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     config: deps.config,
     db: deps.db,
     workos,
-    toListItem: (row) => toListItem(deps.config, row),
+    toListItem: (row) => toListItem(deps.config, deps.db, row),
   });
 
   app.get("/", async (_req, reply) => {
@@ -729,13 +735,13 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     updateSiteExpiry(deps.db, id, expiresAt, now);
     applyStoredTierLimits(deps.db, existing, policy);
     const row = getSite(deps.db, id)!;
-    return reply.send(toSiteResponse(deps.config, row));
+    return reply.send(toSiteResponse(deps.config, deps.db, row));
   });
 
   app.get("/api/v1/sites", async (req, reply) => {
     const { user } = requireAccount(deps.db, req);
     const rows = listSitesForUser(deps.db, user.id);
-    const items: SiteListItem[] = rows.map((r) => toListItem(deps.config, r));
+    const items: SiteListItem[] = rows.map((r) => toListItem(deps.config, deps.db, r));
     return reply.send({ sites: items });
   });
 
@@ -748,7 +754,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
         error: { code: "not_found", message: "site not found" },
       });
     }
-    return reply.send(toSiteResponse(deps.config, row));
+    return reply.send(toSiteResponse(deps.config, deps.db, row));
   });
 
   app.delete("/api/v1/sites/:id", async (req, reply) => {
@@ -1129,6 +1135,7 @@ async function publishNewSite(
   body: z.infer<typeof createSiteSchema>,
   req: FastifyRequest,
 ): Promise<SiteResponse> {
+  const orgLink = body.visibility === "org" ? orgVisibilityLink(ctx, account, body) : null;
   assertTierPublish(account.tier, body);
   consumePublishQuota(ctx, req, account);
   const policy = policyForTier(account.tier, ctx.config);
@@ -1138,7 +1145,12 @@ async function publishNewSite(
   const siteId = createSiteId();
   const versionId = createVersionId();
   const now = Date.now();
-  const visibility: Visibility = body.visibility ?? "unlisted";
+  // org is stored as private plus an audience, so anything that misses the
+  // audience (an older binary, a later relink) serves it owner-only.
+  const visibility: StoredVisibility =
+    body.visibility === undefined ? "unlisted" : body.visibility === "org" ? "private" : body.visibility;
+  const audience: SiteAudience | null =
+    orgLink === null ? null : { ...orgLink, versionId };
   const expires_at = resolveTierExpiry(policy, body.ttl, now, "create");
 
   if (body.slug !== undefined) {
@@ -1150,31 +1162,91 @@ async function publishNewSite(
 
   await putSiteFiles(ctx.s3, ctx.config.s3.bucket, siteId, versionId, files);
 
-  insertSite(ctx.db, {
-    id: siteId,
-    owner_key_id: account.key.id,
-    owner_user_id: account.user.id,
-    slug: body.slug ?? null,
-    title: body.title ?? null,
-    visibility,
-    current_version_id: versionId,
-    created_at: now,
-    updated_at: now,
-    expires_at,
-    byte_size,
-    file_count,
+  // Race rule for an org create: the owner may have been detached, or the org
+  // relinked, while the files uploaded. Re-check in the transaction that
+  // writes the rows, and write no audience the owner no longer has.
+  const committed = transaction(ctx.db, () => {
+    if (orgLink !== null) {
+      const owner = getUser(ctx.db, account.user.id);
+      const org = getOrg(ctx.db, orgLink.orgId);
+      if (
+        owner === null ||
+        owner.org_id !== orgLink.orgId ||
+        org === null ||
+        org.workos_organization_id !== orgLink.workosOrgId
+      ) {
+        return false;
+      }
+    }
+    insertSite(ctx.db, {
+      id: siteId,
+      owner_key_id: account.key.id,
+      owner_user_id: account.user.id,
+      slug: body.slug ?? null,
+      title: body.title ?? null,
+      visibility,
+      current_version_id: versionId,
+      created_at: now,
+      updated_at: now,
+      expires_at,
+      byte_size,
+      file_count,
+      audience,
+    });
+    insertVersion(ctx.db, {
+      id: versionId,
+      site_id: siteId,
+      created_at: now,
+      byte_size,
+      file_count,
+      note: body.note ?? null,
+    });
+    return true;
   });
-  insertVersion(ctx.db, {
-    id: versionId,
-    site_id: siteId,
-    created_at: now,
-    byte_size,
-    file_count,
-    note: body.note ?? null,
-  });
+  if (!committed) {
+    await discardVersionObjects(ctx, siteId, versionId);
+    throw new HttpError(
+      409,
+      "site_changed",
+      "the organization changed while this site uploaded; nothing was published, try again",
+    );
+  }
 
   const row = getSite(ctx.db, siteId)!;
-  return toSiteResponse(ctx.config, row);
+  return toSiteResponse(ctx.config, ctx.db, row);
+}
+
+/**
+ * Who an org site created now would be readable by: the caller's org and its
+ * WorkOS link. Org visibility needs WorkOS configured and the caller's org
+ * linked (400 visibility_not_allowed), and never takes a vanity slug (400
+ * slug_not_allowed), so an org site always lives on a fresh id origin.
+ */
+function orgVisibilityLink(
+  ctx: Ctx,
+  account: Account,
+  body: { slug?: string },
+): { orgId: string; workosOrgId: string } {
+  if (body.slug !== undefined) {
+    throw new HttpError(400, "slug_not_allowed", "org sites cannot have a vanity slug");
+  }
+  const workosOrgId = account.org?.workos_organization_id ?? null;
+  if (ctx.config.workos === null || account.org === null || workosOrgId === null) {
+    throw new HttpError(
+      400,
+      "visibility_not_allowed",
+      "org visibility needs an organization linked to WorkOS",
+    );
+  }
+  return { orgId: account.org.id, workosOrgId };
+}
+
+function sameAudienceColumns(a: SiteRow, b: SiteRow): boolean {
+  return (
+    a.audience_org_id === b.audience_org_id &&
+    a.audience_workos_org_id === b.audience_workos_org_id &&
+    a.audience_version_id === b.audience_version_id
+  );
 }
 
 async function publishVersion(
@@ -1184,6 +1256,23 @@ async function publishVersion(
   body: z.infer<typeof updateSiteSchema>,
   req: FastifyRequest,
 ): Promise<SiteResponse> {
+  // The audience state before the upload. An org site is one whose audience is
+  // honoured now; anything else is a plain site, even with stale columns.
+  const wasOrg = honouredAudience(ctx.db, existing) !== null;
+  if (body.visibility === "org" && !wasOrg) {
+    // A fresh origin keeps out service workers installed while it was public.
+    throw new HttpError(
+      400,
+      "org_requires_new_site",
+      "org visibility is only set on a new site; publish a new site instead",
+    );
+  }
+  if (wasOrg && body.slug !== undefined) {
+    throw new HttpError(400, "slug_not_allowed", "org sites cannot have a vanity slug");
+  }
+  // Omitted or "org" keeps an org site org, if its audience is still honoured
+  // when the version lands; any other explicit visibility clears the audience.
+  const keepOrg = wasOrg && (body.visibility === undefined || body.visibility === "org");
   assertTierPublish(account.tier, body);
   consumePublishQuota(ctx, req, account);
   const policy = policyForTier(account.tier, ctx.config);
@@ -1211,12 +1300,70 @@ async function publishVersion(
 
   const byte_size = files.reduce((n, f) => n + f.body.byteLength, 0);
   const file_count = files.length;
-  let visibility = body.visibility ?? existing.visibility;
+  let visibility: StoredVisibility =
+    keepOrg || body.visibility === undefined || body.visibility === "org"
+      ? existing.visibility
+      : body.visibility;
   if (visibility === "public" && !policy.publicVisibility) {
     visibility = "unlisted";
   }
+  const versionFields = {
+    current_version_id: versionId,
+    updated_at: now,
+    expires_at,
+    byte_size,
+    file_count,
+    title: body.title ?? undefined,
+  };
+  const versionRow = {
+    id: versionId,
+    site_id: existing.id,
+    created_at: now,
+    byte_size,
+    file_count,
+    note: body.note ?? null,
+  };
 
   await putSiteFiles(ctx.s3, ctx.config.s3.bucket, existing.id, versionId, files);
+
+  if (wasOrg) {
+    // Race rule, for republishes that involve org: decide from the row as it
+    // is now, in one transaction, and refuse if anything moved during the
+    // upload. Otherwise a slower publish could undo a concurrent public or
+    // private publish, or keep an audience a relink just cancelled.
+    const committed = transaction(ctx.db, () => {
+      const current = getSite(ctx.db, existing.id);
+      if (
+        current === null ||
+        current.current_version_id !== existing.current_version_id ||
+        !sameAudienceColumns(current, existing)
+      ) {
+        return false;
+      }
+      // Never rebinds: an audience survives only with the link it was set for.
+      const still = honouredAudience(ctx.db, current);
+      if (still === null) return false;
+      const audience = keepOrg ? { ...still, versionId } : null;
+      if (dropSlug) updateSiteSlug(ctx.db, existing.id, null);
+      updateSiteVersion(ctx.db, existing.id, {
+        ...versionFields,
+        visibility: keepOrg ? "private" : visibility,
+        audience,
+      });
+      insertVersion(ctx.db, versionRow);
+      return true;
+    });
+    if (!committed) {
+      await discardVersionObjects(ctx, existing.id, versionId);
+      throw new HttpError(
+        409,
+        "site_changed",
+        "the site changed while this version uploaded; nothing was published, try again",
+      );
+    }
+    await pruneOldVersions(ctx, existing.id);
+    return toSiteResponse(ctx.config, ctx.db, getSite(ctx.db, existing.id)!);
+  }
 
   if (newSlug !== null) {
     // Re-checked after the upload, not just before it: another publish can claim
@@ -1233,28 +1380,14 @@ async function publishVersion(
   } else if (dropSlug) {
     updateSiteSlug(ctx.db, existing.id, null);
   }
-  updateSiteVersion(ctx.db, existing.id, {
-    current_version_id: versionId,
-    updated_at: now,
-    expires_at,
-    byte_size,
-    file_count,
-    title: body.title ?? undefined,
-    visibility,
-  });
-  insertVersion(ctx.db, {
-    id: versionId,
-    site_id: existing.id,
-    created_at: now,
-    byte_size,
-    file_count,
-    note: body.note ?? null,
-  });
+  // Not an org site, so last writer wins as before; any stale audience goes.
+  updateSiteVersion(ctx.db, existing.id, { ...versionFields, visibility, audience: null });
+  insertVersion(ctx.db, versionRow);
 
   await pruneOldVersions(ctx, existing.id);
 
   const row = getSite(ctx.db, existing.id)!;
-  return toSiteResponse(ctx.config, row);
+  return toSiteResponse(ctx.config, ctx.db, row);
 }
 
 /**
@@ -1476,14 +1609,14 @@ function siteUrlShape(config: Config): string {
     : `${siteScheme(config)}://:id.${config.siteHostSuffix}/`;
 }
 
-function toSiteResponse(config: Config, row: SiteRow): SiteResponse {
+function toSiteResponse(config: Config, db: DatabaseSync, row: SiteRow): SiteResponse {
   return {
     id: row.id,
     url: siteUrl(config, row.slug ?? row.id),
     versionId: row.current_version_id ?? "",
     title: row.title,
     slug: row.slug,
-    visibility: row.visibility,
+    visibility: effectiveVisibility(db, row),
     createdAt: new Date(row.created_at).toISOString(),
     updatedAt: new Date(row.updated_at).toISOString(),
     expiresAt: row.expires_at ? new Date(row.expires_at).toISOString() : null,
@@ -1492,13 +1625,13 @@ function toSiteResponse(config: Config, row: SiteRow): SiteResponse {
   };
 }
 
-function toListItem(config: Config, row: SiteRow): SiteListItem {
+function toListItem(config: Config, db: DatabaseSync, row: SiteRow): SiteListItem {
   return {
     id: row.id,
     url: siteUrl(config, row.slug ?? row.id),
     title: row.title,
     slug: row.slug,
-    visibility: row.visibility,
+    visibility: effectiveVisibility(db, row),
     createdAt: new Date(row.created_at).toISOString(),
     updatedAt: new Date(row.updated_at).toISOString(),
     expiresAt: row.expires_at ? new Date(row.expires_at).toISOString() : null,

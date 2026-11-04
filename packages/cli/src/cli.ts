@@ -46,7 +46,7 @@ import { collectDirectory, collectSingleFile } from "./bundle.js";
 import type { CreateSiteRequest, SiteFileInput, Visibility } from "@shareplan/core";
 
 /** Mirrors the server's visibility enum (createSiteSchema in @shareplan/server). */
-const VISIBILITIES = ["public", "unlisted", "private"] as const satisfies readonly Visibility[];
+const VISIBILITIES = ["public", "unlisted", "private", "org"] as const satisfies readonly Visibility[];
 /** Mirrors the server's roleSchema and ORG_TIERS (@shareplan/server). */
 const ORG_ROLES = ["admin", "member"] as const satisfies readonly OrgRole[];
 const ORG_TIERS = ["free--", "free-", "free", "unlock", "paid"] as const satisfies readonly OrgTier[];
@@ -130,7 +130,10 @@ program
   .option("--title <title>", "site title")
   .option("--ttl <ttl>", "expiry (e.g. 7d, 12h) or none for no expiry (paid, ops, or a paid organization)")
   .option("--site <id>", "update existing site id (new version)")
-  .option("--visibility <vis>", "public | unlisted | private (default: unlisted on create, unchanged on update)")
+  .option(
+    "--visibility <vis>",
+    "public | unlisted | private | org (default: unlisted on create, unchanged on update; org only on a new site, for an organization linked to WorkOS)",
+  )
   .option("--note <note>", "version note")
   .option("--slug <slug>", "optional vanity slug (renames the site on update)")
   .action(async (pathArg: string, opts: PublishOptions) => {
