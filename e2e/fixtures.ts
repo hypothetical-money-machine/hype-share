@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:https";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { chromium, expect, test as base } from "@playwright/test";
+import { chromium, expect, test as base, type BrowserContext } from "@playwright/test";
 import { buildApp } from "../packages/server/src/app.js";
 import { loadConfig } from "../packages/server/src/config.js";
 import { createOpsKey, openDb } from "../packages/server/src/db.js";
@@ -147,32 +147,46 @@ export const test = base.extend<{ harness: Harness }>({
         `--host-resolver-rules=MAP shareplan.localhost ${destination}, MAP *.shareplan.localhost ${destination}, MAP authkit.shareplan-test.localhost ${destination}, MAP * ~NOTFOUND`,
       ],
     });
-    const context = await browser.newContext({ ignoreHTTPSErrors: true, serviceWorkers: "block" });
-    const unexpectedOrigins: string[] = [];
-    await context.route("**/*", async route => {
-      const url = new URL(route.request().url());
-      if (url.protocol === "https:" && url.port === "" &&
-          (url.origin === APEX || url.origin === AUTHKIT_ORIGIN || SITE_HOST.test(url.host))) {
-        await route.continue();
-      } else {
-        unexpectedOrigins.push(url.origin);
-        await route.abort("blockedbyclient");
-      }
-    });
-    await context.tracing.start({ screenshots: true, snapshots: true });
+    // Everything after launch sits inside the cleanup scope, and each close
+    // has its own finally, so a failed setup or trace write still closes
+    // the context and Chromium.
+    let context: BrowserContext | undefined;
+    let tracing = false;
     try {
+      context = await browser.newContext({ ignoreHTTPSErrors: true, serviceWorkers: "block" });
+      const unexpectedOrigins: string[] = [];
+      await context.route("**/*", async route => {
+        const url = new URL(route.request().url());
+        if (url.protocol === "https:" && url.port === "" &&
+            (url.origin === APEX || url.origin === AUTHKIT_ORIGIN || SITE_HOST.test(url.host))) {
+          await route.continue();
+        } else {
+          unexpectedOrigins.push(url.origin);
+          await route.abort("blockedbyclient");
+        }
+      });
+      await context.tracing.start({ screenshots: true, snapshots: true });
+      tracing = true;
       await use(context);
       expect(unexpectedOrigins, "Browser must only contact the mapped test origins").toEqual([]);
     } finally {
-      if (testInfo.status !== testInfo.expectedStatus) {
-        const path = testInfo.outputPath("trace.zip");
-        await context.tracing.stop({ path });
-        await testInfo.attach("trace", { path, contentType: "application/zip" });
-      } else {
-        await context.tracing.stop();
+      try {
+        if (context && tracing) {
+          if (testInfo.status !== testInfo.expectedStatus) {
+            const path = testInfo.outputPath("trace.zip");
+            await context.tracing.stop({ path });
+            await testInfo.attach("trace", { path, contentType: "application/zip" });
+          } else {
+            await context.tracing.stop();
+          }
+        }
+      } finally {
+        try {
+          await context?.close();
+        } finally {
+          await browser.close();
+        }
       }
-      await context.close();
-      await browser.close();
     }
   },
 });
