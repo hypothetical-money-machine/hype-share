@@ -16,6 +16,8 @@ export interface FakeS3 {
   hooks: {
     beforePut?: (key: string) => void | Promise<void>;
     beforeDelete?: (keys: string[]) => void | Promise<void>;
+    /** Replace what GetObject returns for a key that exists. */
+    getResponse?: (key: string) => { Body: Readable; ContentLength: number } | undefined;
     deleteError?: (key: string) => boolean;
   };
 }
@@ -52,6 +54,8 @@ export function createFakeS3(): FakeS3 {
           err.name = "NoSuchKey";
           throw err;
         }
+        const override = hooks.getResponse?.(input.Key as string);
+        if (override) return { ContentType: hit.contentType, ...override };
         return {
           ContentType: hit.contentType,
           ContentLength: hit.body.byteLength,

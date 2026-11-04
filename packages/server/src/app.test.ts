@@ -5,7 +5,7 @@ import type {
   LightMyRequestResponse,
 } from "fastify";
 import net from "node:net";
-import { Writable } from "node:stream";
+import { Readable, Writable } from "node:stream";
 import type { DatabaseSync } from "node:sqlite";
 import { buildApp, redactRequestUrl, type WorkOSAuthClient } from "./app.js";
 import type { Config } from "./config.js";
@@ -2477,5 +2477,127 @@ describe("council round 1", () => {
     expect((await inject(app, { method: "GET", url: `/s/${site.id}/` })).statusCode).toBe(401);
     const owner = await inject(app, { method: "GET", url: `/s/${site.id}/`, headers: auth() });
     expect(owner.statusCode).toBe(410);
+  });
+});
+
+describe("council round 2", () => {
+  it("counts parallel wrong admin tokens before any of them is answered", async () => {
+    const { app } = await setup();
+    const call = (token: string) =>
+      inject(app, { method: "GET", url: "/api/v1/admin/keys", headers: { "x-admin-token": token } });
+    const results = await Promise.all(Array.from({ length: 30 }, (_, i) => call(`wrong-${i}`)));
+    const codes = results.map((r) => r.statusCode);
+    expect(codes.filter((c) => c === 401)).toHaveLength(10);
+    expect(codes.filter((c) => c === 429)).toHaveLength(20);
+    expect((await call(ADMIN)).statusCode).toBe(429);
+  });
+
+  it("does not let owner-session 401s or missing tokens lock out the admin token", async () => {
+    const { app } = await setup();
+    for (let i = 0; i < 15; i++) {
+      await inject(app, { method: "GET", url: "/api/v1/admin/stats" });
+      await inject(app, { method: "GET", url: "/api/v1/admin/keys" });
+    }
+    const ok = await inject(app, {
+      method: "GET",
+      url: "/api/v1/admin/keys",
+      headers: { "x-admin-token": ADMIN },
+    });
+    expect(ok.statusCode).toBe(200);
+  });
+
+  it("keeps a privacy change that lands while a content-only republish uploads", async () => {
+    const { app, s3 } = await setup();
+    const site = (await publish(app, helloSite("v1"))).json<{ id: string }>();
+    const held = gate();
+    let first = true;
+    s3.hooks.beforePut = async () => {
+      if (first) {
+        first = false;
+        await held.wait;
+      }
+    };
+    const slow = inject(app, {
+      method: "PUT",
+      url: `/api/v1/sites/${site.id}`,
+      headers: auth(),
+      payload: helloSite("content only"),
+    });
+    await tick();
+    const fast = await inject(app, {
+      method: "PUT",
+      url: `/api/v1/sites/${site.id}`,
+      headers: auth(),
+      payload: { ...helloSite("now private"), visibility: "private" },
+    });
+    expect(fast.statusCode).toBe(200);
+    held.open();
+    const res = await slow;
+    expect(res.statusCode).toBe(200);
+    expect(res.json<{ visibility: string }>().visibility).toBe("private");
+    expect((await inject(app, { method: "GET", url: `/s/${site.id}/` })).statusCode).toBe(401);
+  });
+
+  it("refuses a new site whose id was claimed as a slug while it uploaded", async () => {
+    const { app, db, s3 } = await setup();
+    const held = gate();
+    let first = true;
+    s3.hooks.beforePut = async () => {
+      if (first) {
+        first = false;
+        await held.wait;
+      }
+    };
+    const slow = publish(app, helloSite("slow"));
+    await tick();
+    const prefix = (db.prepare(`SELECT prefix FROM pending_uploads`).get() as { prefix: string }).prefix;
+    const pendingId = /^sites\/([^/]+)\//.exec(prefix)![1]!;
+    const squatter = await publish(app, { ...helloSite("squat"), slug: pendingId });
+    expect(squatter.statusCode).toBe(201);
+    held.open();
+    const res = await slow;
+    expect(res.statusCode).toBe(409);
+    expect(s3.keysUnder(`sites/${pendingId}/`)).toEqual([]);
+  });
+
+  it("frees a retired slug for anyone once its hold has passed", async () => {
+    const { app, db } = await setup();
+    const other = createUser(db, { tier: "free-" });
+    createApiKeyRecord(db, { name: "other", token: "sp_other2", userId: other.id });
+    const site = (await publish(app, { ...helloSite(), slug: "old-name" })).json<{ id: string }>();
+    await inject(app, { method: "DELETE", url: `/api/v1/sites/${site.id}`, headers: auth() });
+    expect((await publish(app, { ...helloSite(), slug: "old-name" }, "sp_other2")).statusCode).toBe(409);
+    db.prepare(`UPDATE retired_slugs SET retired_at = ?`).run(Date.now() - 91 * 86_400_000);
+    expect((await publish(app, { ...helloSite(), slug: "old-name" }, "sp_other2")).statusCode).toBe(201);
+  });
+
+  it("answers a stream that fails before its first byte with a JSON error", async () => {
+    const { app, s3 } = await setup();
+    const site = (await publish(app, helloSite("<h1>big</h1>"))).json<{ id: string }>();
+    s3.hooks.getResponse = () => ({
+      ContentLength: 5 * 1024 * 1024,
+      Body: new Readable({
+        read() {
+          this.destroy(new Error("s3 connection reset"));
+        },
+      }),
+    });
+    const res = await inject(app, { method: "GET", url: `/s/${site.id}/` });
+    expect(res.statusCode).toBe(500);
+    expect(res.headers["content-type"]).toContain("application/json");
+    expect(res.json<{ error: { code: string } }>().error.code).toBe("internal_error");
+  });
+
+  it("puts a private site's headers on errors from its host before serving starts", async () => {
+    const { app } = await setup({ siteHostSuffix: "sites.test", publicBaseUrl: "https://api.test" });
+    const site = (await publish(app, { ...helloSite(), visibility: "private" })).json<{ id: string }>();
+    const host = { host: `${site.id}.sites.test` };
+    const post = await inject(app, { method: "POST", url: "/", headers: host });
+    expect(post.statusCode).toBe(405);
+    expect(post.headers["cache-control"]).toBe("private, no-store");
+    expect(post.headers["x-content-type-options"]).toBe("nosniff");
+    const bad = await inject(app, { method: "GET", url: "/%E0%A4%A", headers: host });
+    expect(bad.statusCode).toBe(400);
+    expect(bad.headers["cache-control"]).toBe("private, no-store");
   });
 });

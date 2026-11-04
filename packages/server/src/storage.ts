@@ -9,7 +9,7 @@ import {
   CreateBucketCommand,
   type S3ClientConfig,
 } from "@aws-sdk/client-s3";
-import type { Readable } from "node:stream";
+import { Readable } from "node:stream";
 import type { Config } from "./config.js";
 import {
   s3ObjectKey,
@@ -24,10 +24,25 @@ export interface StoredFile {
   contentType?: string;
 }
 
-export function createS3Client(config: Config): S3Client {
+/**
+ * Serving streams large objects to visitors, and a slow reader holds its S3
+ * socket for as long as it reads. So serving gets its own client, with a
+ * bigger pool, and every socket is dropped after a stretch with no traffic:
+ * slow readers can then starve neither publishing nor the sweeper, and a
+ * stalled one cannot hold a socket for ever.
+ */
+const S3_POOL = {
+  serve: { maxSockets: 256, requestTimeout: 30_000 },
+  write: { maxSockets: 50, requestTimeout: 120_000 },
+} as const;
+
+export function createS3Client(config: Config, purpose: keyof typeof S3_POOL = "write"): S3Client {
+  const pool = S3_POOL[purpose];
+  const agent = { keepAlive: true, maxSockets: pool.maxSockets };
   const cfg: S3ClientConfig = {
     region: config.s3.region,
     forcePathStyle: config.s3.forcePathStyle,
+    requestHandler: { requestTimeout: pool.requestTimeout, httpAgent: agent, httpsAgent: agent },
   };
   // Without explicit SHAREPLAN_S3_* keys, leave credentials to the SDK's
   // default chain: AWS_* env vars (with AWS_SESSION_TOKEN), profiles, and
@@ -82,6 +97,13 @@ export interface StoredObject {
   contentLength: number | undefined;
 }
 
+/**
+ * Objects at most this big are read in full before serving, which hands their
+ * S3 socket back at once; most HTML, CSS and JS is far smaller. Bigger ones
+ * stream, so memory stays flat however large the file.
+ */
+const BUFFER_UP_TO_BYTES = 1024 * 1024;
+
 /** An object's body as a stream, or null if there is no such key. */
 export async function getObject(
   client: S3Client,
@@ -91,11 +113,13 @@ export async function getObject(
   try {
     const out = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
     if (!out.Body) return null;
-    return {
-      body: out.Body as Readable,
-      contentType: out.ContentType,
-      contentLength: out.ContentLength,
-    };
+    let body = out.Body as Readable;
+    if (out.ContentLength !== undefined && out.ContentLength <= BUFFER_UP_TO_BYTES) {
+      const chunks: Buffer[] = [];
+      for await (const chunk of body) chunks.push(Buffer.from(chunk as Uint8Array));
+      body = Readable.from([Buffer.concat(chunks)]);
+    }
+    return { body, contentType: out.ContentType, contentLength: out.ContentLength };
   } catch (err: unknown) {
     if (isNotFound(err)) return null;
     throw err;

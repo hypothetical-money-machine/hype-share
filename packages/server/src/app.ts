@@ -76,6 +76,7 @@ import {
   type StoredVisibility,
 } from "./db.js";
 import {
+  adminTokenCheck,
   AuthError,
   requireAccount,
   requireAdmin,
@@ -212,6 +213,8 @@ export interface AppDeps {
   config: Config;
   db: DatabaseSync;
   s3: S3Client;
+  /** The client site serving reads through; defaults to `s3`. See createS3Client. */
+  serveS3?: S3Client;
   /** Fastify options passthrough, mainly so tests can silence the logger. */
   logger?: boolean;
   /** Where log lines go instead of stdout; tests capture them here. */
@@ -288,6 +291,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       const suffix = deps.config.siteHostSuffix;
       const label = suffix === null ? null : siteLabelFromHost(req.headers.host ?? "", suffix);
       const site = label === null || RESERVED_HOST_LABELS.has(label) ? null : getSiteByIdOrSlug(deps.db, label);
+      if (site !== null) setSiteHeaders(reply, site);
       if (site !== null && honouredAudience(deps.db, site) !== null) setOrgSiteHeaders(reply);
       const statusCode = error.statusCode ?? 500;
       void reply.code(statusCode).type("application/json").send(JSON.stringify({
@@ -331,26 +335,33 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   };
   const publishRoute = { onRequest: authenticate, bodyLimit: publishBodyLimit };
 
-  // The admin token is checked on every admin route, so wrong guesses are
-  // counted here, per address, like owner login's attempts: past the limit
-  // the admin API refuses that address for the rest of the hour. Keyed on the
-  // matched route, so an encoded spelling of the path is counted the same.
-  const isAdminRoute = (req: FastifyRequest) =>
-    req.routeOptions.url?.startsWith("/api/v1/admin/") === true;
+  // Wrong admin tokens are counted per address, like owner login's attempts:
+  // past the limit, the token-checked admin routes refuse that address for
+  // the rest of the hour. The check, the comparison and the count happen
+  // together here, synchronously and before any body is parsed, so neither
+  // parallel guesses nor requests queued with their bodies held back get past
+  // the limit. Keyed on the matched route, so an encoded path counts the
+  // same. The stats route answers to the owner session, not the token.
+  const isAdminTokenRoute = (req: FastifyRequest) => {
+    const route = req.routeOptions.url;
+    return route?.startsWith("/api/v1/admin/") === true && route !== "/api/v1/admin/stats";
+  };
   const adminBucket = (req: FastifyRequest) =>
     `admin:${hashIp(requestIp(req), deps.config.ipHashPepper ?? deps.config.adminTokenHash ?? "")}`;
   app.addHook("onRequest", async (req, reply) => {
-    if (!isAdminRoute(req)) return;
-    if (rateExhausted(deps.db, adminBucket(req), "admin_auth", ADMIN_FAILURES_PER_HOUR)) {
+    const tokenHash = deps.config.adminTokenHash;
+    if (tokenHash === null || !isAdminTokenRoute(req)) return;
+    const bucket = adminBucket(req);
+    const lockedOut = rateExhausted(deps.db, bucket, "admin_auth", ADMIN_FAILURES_PER_HOUR);
+    if (!lockedOut && adminTokenCheck(tokenHash, req) === "invalid") {
+      consumeRate(deps.db, bucket, "admin_auth", ADMIN_FAILURES_PER_HOUR);
+      return; // the route answers 401
+    }
+    if (lockedOut) {
       await reply.status(429).send({
         error: { code: "rate_limited", message: "too many failed admin attempts" },
       });
       return reply;
-    }
-  });
-  app.addHook("onResponse", async (req, reply) => {
-    if (isAdminRoute(req) && reply.statusCode === 401) {
-      consumeRate(deps.db, adminBucket(req), "admin_auth", ADMIN_FAILURES_PER_HOUR);
     }
   });
   app.addContentTypeParser(
@@ -380,6 +391,10 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   );
 
   app.setErrorHandler((err: FastifyError, _req, reply) => {
+    // Every error answer is JSON, even when the failure came after a file's
+    // own headers were set (a stream that broke before its first byte).
+    reply.removeHeader("content-length");
+    reply.type("application/json; charset=utf-8");
     if (err instanceof AuthError || err instanceof HttpError) {
       return reply.status(err.statusCode).send({
         error: { code: err.code, message: err.message },
@@ -934,6 +949,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       if (label === null) return;
       // Org sites carry their headers on every response, these errors included.
       const early = RESERVED_HOST_LABELS.has(label) ? null : getSiteByIdOrSlug(deps.db, label);
+      if (early !== null) setSiteHeaders(reply, early);
       if (early !== null && honouredAudience(deps.db, early) !== null) setOrgSiteHeaders(reply);
       if (req.method !== "GET" && req.method !== "HEAD") {
         reply.header("Allow", "GET, HEAD");
@@ -1344,6 +1360,11 @@ async function publishNewSite(
     // publish may have taken the slug, or an org downgrade lowered the tier,
     // while the files uploaded.
     const committed = transaction(ctx.db, () => {
+      // The id was free when generated; a slug claimed as it since then
+      // would be shadowed by this site, so check the namespace again.
+      if (!siteIdIsFree(ctx, siteId)) {
+        throw new HttpError(409, "site_changed", "the new site's id was taken while it uploaded; publish again");
+      }
       const limits = currentPolicy(ctx, account);
       const slug = body.slug !== undefined && limits.slugs ? body.slug : null;
       if (slug !== null) assertSlugAvailable(ctx, slug, account.user.id);
@@ -1477,10 +1498,11 @@ async function publishVersion(
     assertSlugAvailable(ctx, newSlug, account.user.id, existing.id);
   }
   consumePublishQuota(ctx, req, account);
-  const requested: StoredVisibility =
-    keepOrg || body.visibility === undefined || body.visibility === "org"
-      ? existing.visibility
-      : body.visibility;
+  // An omitted visibility keeps the site's own, read at commit time below:
+  // reading it now would let this publish undo a privacy change that lands
+  // while it uploads.
+  const explicitVisibility: StoredVisibility | null =
+    keepOrg || body.visibility === undefined || body.visibility === "org" ? null : body.visibility;
 
   // This version has no site_versions row until the writes below, so pruning
   // can never reach its objects: any failure from here on discards them, and
@@ -1513,7 +1535,7 @@ async function publishVersion(
         explicitExpiry !== undefined ? explicitExpiry : current.expires_at,
         now,
       );
-      const visibility = allowedVisibility(requested, limits);
+      const visibility = allowedVisibility(explicitVisibility ?? current.visibility, limits);
       let audience: SiteAudience | null = null;
       if (wasOrg) {
         // Race rule for org republishes: refuse if anything moved during the
@@ -1574,20 +1596,24 @@ async function publishVersion(
 
 /**
  * A new site id that is free as an id and as a host label: not a live or
- * deleting site, not a slug (the id would shadow it, since lookups try ids
- * first), and not a retired id.
+ * deleting site, not a slug or a retired one (the id would shadow it, since
+ * lookups try ids first), and not a retired id.
  */
 function freshSiteId(ctx: Ctx): string {
   for (;;) {
     const id = createSiteId();
-    if (
-      getSite(ctx.db, id, true) === null &&
-      getSiteBySlug(ctx.db, id, true) === null &&
-      !isRetiredSiteId(ctx.db, id)
-    ) {
-      return id;
-    }
+    if (siteIdIsFree(ctx, id)) return id;
   }
+}
+
+/** Free as an id and as a host label, now and for anyone who held it before. */
+function siteIdIsFree(ctx: Ctx, id: string): boolean {
+  return (
+    getSite(ctx.db, id, true) === null &&
+    getSiteBySlug(ctx.db, id, true) === null &&
+    !isRetiredSiteId(ctx.db, id) &&
+    retiredSlugOwner(ctx.db, id) === null
+  );
 }
 
 /**
@@ -1659,9 +1685,11 @@ async function discardUpload(ctx: Ctx, prefix: string): Promise<void> {
 }
 
 /**
- * Drop objects for versions beyond the retention window. The previous version
- * is kept so a page loaded moments before a republish can still fetch its
- * assets. Failures are logged, not fatal — the publish itself already landed.
+ * Drop objects for versions beyond the retention window (by default the live
+ * version and the one before it keep their objects). Site URLs always serve
+ * the live version, so the kept one is history, not a fallback for open pages.
+ * Failures are logged, not fatal: the publish itself already landed, and the
+ * sweeper retries the prune.
  */
 async function pruneOldVersions(ctx: Ctx, siteId: string): Promise<void> {
   const stale = listPrunableVersions(ctx.db, siteId, ctx.config.versionRetention);
@@ -1790,8 +1818,8 @@ async function serveSitePath(
   // HEAD answers from metadata; GET streams the body rather than holding it.
   const fetchObject = (p: string) =>
     req.method === "HEAD"
-      ? headObject(ctx.s3, bucket, keyFor(p))
-      : getObject(ctx.s3, bucket, keyFor(p));
+      ? headObject(ctx.serveS3 ?? ctx.s3, bucket, keyFor(p))
+      : getObject(ctx.serveS3 ?? ctx.s3, bucket, keyFor(p));
 
   let path = requested;
   let obj: { body?: Readable; contentType: string | undefined; contentLength: number | undefined } | null =
@@ -1811,7 +1839,9 @@ async function serveSitePath(
       indexPath !== null &&
       (
         await Promise.all(
-          [indexPath, indexPath.slice(0, -1)].map((p) => objectExists(ctx.s3, bucket, keyFor(p))),
+          [indexPath, indexPath.slice(0, -1)].map((p) =>
+            objectExists(ctx.serveS3 ?? ctx.s3, bucket, keyFor(p)),
+          ),
         )
       ).some(Boolean);
     if (found) {

@@ -10,6 +10,7 @@ async function main(): Promise<void> {
   for (const gap of describeConfigGaps(config)) console.warn(`Warning: ${gap}`);
   const db = openDb(config.dbPath);
   const s3 = createS3Client(config);
+  const serveS3 = createS3Client(config, "serve");
 
   try {
     await ensureBucket(s3, config.s3.bucket);
@@ -20,7 +21,7 @@ async function main(): Promise<void> {
     );
   }
 
-  const app = await buildApp({ config, db, s3 });
+  const app = await buildApp({ config, db, s3, serveS3 });
   const stopReaper = startReaper({
     config,
     db,

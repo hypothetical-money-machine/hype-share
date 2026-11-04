@@ -90,14 +90,26 @@ export function requireAdmin(
   if (!adminTokenHash) {
     throw new AuthError(503, "admin_disabled", "admin token not configured");
   }
+  if (adminTokenCheck(adminTokenHash, req) !== "valid") {
+    throw new AuthError(401, "unauthorized", "invalid admin token");
+  }
+}
+
+/**
+ * How the request's admin token compares: "valid", "invalid" (one was sent
+ * and it is wrong: a guess), or "missing". Bearer or X-Admin-Token.
+ */
+export function adminTokenCheck(
+  adminTokenHash: string,
+  req: FastifyRequest,
+): "valid" | "invalid" | "missing" {
   const token = extractBearer(req);
   const header = req.headers["x-admin-token"];
   const fromHeader = typeof header === "string" ? header : null;
+  if (token === null && fromHeader === null) return "missing";
   const bearerOk = hashedTokenEquals(token, adminTokenHash);
   const headerOk = hashedTokenEquals(fromHeader, adminTokenHash);
-  if (!bearerOk && !headerOk) {
-    throw new AuthError(401, "unauthorized", "invalid admin token");
-  }
+  return bearerOk || headerOk ? "valid" : "invalid";
 }
 
 function hashedTokenEquals(presented: string | null, expectedHash: string): boolean {

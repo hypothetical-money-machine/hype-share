@@ -212,7 +212,7 @@ On `PUT`, omitting `ttl` preserves the current expiry. Only accounts whose `effe
 - **File structure**: Multi-file uploads require an `index.html`. Single files wrap automatically.
 - **Site size**: 50 MiB total byte size, maximum 200 files.
 - **TTL**: Default 7d, maximum 30d. Setting `ttl: null` returns `400 ttl_not_allowed`.
-- **Slugs**: Vanity slugs are not allowed on `free--` (requires `free-` or higher). Returns `400 slug_not_allowed`. Sign-in and infrastructure labels (`login`, `auth`, `account`, `support`, `www`, `api`, ...) are reserved, and a slug another account gave up stays theirs; both return `409 slug_taken`. A slug you give up stays yours to take back.
+- **Slugs**: Vanity slugs are not allowed on `free--` (requires `free-` or higher). Returns `400 slug_not_allowed`. Sign-in and infrastructure labels (`login`, `auth`, `account`, `support`, `www`, `api`, ...) are reserved, and a slug another account gave up stays theirs for 90 days; both return `409 slug_taken`. A slug you give up stays yours to take back for the same 90 days.
 - **Visibility**: `unlisted` by default. `public` returns `400 visibility_not_allowed`. `private` sites require owner API key to access.
 - **Rate limits**: 120 publish/touch requests per hour per user and per IP hash. 10 registers per day per IP hash.
 

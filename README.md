@@ -406,8 +406,8 @@ finishes the job. A publish that fails partway removes the objects it uploaded.
 
 A deleted site's id is retired for good: no vanity slug can take it, so an old
 link never starts serving someone else's page. A slug its site gives up, by a delete,
-a rename or a tier downgrade, stays reserved for the account that held it: that
-account can take it back, no other can. Ids deleted before this rule existed were not
+a rename or a tier downgrade, stays reserved for the account that held it for 90
+days: that account can take it back, no other can, until the hold ends. Ids deleted before this rule existed were not
 recorded and are not protected. A publish that dies partway is recorded until it
 commits, so the sweeper removes what it uploaded even if its own cleanup failed.
 
@@ -430,8 +430,9 @@ stays permanent under a tier that forbids it.
   registrable domain for sites, listed in the Public Suffix List, removes that.
 - Vanity slugs cannot use infrastructure or sign-in labels (`www`, `api`, `admin`,
   `login`, `auth`, `account`, `billing`, `support` and similar).
-- Wrong admin tokens are limited to ten per address per hour; past that the admin API
-  refuses the address, right token or not, until the hour ends. `SHAREPLAN_ADMIN_TOKEN`
+- Wrong admin tokens are limited to ten per address per hour, counted before the
+  request body is read; past that the token-checked admin routes refuse the address,
+  right token or not, until the hour ends. `SHAREPLAN_ADMIN_TOKEN`
   must be at least 16 characters.
 - Only the two publish routes accept large bodies, and they authenticate first;
   every other route takes at most 64 KiB.

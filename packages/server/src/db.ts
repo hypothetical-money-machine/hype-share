@@ -1088,11 +1088,21 @@ function retireSlug(db: DatabaseSync, slug: string, ownerUserId: string, now: nu
   ).run(slug.toLowerCase(), ownerUserId, now);
 }
 
-/** Who a freed slug still belongs to, or null if it was never retired. */
-export function retiredSlugOwner(db: DatabaseSync, slug: string): string | null {
+/**
+ * How long a freed slug stays with its owner. Long enough that old links have
+ * gone quiet, short enough that renaming cannot squat names for good.
+ */
+export const RETIRED_SLUG_HOLD_MS = 90 * 86_400_000;
+
+/** Who a freed slug still belongs to, or null if it is free to anyone. */
+export function retiredSlugOwner(
+  db: DatabaseSync,
+  slug: string,
+  now = Date.now(),
+): string | null {
   const row = db
-    .prepare(`SELECT owner_user_id FROM retired_slugs WHERE slug = ?`)
-    .get(slug.toLowerCase()) as { owner_user_id: string } | undefined;
+    .prepare(`SELECT owner_user_id FROM retired_slugs WHERE slug = ? AND retired_at > ?`)
+    .get(slug.toLowerCase(), now - RETIRED_SLUG_HOLD_MS) as { owner_user_id: string } | undefined;
   return row?.owner_user_id ?? null;
 }
 
