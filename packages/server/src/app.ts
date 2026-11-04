@@ -404,9 +404,11 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     reply.type("application/json; charset=utf-8");
     // A site's own Cache-Control may already be set (public, max-age=60);
     // an outage must not be cached as if it were the page.
-    const status = err instanceof AuthError || err instanceof HttpError ? err.statusCode : 500;
-    if (status >= 500) reply.header("Cache-Control", "no-store");
+    const noStoreIf5xx = (status: number) => {
+      if (status >= 500) reply.header("Cache-Control", "no-store");
+    };
     if (err instanceof AuthError || err instanceof HttpError) {
+      noStoreIf5xx(err.statusCode);
       return reply.status(err.statusCode).send({
         error: { code: err.code, message: err.message },
       });
@@ -454,6 +456,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       });
     }
     app.log.error(err);
+    noStoreIf5xx(500);
     return reply.status(500).send({
       error: { code: "internal_error", message: "internal server error" },
     });
@@ -1830,11 +1833,8 @@ async function serveSitePath(
   const limits = ctx.bodyLimits ?? DEFAULT_BODY_LIMITS;
   const fetchObject = (p: string) =>
     req.method === "HEAD"
-      ? headObject(ctx.serveS3 ?? ctx.s3, bucket, keyFor(p))
+      ? headObject(ctx.serveS3 ?? ctx.s3, bucket, keyFor(p), limits)
       : getObject(ctx.serveS3 ?? ctx.s3, bucket, keyFor(p), limits);
-  // The visitor's side of the same rule: a connection that moves nothing for
-  // the idle limit is closed, which also tears down the S3 body behind it.
-  reply.raw.setTimeout(limits.idleMs, () => reply.raw.destroy());
 
   let path = requested;
   let obj: { body?: Readable; contentType: string | undefined; contentLength: number | undefined } | null =
@@ -1855,7 +1855,7 @@ async function serveSitePath(
       (
         await Promise.all(
           [indexPath, indexPath.slice(0, -1)].map((p) =>
-            objectExists(ctx.serveS3 ?? ctx.s3, bucket, keyFor(p)),
+            objectExists(ctx.serveS3 ?? ctx.s3, bucket, keyFor(p), limits),
           ),
         )
       ).some(Boolean);
@@ -1887,6 +1887,11 @@ async function serveSitePath(
   }
   // Every other org response keeps ORG_HTML_CSP from setOrgSiteHeaders.
 
+  // The visitor's side of the same rule: once the body is on its way, a
+  // connection that moves nothing for the idle limit is closed, which also
+  // tears down the S3 body behind it. Armed only now, so a stall before this
+  // point is answered by the S3 deadlines with a proper error, not a reset.
+  reply.raw.setTimeout(limits.idleMs, () => reply.raw.destroy());
   // HEAD has no body to send. An empty stream rather than nothing, because
   // Fastify's HEAD route turns an undefined payload into Content-Length: 0.
   await reply.send(obj.body ?? Readable.from([]));

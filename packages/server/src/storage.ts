@@ -151,13 +151,39 @@ function withDeadlines(source: Readable, limits: BodyLimits): Readable {
   }
   const total = setTimeout(fail(`took longer than ${limits.maxMs} ms`), limits.maxMs);
   resetIdle();
-  out.on("close", () => {
+  const stop = () => {
     clearTimeout(idle);
     clearTimeout(total);
-  });
+  };
+  // Once the source has fully arrived its socket is back in the pool, so the
+  // deadlines have done their job; whoever reads the rest bounds the drain.
+  out.on("finish", stop);
+  out.on("close", stop);
+  // Consumers attach their own error listeners; this one only keeps a body
+  // nobody reads from turning a deadline into an uncaught exception.
+  out.on("error", () => {});
   // pipeline destroys the source when `out` is destroyed, and vice versa.
   pipeline(source, out, () => {});
   return out;
+}
+
+/**
+ * Send a serving read with a deadline that covers the whole of `send`: the
+ * wait for headers and, on an error status, the SDK reading the error body.
+ * Cleared once send returns, so it never cuts a successful body short (that
+ * is withDeadlines' job).
+ */
+async function sendWithin<T>(ms: number, send: (abortSignal: AbortSignal) => Promise<T>): Promise<T> {
+  const abort = new AbortController();
+  const timer = setTimeout(
+    () => abort.abort(new Error(`S3 did not answer within ${ms} ms`)),
+    ms,
+  );
+  try {
+    return await send(abort.signal);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** An object's body as a stream, or null if there is no such key. */
@@ -168,7 +194,9 @@ export async function getObject(
   limits: BodyLimits = DEFAULT_BODY_LIMITS,
 ): Promise<StoredObject | null> {
   try {
-    const out = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+    const out = await sendWithin(limits.idleMs, (abortSignal) =>
+      client.send(new GetObjectCommand({ Bucket: bucket, Key: key }), { abortSignal }),
+    );
     if (!out.Body) return null;
     const body = withDeadlines(out.Body as Readable, limits);
     const length = out.ContentLength;
@@ -190,6 +218,11 @@ export async function getObject(
         for await (const chunk of body) chunks.push(Buffer.from(chunk as Uint8Array));
         const buffered = Readable.from([Buffer.concat(chunks)]);
         buffered.on("close", release);
+        // A buffered body nobody sends would hold its share of the budget for
+        // good; past the total limit it is dropped and the share comes back.
+        const abandon = setTimeout(() => buffered.destroy(), limits.maxMs);
+        abandon.unref();
+        buffered.on("close", () => clearTimeout(abandon));
         return { body: buffered, contentType: out.ContentType, contentLength: length, buffered: true };
       } catch (err) {
         release();
@@ -208,9 +241,12 @@ export async function headObject(
   client: S3Client,
   bucket: string,
   key: string,
+  limits: BodyLimits = DEFAULT_BODY_LIMITS,
 ): Promise<Omit<StoredObject, "body"> | null> {
   try {
-    const out = await client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+    const out = await sendWithin(limits.idleMs, (abortSignal) =>
+      client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }), { abortSignal }),
+    );
     return { contentType: out.ContentType, contentLength: out.ContentLength };
   } catch (err: unknown) {
     if (isNotFound(err)) return null;
@@ -230,8 +266,9 @@ export async function objectExists(
   client: S3Client,
   bucket: string,
   key: string,
+  limits: BodyLimits = DEFAULT_BODY_LIMITS,
 ): Promise<boolean> {
-  return (await headObject(client, bucket, key)) !== null;
+  return (await headObject(client, bucket, key, limits)) !== null;
 }
 
 export function deleteSiteObjects(

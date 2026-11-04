@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { Readable } from "node:stream";
 import type { S3Client } from "@aws-sdk/client-s3";
-import { getObject, type BodyLimits } from "./storage.js";
+import { getObject, headObject, type BodyLimits } from "./storage.js";
 
 const LIMITS: BodyLimits = { idleMs: 40, maxMs: 5_000, bufferUpToBytes: 1024, bufferBudgetBytes: 1500 };
 
@@ -86,5 +86,26 @@ describe("getObject body limits", () => {
     const obj = (await getObject(client, "b", "k", LIMITS))!;
     expect(obj.buffered).toBe(false);
     expect((await drain(obj.body)).length).toBe(2000);
+  });
+
+  it("gives up on S3 when send itself stalls, as with an error body that never ends", async () => {
+    // Resolves only if aborted, like an SDK reading a 503's XML body that stalls.
+    const client = {
+      send: (_cmd: unknown, opts: { abortSignal: AbortSignal }) =>
+        new Promise((_, reject) =>
+          opts.abortSignal.addEventListener("abort", () => reject(opts.abortSignal.reason)),
+        ),
+    } as unknown as S3Client;
+    await expect(getObject(client, "b", "k", LIMITS)).rejects.toThrow(/did not answer/);
+    await expect(headObject(client, "b", "k", LIMITS)).rejects.toThrow(/did not answer/);
+  });
+
+  it("lets a fully received body that nobody reads sit without crashing", async () => {
+    const client = clientFor(() => Readable.from([Buffer.alloc(4000, 2)]), 4000);
+    const obj = (await getObject(client, "b", "k", LIMITS))!;
+    expect(obj.buffered).toBe(false);
+    // Past the idle limit with nothing reading it; an unhandled error would fail the run.
+    await new Promise((r) => setTimeout(r, LIMITS.idleMs * 4));
+    obj.body.destroy();
   });
 });
