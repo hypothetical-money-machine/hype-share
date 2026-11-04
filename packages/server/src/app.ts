@@ -8,7 +8,7 @@ import Fastify, {
 import type { DatabaseSync } from "node:sqlite";
 import type { S3Client } from "@aws-sdk/client-s3";
 import fastifyCookie from "@fastify/cookie";
-import { createWorkOS } from "@workos-inc/node";
+import { createWorkOS, NotFoundException } from "@workos-inc/node";
 import { z } from "zod";
 import {
   createApiKey,
@@ -148,7 +148,7 @@ export interface AppDeps {
   s3: S3Client;
   /** Fastify options passthrough, mainly so tests can silence the logger. */
   logger?: boolean;
-  /** Test override for the two WorkOS methods used by account claiming. */
+  /** Test override for the WorkOS methods used by claiming and org linking. */
   workos?: WorkOSAuthClient;
 }
 
@@ -170,6 +170,10 @@ export interface WorkOSAuthClient {
       user: { id: string; email: string; emailVerified: boolean };
       authenticationMethod?: string;
     }>;
+  };
+  organizations: {
+    /** The WorkOS organization, or null when WorkOS has no organization with this id. */
+    getOrganization(id: string): Promise<{ id: string; name: string } | null>;
   };
 }
 
@@ -281,6 +285,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   registerOrgRoutes(app, {
     config: deps.config,
     db: deps.db,
+    workos,
     toListItem: (row) => toListItem(deps.config, row),
   });
 
@@ -853,6 +858,17 @@ function createWorkOSAuthClient(config: Config): WorkOSAuthClient | null {
           },
           authenticationMethod: result.authenticationMethod,
         };
+      },
+    },
+    organizations: {
+      getOrganization: async (id) => {
+        try {
+          const org = await client.organizations.getOrganization(id);
+          return { id: org.id, name: org.name };
+        } catch (err) {
+          if (err instanceof NotFoundException) return null;
+          throw err;
+        }
       },
     },
   };

@@ -443,6 +443,7 @@ program
   .option("--tier <tier>", `comp tier: ${ORG_TIERS.join(" | ")}`, parseOrgTier)
   .option("--max-members <n>", "member cap (default 100)", parsePositiveInt)
   .option("--publish-per-hour <n>", "pooled publish limit per hour (default: tier's limit)", parsePositiveInt)
+  .option("--workos-org <id>", "link a WorkOS organization (org_...), or none", parseWorkosOrgOrNone)
   .action(
     async (opts: AdminOptions & CreateOrgOptions) => {
       try {
@@ -450,7 +451,7 @@ program
         const o = created.org;
         console.log(created.joinToken);
         console.error(
-          `id=${o.id} name=${printable(o.name)} tier=${dash(o.tier)} members=${o.memberCount}/${o.maxMembers} pool=${poolText(o)}`,
+          `id=${o.id} name=${printable(o.name)} tier=${dash(o.tier)} members=${o.memberCount}/${o.maxMembers} pool=${poolText(o)} workos=${dash(o.workosOrganizationId)}`,
         );
         console.error(
           "Save this join token; it will not be shown again. Anyone holding it can register keys under this organization.",
@@ -498,7 +499,9 @@ program
 
 program
   .command("set-org")
-  .description("Update an organization; lowering the tier clamps member sites (requires admin token)")
+  .description(
+    "Update an organization; lowering the tier clamps member sites, changing the WorkOS link cancels its org-visibility audiences (requires admin token)",
+  )
   .argument("<org-id>", "organization id")
   .requiredOption("--url <url>", "shareplan base URL")
   .requiredOption("--admin-token <token>", "admin token")
@@ -506,6 +509,11 @@ program
   .option("--name <name>", "organization name")
   .option("--max-members <n>", "member cap", parsePositiveInt)
   .option("--publish-per-hour <n>", "pooled publish limit per hour, or none for the tier's limit", parsePositiveIntOrNone)
+  .option(
+    "--workos-org <id>",
+    "link a WorkOS organization (org_...), or none to unlink (unlinking works without WorkOS configured)",
+    parseWorkosOrgOrNone,
+  )
   .action(
     async (
       orgId: string,
@@ -514,6 +522,7 @@ program
         name?: string;
         maxMembers?: number;
         publishPerHour?: number | "none";
+        workosOrg?: string;
       },
     ) => {
       try {
@@ -522,14 +531,17 @@ program
         if (opts.name !== undefined) patch.name = opts.name;
         if (opts.maxMembers !== undefined) patch.maxMembers = opts.maxMembers;
         if (opts.publishPerHour !== undefined) patch.publishPerHour = noneToNull(opts.publishPerHour);
+        if (opts.workosOrg !== undefined) patch.workosOrganizationId = noneToNull(opts.workosOrg);
         if (Object.keys(patch).length === 0) {
-          throw new Error("nothing to update: pass --tier, --name, --max-members, or --publish-per-hour");
+          throw new Error(
+            "nothing to update: pass --tier, --name, --max-members, --publish-per-hour, or --workos-org",
+          );
         }
         const updated = await updateOrg(opts.url, opts.adminToken, orgId, patch);
         const { clamped } = updated;
         const skipped = clamped.skipped > 0 ? ` skipped=${clamped.skipped}` : "";
         console.log(
-          `updated ${updated.org.id} tier=${dash(updated.org.tier)} clamped=${clamped.sites}${skipped}`,
+          `updated ${updated.org.id} tier=${dash(updated.org.tier)} workos=${dash(updated.org.workosOrganizationId)} clamped=${clamped.sites}${skipped}`,
         );
       } catch (e) {
         fail(e);
@@ -655,6 +667,8 @@ interface CreateOrgOptions {
   tier?: OrgTier;
   maxMembers?: number;
   publishPerHour?: number;
+  /** A WorkOS org id, or the "none" sentinel (same as leaving it out). */
+  workosOrg?: string;
 }
 
 /** A pool on a tier-less org is stored but never applied, so refuse it before the request. */
@@ -667,6 +681,9 @@ export function buildCreateOrgBody(opts: CreateOrgOptions): CreateOrgBody {
     ...(opts.tier !== undefined ? { compTier: opts.tier } : {}),
     ...(opts.maxMembers !== undefined ? { maxMembers: opts.maxMembers } : {}),
     ...(opts.publishPerHour !== undefined ? { publishPerHour: opts.publishPerHour } : {}),
+    ...(opts.workosOrg !== undefined && opts.workosOrg !== "none"
+      ? { workosOrganizationId: opts.workosOrg }
+      : {}),
   };
 }
 
@@ -720,6 +737,12 @@ function parsePositiveInt(value: string): number {
 
 function parsePositiveIntOrNone(value: string): number | "none" {
   return value === "none" ? value : parsePositiveInt(value);
+}
+
+/** Shape only; the server asks WorkOS whether the organization exists. */
+export function parseWorkosOrgOrNone(value: string): string {
+  if (value === "none" || /^org_[0-9A-Za-z]{1,64}$/.test(value)) return value;
+  throw new InvalidArgumentError("expected a WorkOS organization id (org_...) or none");
 }
 
 function noneToNull<T>(value: T | "none"): T | null {
@@ -804,6 +827,7 @@ function orgRow(org: OrgAdmin, siteCount: number, permanentSites: number): strin
     `sites=${siteCount}`,
     `permanent=${permanentSites}`,
     `join=${org.joinEnabled ? "on" : "off"}`,
+    `workos=${dash(org.workosOrganizationId)}`,
   ];
 }
 

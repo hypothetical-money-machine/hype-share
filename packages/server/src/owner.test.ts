@@ -108,7 +108,7 @@ describe("owner portal", () => {
     expect(empty.sites.total).toBe(0);
     expect(empty.versions.retainedBytes).toBe(0);
     expect(empty.activity).toHaveLength(30);
-    expect(empty.orgs).toEqual({ total: 0, joinEnabled: 0, members: 0, elevated: 0 });
+    expect(empty.orgs).toEqual({ total: 0, joinEnabled: 0, workosLinked: 0, members: 0, elevated: 0 });
     expect(empty.orgList).toEqual([]);
     expect(empty.accounts.inOrg).toBe(0);
     const registered = (await app.inject({ method: "POST", url: "/api/v1/register", headers, payload: { name: "agent" } })).json();
@@ -137,7 +137,7 @@ describe("owner portal", () => {
     expect(reaped.sites.total).toBe(0);
     expect(reaped.versions.retainedBytes).toBe(0);
     expect(reaped.versions.publishes).toBe(0);
-    expect(reaped.orgs).toEqual({ total: 0, joinEnabled: 0, members: 0, elevated: 0 });
+    expect(reaped.orgs).toEqual({ total: 0, joinEnabled: 0, workosLinked: 0, members: 0, elevated: 0 });
     // Org fixture built with the db helpers; the HTTP org routes are covered in orgs.test.ts.
     const joinToken = "org_" + "j".repeat(43);
     const org = createOrg(db, { name: "<b>SkySlope</b>", compTier: "paid", joinToken });
@@ -147,10 +147,10 @@ describe("owner portal", () => {
     const teamSite = await app.inject({ method: "POST", url: "/api/v1/sites", headers: memberHeaders, payload: { title: "Team plan", ttl: "1d", files: [{ path: "index.html", content: "team" }] } });
     expect(teamSite.statusCode).toBe(201);
     const withOrg = await readStats();
-    expect(withOrg.orgs).toEqual({ total: 1, joinEnabled: 1, members: 1, elevated: 1 });
+    expect(withOrg.orgs).toEqual({ total: 1, joinEnabled: 1, workosLinked: 0, members: 1, elevated: 1 });
     expect(withOrg.accounts.inOrg).toBe(1);
     expect(withOrg.orgList).toHaveLength(1);
-    expect(withOrg.orgList[0]).toMatchObject({ id: org.id, name: "<b>SkySlope</b>", tier: "paid", compTier: "paid", billingTier: null, members: 1, maxMembers: 100, sites: 1, permanent: 0, joinEnabled: 1, publishPerHour: null });
+    expect(withOrg.orgList[0]).toMatchObject({ id: org.id, name: "<b>SkySlope</b>", tier: "paid", compTier: "paid", billingTier: null, members: 1, maxMembers: 100, sites: 1, permanent: 0, joinEnabled: 1, workosLinked: 0, publishPerHour: null });
     const withOrgJson = JSON.stringify(withOrg);
     expect(withOrgJson).not.toContain(joinToken);
     expect(withOrgJson).not.toContain(hashApiKey(joinToken));

@@ -100,6 +100,8 @@ export interface OrgAdmin extends OrgPublic {
   /** Effective pooled publish limit; null when the org holds no tier. */
   publishPerHour: number | null;
   joinEnabled: boolean;
+  /** The linked WorkOS organization (org_...), or null. */
+  workosOrganizationId: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -287,6 +289,7 @@ export interface CreateOrgBody {
   compTier?: OrgTier | null;
   maxMembers?: number;
   publishPerHour?: number | null;
+  workosOrganizationId?: string | null;
 }
 
 export interface UpdateOrgBody {
@@ -294,6 +297,8 @@ export interface UpdateOrgBody {
   compTier?: OrgTier | null;
   maxMembers?: number;
   publishPerHour?: number | null;
+  /** Null unlinks, which works even when the server has no WorkOS configured. */
+  workosOrganizationId?: string | null;
 }
 
 export function createOrg(
