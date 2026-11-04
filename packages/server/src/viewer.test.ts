@@ -118,8 +118,8 @@ async function signIn(h: Awaited<ReturnType<typeof setup>>) {
   const started = await h.start();
   expect(started.statusCode).toBe(302);
   const completed = await h.callback(cookiePair(started));
-  expect(completed.statusCode).toBe(501);
-  expect(completed.json().error.code).toBe("viewer_handoff_not_implemented");
+  expect(completed.statusCode).toBe(302);
+  expect(completed.headers.location).toMatch(/^https:\/\/orgsite\.shareplan\.localhost\/__shareplan\/session\?code=[A-Za-z0-9_-]{43}$/);
   return { started, completed, cookie: cookiePair(completed, VIEW_COOKIE) };
 }
 
@@ -238,7 +238,7 @@ describe("viewer start", () => {
     const h = await setup(); const { cookie } = await signIn(h);
     const noNonce = () => h.request({ method: "GET", url: `/v1/view/start?${new URLSearchParams({ site: "orgsite", path: "/" })}` });
     for (let i = 0; i < VIEWER_STARTS_PER_HOUR + 5; i++) {
-      expect((await h.start("/", { headers: { cookie } })).statusCode).toBe(501);
+      expect((await h.start("/", { headers: { cookie } })).statusCode).toBe(302);
       expect((await noNonce()).statusCode).toBe(302);
     }
     expect(h.db.prepare("SELECT count FROM rate_limits WHERE action = 'viewer_start'").get()).toEqual({ count: 1 });
@@ -251,7 +251,7 @@ describe("viewer start", () => {
     expect(cookies(start)[0]).toMatch(/^shareplan_view_flow_state_1=/);
     expect(cookies(start)[0]).not.toContain("Secure");
     const callback = await h.callback(cookiePair(start));
-    expect(callback.statusCode).toBe(501);
+    expect(callback.statusCode).toBe(302);
     expect(cookies(callback).find((c) => c.startsWith("shareplan_viewer="))).toContain("SameSite=Lax");
     expect(h.workos.authorize.mock.calls[0]![0].redirectUri).toBe(`http://localhost:8788${VIEW_CALLBACK_PATH}`);
   });
@@ -263,7 +263,7 @@ describe("viewer start", () => {
 });
 
 describe("viewer callback", () => {
-  it("creates only a viewer session, extracts sid, discards tokens, and stops at the slice-5 hook", async () => {
+  it("creates only a viewer session, extracts sid, discards tokens, and hands off to the site host", async () => {
     const h = await setup();
     const before = h.db.prepare("SELECT * FROM users").all();
     const { completed, cookie } = await signIn(h);
@@ -279,7 +279,7 @@ describe("viewer callback", () => {
     const header = cookies(completed).find((c) => c.startsWith(`${VIEW_COOKIE}=`))!;
     for (const value of ["Max-Age=28800", "Path=/", "HttpOnly", "Secure", "SameSite=Lax"]) expect(header).toContain(value);
     expect(header).not.toContain("Domain="); privateHeaders(completed);
-    // Browser site serving is deliberately inert in this slice.
+    // The apex viewer cookie is not a site cookie: the site host ignores it.
     const site = await h.request({ method: "GET", url: "/", headers: { host: "orgsite.shareplan.localhost", cookie } });
     expect(site.statusCode).toBe(401);
   });
@@ -315,7 +315,7 @@ describe("viewer callback", () => {
     h.workos.claims.auth_time = NOW / 1000 - 60;
     vi.setSystemTime(NOW + 120_000);
     const res = await h.callback(cookiePair(started));
-    expect(res.statusCode).toBe(501);
+    expect(res.statusCode).toBe(302);
     expect(sessions(h)[0]!.expires_at).toBe(NOW - 60_000 + EIGHT_HOURS);
     expect(cookies(res).find((c) => c.startsWith(`${VIEW_COOKIE}=`))).toContain("Max-Age=28620");
     const token = cookiePair(res, VIEW_COOKIE).split("=")[1]!;
@@ -330,7 +330,7 @@ describe("viewer callback", () => {
   it("consumes state once, including concurrent callbacks", async () => {
     const h = await setup(); const started = await h.start(); const cookie = cookiePair(started);
     const results = await Promise.all([h.callback(cookie), h.callback(cookie)]);
-    expect(results.map((r) => r.statusCode).sort()).toEqual([403, 501]);
+    expect(results.map((r) => r.statusCode).sort()).toEqual([302, 403]);
     expect((await h.callback(cookie)).statusCode).toBe(403);
     expect(h.workos.authenticate).toHaveBeenCalledTimes(1);
     expect(sessions(h)).toHaveLength(1);
@@ -344,8 +344,8 @@ describe("viewer callback", () => {
     expect((await h.callback(wrong)).statusCode).toBe(403);
     expect((await h.callback(cookiePair(a), "made_up")).statusCode).toBe(403);
     expect(h.workos.authenticate).not.toHaveBeenCalled();
-    expect((await h.callback(cookiePair(b), "state_2")).statusCode).toBe(501);
-    expect((await h.callback(cookiePair(a))).statusCode).toBe(501);
+    expect((await h.callback(cookiePair(b), "state_2")).statusCode).toBe(302);
+    expect((await h.callback(cookiePair(a))).statusCode).toBe(302);
     expect(sessions(h)).toHaveLength(2);
   });
 
@@ -378,7 +378,7 @@ describe("viewer callback", () => {
     const h = await setup(); const first = await signIn(h);
     const started = await h.start("/", { headers: { cookie: "x=1" } });
     const res = await h.callback(`${cookiePair(started)}; ${first.cookie}`, "state_2");
-    expect(res.statusCode).toBe(501);
+    expect(res.statusCode).toBe(302);
     const rows = sessions(h);
     expect(rows).toHaveLength(2);
     expect(rows.find((r) => r.token_hash === hashApiKey(first.cookie.split("=")[1]!))!.revoked_at).toBe(NOW);
@@ -413,7 +413,7 @@ describe("viewer callback", () => {
   it("uses a live apex session only for its org and refuses revoked/expired sessions", async () => {
     const h = await setup(); const { cookie } = await signIn(h);
     const shortcut = await h.start("/", { headers: { cookie } });
-    expect(shortcut.statusCode).toBe(501); privateHeaders(shortcut);
+    expect(shortcut.statusCode).toBe(302); privateHeaders(shortcut);
     expect(h.workos.authorize).toHaveBeenCalledTimes(1);
     h.db.exec("UPDATE viewer_sessions SET workos_org_id = 'org_other'");
     expect((await h.start("/", { headers: { cookie } })).statusCode).toBe(302);

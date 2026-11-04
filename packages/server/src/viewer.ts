@@ -5,17 +5,23 @@ import { isHostLabel, RESERVED_HOST_LABELS } from "@shareplan/core";
 import type { WorkOSAuthClient } from "./app.js";
 import { claimRedirectPage, escapeHtml, setAuthPageHeaders } from "./auth-pages.js";
 import type { Config } from "./config.js";
+import { z } from "zod";
+import { requireAdmin } from "./auth.js";
 import { getSite, getSiteByIdOrSlug, hashApiKey, honouredAudience, isExpired, type SiteRow } from "./db.js";
 import { HttpError } from "./errors.js";
 import { hashIp, requestIp } from "./ip.js";
 import { consumeRate } from "./rate-limit.js";
 import { siteUrl } from "./site-url.js";
 import {
-  consumeViewerAuthFlow, getViewerSession, insertViewerAuthFlow,
-  insertViewerSession, revokeViewerSession, type ViewerSession,
+  consumeViewerAuthFlow, getViewerSession, getViewerSessionByHash, insertSiteGrant,
+  insertViewerAuthFlow, insertViewerSession, replaceViewerSession, revokeViewerSession, revokeViewerSessions,
+  type ViewerSession,
 } from "./viewer-db.js";
 
 export const VIEW_CALLBACK_PATH = "/v1/auth/workos/view/callback";
+/** The site-host redemption endpoint; only intercepted on org sites. */
+export const SITE_SESSION_PATH = "/__shareplan/session";
+const GRANT_SECONDS = 60;
 const FLOW_SECONDS = 10 * 60;
 const SESSION_SECONDS = 8 * 60 * 60;
 /** New WorkOS sign-ins per hashed IP per hour; offices share NAT addresses. */
@@ -63,20 +69,45 @@ export interface ViewerGrantInput {
 }
 
 /**
- * Slice 5 implements the 60-second, single-use, site/nonce-bound grant here.
- * It must recheck viewer liveness and honouredAudience before minting, persist
- * only a code hash, and redirect to siteUrl(config, site.id). No site access is
- * granted by slice 4: both the callback and the existing-session shortcut end
- * with this explicit placeholder until the handoff is installed.
+ * The apex half of the site handoff. Rechecks the viewer session and the
+ * site's honoured audience, then mints a random 32-byte code, stored only as
+ * a hash, valid for 60 seconds, single use, and bound to this viewer session,
+ * this site and the site-host nonce hash. The redirect host comes from the
+ * database row, never from the request.
  */
 export function mintViewerGrant(
-  _db: DatabaseSync, _config: Config, reply: FastifyReply, _input: ViewerGrantInput,
+  db: DatabaseSync, config: Config, reply: FastifyReply, input: ViewerGrantInput,
 ): FastifyReply {
-  return reply.code(501).send({ error: {
-    code: "viewer_handoff_not_implemented",
-    message: "Viewer sign-in is ready. Site viewing requires the slice-5 handoff.",
-  } });
+  const now = Date.now();
+  const session = getViewerSessionByHash(db, input.session.token_hash, now);
+  const site = getSite(db, input.site.id);
+  if (!session || !site || isExpired(site, now) ||
+      honouredAudience(db, site)?.workosOrgId !== session.workos_org_id) {
+    return reply.code(403).send({
+      error: { code: "viewer_signin_failed", message: "Viewer sign-in failed. Open the site and try again." },
+    });
+  }
+  const code = randomBytes(32).toString("base64url");
+  insertSiteGrant(db, {
+    code_hash: hashApiKey(code), code_expires_at: now + GRANT_SECONDS * 1000,
+    viewer_token_hash: session.token_hash, site_id: site.id,
+    nonce_hash: input.siteNonceHash, return_path: input.returnPath,
+    created_at: now, expires_at: session.expires_at,
+  });
+  const location = new URL(`${SITE_SESSION_PATH}?code=${code}`, siteUrl(config, site.id));
+  return reply.redirect(location.href, 302);
 }
+
+/** Operator revoke: exactly one of email, WorkOS user id or WorkOS org id. */
+const revokeViewersSchema = z.object({
+  email: z.string().min(1).max(320).optional(),
+  workosUserId: z.string().min(1).max(256).optional(),
+  /** The WorkOS organization id (org_...) the viewer sessions are bound to. */
+  orgId: z.string().regex(/^org_[0-9A-Za-z]{1,64}$/, "orgId must be a WorkOS organization id (org_...)").optional(),
+}).strict().refine(
+  (body) => [body.email, body.workosUserId, body.orgId].filter((v) => v !== undefined).length === 1,
+  "pass exactly one of email, workosUserId, orgId",
+);
 
 // SDK 10.13.0's UserManagementAccessToken omits auth_time (and sub).
 // These untrusted-shaped values are validated below before storing anything.
@@ -136,7 +167,7 @@ export function registerViewerRoutes(
     const site = getSiteByIdOrSlug(db, label);
     const audience = site && honouredAudience(db, site);
     if (!site || !audience || isExpired(site)) throw new HttpError(404, "not_found", "site not found");
-    // Slice 5's site host will issue the nonce and return its hash here.
+    // Only the site host can issue the nonce; send the browser there for one.
     if (nonceHash === undefined) return reply.redirect(new URL(path, siteUrl(config, site.id)).href, 302);
     const session = sessionFor(req);
     if (session?.workos_org_id === audience.workosOrgId) {
@@ -210,7 +241,9 @@ export function registerViewerRoutes(
       insertViewerSession(db, session);
       // This cookie replaces any earlier session in this browser (e.g. another org's).
       const replaced = req.cookies[cookieName];
-      if (replaced) revokeViewerSession(db, hashApiKey(replaced), now);
+      // Same person, same org: its site sessions and pending grants move to the
+      // new session first, so a second tab's sign-in can't strand the first's.
+      if (replaced) replaceViewerSession(db, hashApiKey(replaced), session, now);
       reply.setCookie(cookieName, token, { ...cookieOptions, maxAge: Math.floor((session.expires_at - now) / 1000) });
       return mintViewerGrant(db, config, reply, {
         session, site, returnPath: flow.return_path, siteNonceHash: flow.site_nonce_hash,
@@ -236,7 +269,10 @@ export function registerViewerRoutes(
   app.post("/v1/view/logout", { ...options, bodyLimit: 4096 }, async (req, reply) => {
     if (req.headers.origin !== base.origin) throw new HttpError(403, "invalid_origin", "Submit this form from the viewer sign-in page.");
     const session = sessionFor(req);
-    if (session) revokeViewerSession(db, session.token_hash);
+    // Sign out every viewer session this person holds, not just this cookie's:
+    // tabs that signed in at the same time each got their own session, and
+    // their site cookies would otherwise outlive the sign-out.
+    if (session) revokeViewerSessions(db, { workosUserId: session.workos_user_id });
     reply.clearCookie(cookieName, cookieOptions);
     const url = session
       ? workos!.userManagement.getLogoutUrl({ sessionId: session.workos_session_id, returnTo: new URL("/", base).href })
@@ -247,4 +283,16 @@ export function registerViewerRoutes(
 
   // Keep disabled-mode and auth-page headers consistent even for unknown paths.
   app.all("/v1/view/*", options, async () => { throw new HttpError(404, "not_found", "not found"); });
+
+  // Operator revoke works whether or not browser viewing is enabled, so it can
+  // be used during an incident. Takes effect on the next site request.
+  app.post("/api/v1/admin/viewer-sessions/revoke", async (req, reply) => {
+    requireAdmin(config.adminTokenHash, req);
+    const body = revokeViewersSchema.parse(req.body ?? {});
+    const revoked = revokeViewerSessions(db,
+      body.email !== undefined ? { email: body.email }
+      : body.workosUserId !== undefined ? { workosUserId: body.workosUserId }
+      : { workosOrgId: body.orgId! });
+    return reply.send({ revoked });
+  });
 }

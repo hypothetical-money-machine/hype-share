@@ -55,7 +55,7 @@ export SHAREPLAN_URL=http://127.0.0.1:8788
 export SHAREPLAN_TOKEN=sp_...
 ```
 
-Viewer sign-in and sign-out are at [/v1/view/](https://hype-share.com/v1/view/) on the apex host. Org sites remain owner-key-only until the site handoff ships. See [Org-private viewing](../PLAN.md#org-private-viewing) for the canonical design.
+Sites published with `"visibility": "org"` open in a browser only after an SSO sign-in to the owner's linked WorkOS organization; your key still reads them with `Authorization: Bearer`. Viewer sign-in and sign-out are at [/v1/view/](https://hype-share.com/v1/view/) on the apex host. See [Org-private viewing](../PLAN.md#org-private-viewing) for the canonical design.
 
 ## CLI
 

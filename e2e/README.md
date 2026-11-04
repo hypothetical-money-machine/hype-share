@@ -61,8 +61,18 @@ and its site CSP would block a malicious logout form before the owner guard:
 `/__e2e/attacker` serves a sibling-origin form without CSP. They are served only
 by the harness on site hosts; no application behavior changes. The cookie test
 uses real published HTML/CSP for the credentialed sibling fetch and observes its
-`securitypolicyviolation` event and absence of a network request. It does not yet
-test the upcoming viewer sessions, grant redemption, or fetch-metadata guard.
+`securitypolicyviolation` event and absence of a network request.
+
+`org-sites.spec.ts` covers org-site viewing (PLAN.md, Org-private viewing):
+a full SSO sign-in from a sibling-site link through `/v1/view/start`, fake
+AuthKit, the view callback and `/__shareplan/session`; host-only site and
+viewer cookies; site A's cookie refused on site B while B reuses the apex
+session; a sibling's `fetch`, `<script src>` and `<iframe>` refused with 404
+although the browser sent the Lax cookie; two tabs held at AuthKit at once
+(`authkit.authorizeGate`, because Playwright routes skip redirect hops) sharing
+one nonce and both redeeming; a real sign-out through `/v1/view/` and the fake
+AuthKit logout; and a viewer from another WorkOS organization getting 403.
+`harness.requests[i].status` is the status the server sent.
 
 ## Adding a slice's browser test
 
@@ -86,8 +96,9 @@ test("new sign-in behavior", async ({ page, harness }) => {
 
 `harness.publish(html?)` publishes a public site with an ops key and returns its
 portless URL. Future org tests should publish through the appropriate member
-key. Extend the fake's typed client if a slice adds SDK methods (for example org
-validation or logout); keep all fake endpoints on the separate AuthKit origin.
+key. The fake implements `getLogoutUrl` (served at `/logout`, recorded in
+`logoutCalls`) and `organizations.getOrganization`. Extend its typed client if a
+slice adds SDK methods; keep all fake endpoints on the separate AuthKit origin.
 Prefer locators and awaited responses over sleeps. Run a focused case with
 `npm run test:e2e -- --grep 'new sign-in'`, then the suite twice.
 

@@ -24,6 +24,7 @@ import {
   removeOrgMember,
   revokeKey,
   revokeOrgKey,
+  revokeViewers,
   rotateOrgJoinToken,
   rotateOrgJoinTokenAdmin,
   setOrgMemberRole,
@@ -40,6 +41,7 @@ import {
   type OrgTier,
   type RegisterResponse,
   type RemovedMember,
+  type RevokeViewersBody,
   type UpdateOrgBody,
 } from "./api.js";
 import { collectDirectory, collectSingleFile } from "./bundle.js";
@@ -625,6 +627,43 @@ program
     }
   });
 
+program
+  .command("revoke-viewers")
+  .description(
+    "Sign out org-site viewers now, by email, WorkOS user or WorkOS organization; takes effect on their next request (requires admin token)",
+  )
+  .requiredOption("--url <url>", "shareplan base URL")
+  .requiredOption("--admin-token <token>", "admin token")
+  .option("--email <email>", "viewer email (case-insensitive)")
+  .option("--workos-user <id>", "WorkOS user id (user_...)")
+  .option("--workos-org <id>", "every viewer of this WorkOS organization (org_...)", parseWorkosOrg)
+  .action(
+    async (opts: AdminOptions & RevokeViewersOptions) => {
+      try {
+        const { revoked } = await revokeViewers(opts.url, opts.adminToken, buildRevokeViewersBody(opts));
+        console.log(`revoked ${plural(revoked, "viewer session")}`);
+      } catch (e) {
+        fail(e);
+      }
+    },
+  );
+
+export interface RevokeViewersOptions {
+  email?: string;
+  workosUser?: string;
+  workosOrg?: string;
+}
+
+export function buildRevokeViewersBody(opts: RevokeViewersOptions): RevokeViewersBody {
+  const given = [opts.email, opts.workosUser, opts.workosOrg].filter((v) => v !== undefined);
+  if (given.length !== 1) {
+    throw new Error("pass exactly one of --email, --workos-user, --workos-org");
+  }
+  if (opts.email !== undefined) return { email: opts.email };
+  if (opts.workosUser !== undefined) return { workosUserId: opts.workosUser };
+  return { orgId: opts.workosOrg! };
+}
+
 export interface PublishOptions {
   title?: string;
   ttl?: string;
@@ -746,6 +785,11 @@ function parsePositiveIntOrNone(value: string): number | "none" {
 export function parseWorkosOrgOrNone(value: string): string {
   if (value === "none" || /^org_[0-9A-Za-z]{1,64}$/.test(value)) return value;
   throw new InvalidArgumentError("expected a WorkOS organization id (org_...) or none");
+}
+
+export function parseWorkosOrg(value: string): string {
+  if (/^org_[0-9A-Za-z]{1,64}$/.test(value)) return value;
+  throw new InvalidArgumentError("expected a WorkOS organization id (org_...)");
 }
 
 function noneToNull<T>(value: T | "none"): T | null {
