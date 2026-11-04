@@ -24,9 +24,9 @@ export function getOwnerStats(db: DatabaseSync, now = Date.now()) {
       permanent: number; currentBytes: number; currentFiles: number;
     };
   const versions = db.prepare(`SELECT COUNT(*) AS publishes,
-    COALESCE(SUM(pruned_at IS NULL), 0) AS retained,
-    COALESCE(SUM(CASE WHEN pruned_at IS NULL THEN byte_size ELSE 0 END), 0) AS retainedBytes
-    FROM site_versions`).get() as { publishes: number; retained: number; retainedBytes: number };
+    COALESCE(SUM(v.pruned_at IS NULL), 0) AS retained,
+    COALESCE(SUM(CASE WHEN v.pruned_at IS NULL THEN v.byte_size ELSE 0 END), 0) AS retainedBytes
+    FROM site_versions v JOIN sites s ON s.id = v.site_id WHERE s.deleting_at IS NULL`).get() as { publishes: number; retained: number; retainedBytes: number };
   const keys = db.prepare(`SELECT COUNT(*) AS active FROM api_keys WHERE revoked_at IS NULL`).get() as { active: number };
   const tierRows = db.prepare(`SELECT tier, COUNT(*) AS count FROM users GROUP BY tier`).all() as { tier: string; count: number }[];
   const tiers = Object.keys(TIER_POLICIES).map(tier => ({ tier, count: tierRows.find(row => row.tier === tier)?.count ?? 0 }));
@@ -36,8 +36,9 @@ export function getOwnerStats(db: DatabaseSync, now = Date.now()) {
   const visibility = [...stored.map(row => row.visibility === "private" ? { ...row, count: row.count - orgSites } : row), { visibility: "org", count: orgSites }]
     .filter(row => row.count > 0)
     .sort((a, b) => a.visibility.localeCompare(b.visibility));
-  const activityRows = db.prepare(`SELECT CAST(created_at / ? AS INTEGER) * ? AS day, COUNT(*) AS publishes
-    FROM site_versions WHERE created_at >= ? GROUP BY day`).all(DAY, DAY, since) as { day: number; publishes: number }[];
+  const activityRows = db.prepare(`SELECT CAST(v.created_at / ? AS INTEGER) * ? AS day, COUNT(*) AS publishes
+    FROM site_versions v JOIN sites s ON s.id = v.site_id
+    WHERE v.created_at >= ? AND s.deleting_at IS NULL GROUP BY day`).all(DAY, DAY, since) as { day: number; publishes: number }[];
   const activity = Array.from({ length: 30 }, (_, i) => {
     const day = since + i * DAY;
     return { date: new Date(day).toISOString().slice(0, 10), publishes: activityRows.find(row => row.day === day)?.publishes ?? 0 };

@@ -2224,6 +2224,8 @@ describe("partial delete failures", () => {
     const stats = getOwnerStats(h.db);
     expect(stats.sites).toMatchObject({ total: 0, active: 0 });
     expect(stats.recentSites).toEqual([]);
+    expect(stats.versions).toMatchObject({ publishes: 0, retained: 0 });
+    expect(stats.activity.reduce((n, d) => n + d.publishes, 0)).toBe(0);
     expect(h.db.prepare(`SELECT count(*) AS n FROM sites`).get()).toEqual({ n: 1 });
     expect(h.s3.keysUnder(`sites/${site.id}/`)).not.toEqual([]);
 

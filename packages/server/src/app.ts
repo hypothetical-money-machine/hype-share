@@ -1338,15 +1338,17 @@ async function publishNewSite(
   beginUpload(ctx.db, prefix);
   try {
     await putSiteFiles(ctx.s3, ctx.config.s3.bucket, siteId, versionId, files);
-    // Nothing awaits from here to the insert, so the checks and writes land as
-    // one step. Both are redone against the current state: another publish may
-    // have taken the slug, or an org downgrade lowered the tier, mid-upload.
-    const limits = currentPolicy(ctx, account);
-    const slug = body.slug !== undefined && limits.slugs ? body.slug : null;
-    if (slug !== null) assertSlugAvailable(ctx, slug, account.user.id);
-    // Race rule for an org create: the owner may have been detached, or the org
-    // relinked, while the files uploaded. Write no audience the owner no longer has.
+    // Every check is redone against the state as it is now, inside the
+    // transaction that writes the rows, so nothing can land between a read and
+    // the write that depends on it, even from another process: another
+    // publish may have taken the slug, or an org downgrade lowered the tier,
+    // while the files uploaded.
     const committed = transaction(ctx.db, () => {
+      const limits = currentPolicy(ctx, account);
+      const slug = body.slug !== undefined && limits.slugs ? body.slug : null;
+      if (slug !== null) assertSlugAvailable(ctx, slug, account.user.id);
+      // Race rule for an org create: the owner may have been detached, or the
+      // org relinked. Write no audience the owner no longer has.
       if (orgLink !== null) {
         const owner = getUser(ctx.db, account.user.id);
         const org = getOrg(ctx.db, orgLink.orgId);
@@ -1488,30 +1490,30 @@ async function publishVersion(
   try {
     await putSiteFiles(ctx.s3, ctx.config.s3.bucket, existing.id, versionId, files);
 
-    // Re-read after the upload, not just before it. While we awaited S3 the
+    // Re-read after the upload, not just before it, and inside the transaction
+    // that writes, so no other publish (even from another process) can land
+    // between a read and the write that depends on it. While we awaited S3 the
     // site may have been deleted (or the sweeper may have started on it), it
     // may have expired, another publish may have claimed the slug, or the
-    // owner's tier may have dropped. Nothing awaits between these checks and
-    // the writes, so they land as one step; sites.slug is UNIQUE, so writing
-    // blind would surface a slug race as a 500 instead of a 409.
-    const current = ownSite(ctx.db, existing.id, account.user.id);
-    if (isExpired(current)) {
-      throw new HttpError(410, "site_expired", "site expired");
-    }
-    const limits = currentPolicy(ctx, account);
-    let slug: string | null = limits.slugs ? current.slug : null;
-    if (newSlug !== null && limits.slugs) {
-      assertSlugAvailable(ctx, newSlug, account.user.id, current.id);
-      slug = newSlug;
-    }
-    const expires_at = clampStoredExpiry(
-      limits,
-      explicitExpiry !== undefined ? explicitExpiry : current.expires_at,
-      now,
-    );
-    const visibility = allowedVisibility(requested, limits);
-
+    // owner's tier may have dropped; sites.slug is UNIQUE, so writing blind
+    // would surface a slug race as a 500 instead of a 409.
     const committed = transaction(ctx.db, () => {
+      const current = ownSite(ctx.db, existing.id, account.user.id);
+      if (isExpired(current)) {
+        throw new HttpError(410, "site_expired", "site expired");
+      }
+      const limits = currentPolicy(ctx, account);
+      let slug: string | null = limits.slugs ? current.slug : null;
+      if (newSlug !== null && limits.slugs) {
+        assertSlugAvailable(ctx, newSlug, account.user.id, current.id);
+        slug = newSlug;
+      }
+      const expires_at = clampStoredExpiry(
+        limits,
+        explicitExpiry !== undefined ? explicitExpiry : current.expires_at,
+        now,
+      );
+      const visibility = allowedVisibility(requested, limits);
       let audience: SiteAudience | null = null;
       if (wasOrg) {
         // Race rule for org republishes: refuse if anything moved during the
