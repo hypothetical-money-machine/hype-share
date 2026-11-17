@@ -92,6 +92,8 @@ A self-hosted server reads its S3 target, admin token, and limits from the envir
 
 ### Local development
 
+The server and CLI need Node.js 22.13.0 or later.
+
 ```bash
 # 1. Start local object storage (MinIO)
 docker compose up -d

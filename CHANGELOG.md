@@ -18,8 +18,10 @@ What is in it:
 
 Read these before pointing a running server at this release.
 
-- **Database.** The schema moves to `user_version` 4 on first start. The migration clears, and logs, slugs that aren't valid hostname labels and slugs that are now reserved (`login`, `auth`, `account`, `support` and similar). Back up the SQLite file first.
+- **Back up first.** Back up the SQLite file and the MinIO volume. The database migration and the volume handover below are one-way.
+- **Database.** The schema moves to `user_version` 4 on first start. The migration clears slugs that aren't valid hostname labels and slugs that are now reserved (`login`, `auth`, `account`, `support`, `status`, `help`, `billing` and similar), and logs each one with its site id. Those sites stay up at their generated id.
 - **Admin token.** A `SHAREPLAN_ADMIN_TOKEN` shorter than 16 characters stops the server from starting.
+- **Stricter config.** The server also refuses to start on a `SHAREPLAN_PUBLIC_BASE_URL` with a path, only one of the two S3 keys, a number setting that isn't a whole number in range, or a `SHAREPLAN_DEFAULT_TTL` it can't parse. Each error names the setting.
 - **S3 credentials.** The implicit `minioadmin` keys are gone. Set `SHAREPLAN_S3_ACCESS_KEY` and `SHAREPLAN_S3_SECRET_KEY`, or leave both unset to use the AWS SDK's default credential chain.
 - **Client IP behind Cloudflare.** Set `SHAREPLAN_CLIENT_IP_HEADER=cf-connecting-ip` together with `SHAREPLAN_TRUST_FORWARDED=true`, or every client shares the Cloudflare edge's rate-limit bucket. The server refuses to start with the header set and forwarding untrusted.
 - **Claims need site hosts.** Without `SHAREPLAN_SITE_HOST_SUFFIX`, claim links answer 503.
