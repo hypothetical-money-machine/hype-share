@@ -23,6 +23,12 @@ describe("siteUrl", () => {
     );
   });
 
+  it("reads the scheme case-insensitively", () => {
+    expect(siteUrl(config("HTTP://localtest.me:8788", "localtest.me"), "abc")).toBe(
+      "http://abc.localtest.me:8788/",
+    );
+  });
+
   it("falls back to paths on the API host without a suffix", () => {
     expect(siteUrl(config("http://127.0.0.1:8788"), "abc")).toBe("http://127.0.0.1:8788/s/abc/");
   });

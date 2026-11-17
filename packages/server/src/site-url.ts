@@ -2,7 +2,8 @@ import type { Config } from "./config.js";
 
 /** Sites use the API host's scheme, including plain HTTP in development. */
 export function siteScheme(config: Config): "http" | "https" {
-  return config.publicBaseUrl.startsWith("http://") ? "http" : "https";
+  // Parsed rather than prefix-matched, so `HTTP://` agrees with the cookie code.
+  return new URL(config.publicBaseUrl).protocol === "http:" ? "http" : "https";
 }
 
 /**

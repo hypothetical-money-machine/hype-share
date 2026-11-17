@@ -41,10 +41,9 @@ services:
     image: cgr.dev/chainguard/minio@sha256:68aab277f9748c7c3eb85f178744adba1655c8e33a86987b22d2879ca507c332
     depends_on:
       minio:
-        condition: service_started
+        condition: service_healthy
     entrypoint: >
       /bin/sh -c "
-      sleep 3;
       mc alias set local http://minio:9000 minioadmin minioadmin;
       mc mb -p local/shareplan || true;
       exit 0;
