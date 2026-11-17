@@ -1133,9 +1133,11 @@ export function markSiteDeleting(
     .prepare(
       `UPDATE sites SET deleting_at = COALESCE(deleting_at, ?)
        WHERE id = ?
-         AND (?3 IS NULL OR deleting_at IS NOT NULL OR (expires_at IS NOT NULL AND expires_at <= ?3))`,
+         AND (? IS NULL OR deleting_at IS NOT NULL OR (expires_at IS NOT NULL AND expires_at <= ?))`,
     )
-    .run(now, id, expiredBy ?? null);
+    // Plain placeholders only: Node 22's node:sqlite can't bind `?` mixed
+    // with numbered `?3`, so the cutoff is passed twice.
+    .run(now, id, expiredBy ?? null, expiredBy ?? null);
   return (result.changes ?? 0) > 0;
 }
 
