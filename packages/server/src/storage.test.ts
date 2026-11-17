@@ -100,6 +100,36 @@ describe("getObject body limits", () => {
     await expect(headObject(client, "b", "k", LIMITS)).rejects.toThrow(/did not answer/);
   });
 
+  it("gives up on time when send ignores the abort, as during a retry backoff sleep", async () => {
+    const lateBody = Readable.from([Buffer.alloc(10, 1)]);
+    let resolveLate: (v: unknown) => void = () => {};
+    const client = {
+      // Settles only well after the deadline, whatever the signal says.
+      send: () => new Promise((r) => (resolveLate = r)),
+    } as unknown as S3Client;
+    const started = Date.now();
+    await expect(getObject(client, "b", "k", LIMITS)).rejects.toThrow(/did not answer/);
+    expect(Date.now() - started).toBeLessThan(LIMITS.idleMs * 5);
+    resolveLate({ Body: lateBody, ContentLength: 10 });
+    await new Promise((r) => setImmediate(r));
+    expect(lateBody.destroyed).toBe(true);
+  });
+
+  it("reports the deadline, not the SDK's AbortError, when the SDK rejects on abort", async () => {
+    const client = {
+      send: (_cmd: unknown, opts: { abortSignal: AbortSignal }) =>
+        new Promise((_, reject) =>
+          opts.abortSignal.addEventListener("abort", () => {
+            const err = new Error("Request aborted");
+            err.name = "AbortError";
+            (err as Error & { cause?: unknown }).cause = opts.abortSignal.reason;
+            reject(err);
+          }),
+        ),
+    } as unknown as S3Client;
+    await expect(headObject(client, "b", "k", LIMITS)).rejects.toThrow(/did not answer/);
+  });
+
   it("lets a fully received body that nobody reads sit without crashing", async () => {
     const client = clientFor(() => Readable.from([Buffer.alloc(4000, 2)]), 4000);
     const obj = (await getObject(client, "b", "k", LIMITS))!;
