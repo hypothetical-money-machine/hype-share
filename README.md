@@ -139,6 +139,9 @@ Configuration notes:
 - Point `SHAREPLAN_PUBLIC_BASE_URL` to your public API URL (e.g. `https://share.example.com`). It must be a bare origin, with no path.
 - The container binds to `127.0.0.1:8788` on the host. Configure your reverse proxy (Caddy, Nginx, or Traefik) to terminate HTTPS and forward traffic.
 - Set `SHAREPLAN_SITE_HOST_SUFFIX` to your site domain, configure wildcard DNS (`*.share.example.com`), and make sure your reverse proxy forwards the original `Host` header.
+- Site links use the API URL's scheme and port. With `SHAREPLAN_PUBLIC_BASE_URL=http://example.test:8788`, sites print as `http://<id>.example.test:8788/`.
+- MinIO no longer publishes `minio/minio` images, so both compose files use Chainguard's free MinIO build, pinned by digest. It runs as uid 65532. A one-shot `minio-volume` service hands an existing root-owned volume to that user before MinIO starts.
+- Before upgrading an existing deployment, read [CHANGELOG.md](CHANGELOG.md) for settings that changed.
 
 ---
 
