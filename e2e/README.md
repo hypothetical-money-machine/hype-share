@@ -1,6 +1,6 @@
 # Opt-in browser tests
 
-Run from the repository root (Node >=22.11, OpenSSL on PATH, and Chromium's
+Run from the repository root (Node >=22.13.0, OpenSSL on PATH, and Chromium's
 system libraries already installed):
 
 ```sh
@@ -14,7 +14,7 @@ at `~/.cache/ms-playwright/chromium-1248`. If it is missing, prepare it once wit
 The tests select the full Chromium build with `channel: "chromium"`.
 No Docker, sudo, system DNS edits, privileged ports, WorkOS account, env file,
 or S3 service is needed. After dependencies/browser provisioning, the suite only
-contacts loopback. It is excluded from `npm test` and CI; `npm run typecheck`
+contacts loopback. It is excluded from `npm test` but runs as its own CI job; `npm run typecheck`
 does check the harness. `test:e2e` builds core before importing server sources.
 
 ## Topology and isolation
