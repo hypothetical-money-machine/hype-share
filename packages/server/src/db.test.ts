@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   clampSitesToPolicy,
   countOrgMembers,
@@ -313,7 +313,19 @@ describe("upgrade", () => {
     site(db, "s3", "Launch-Day", 12, a.key.id, a.user.id);
     site(db, "s4", "login", 13, a.key.id, a.user.id);
     db.exec("PRAGMA user_version = 3;");
-    upgrade(db);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      upgrade(db);
+      // Every cleared slug is named, reserved ones included, so the operator
+      // can tell which sites lost their vanity URL.
+      const logged = warn.mock.calls.map((c) => String(c[0])).join("\n");
+      expect(logged).toContain("login (site s4)");
+      expect(logged).toContain("my_plan (site s1)");
+      expect(logged).toContain("v1.2 (site s2)");
+      expect(logged).not.toContain("Launch-Day");
+    } finally {
+      warn.mockRestore();
+    }
     // Newly reserved labels are released by the same step.
     expect(getSite(db, "s4")?.slug).toBeNull();
     expect(getSite(db, "s1")?.slug).toBeNull();

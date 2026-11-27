@@ -1248,18 +1248,18 @@ describe("hostname serving", () => {
     expect(res.headers.location).toBe(`https://${site.id}.${SUFFIX}/?q=1&r=2`);
   });
 
-  it("describes site urls on the landing page with the api scheme", async () => {
+  it("describes site urls on the landing page with the api scheme and port", async () => {
     const http = await setup({ siteHostSuffix: SUFFIX, publicBaseUrl: "http://localhost:8788" });
     const page = await inject(http.app, { method: "GET", url: "/" });
-    expect(page.body).toContain(`http://:id.${SUFFIX}/`);
+    expect(page.body).toContain(`http://:id.${SUFFIX}:8788/`);
     expect(page.body).not.toContain(`https://:id.${SUFFIX}/`);
   });
 
-  it("uses http site urls when the api base is http", async () => {
+  it("uses http site urls on the api port when the api base is http", async () => {
     const h = await setup({ siteHostSuffix: SUFFIX, publicBaseUrl: "http://localhost:8788" });
     const res = await publish(h.app, helloSite());
     const { id, url } = res.json<{ id: string; url: string }>();
-    expect(url).toBe(`http://${id}.${SUFFIX}/`);
+    expect(url).toBe(`http://${id}.${SUFFIX}:8788/`);
   });
 });
 

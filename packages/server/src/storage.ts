@@ -169,18 +169,33 @@ function withDeadlines(source: Readable, limits: BodyLimits): Readable {
 
 /**
  * Send a serving read with a deadline that covers the whole of `send`: the
- * wait for headers and, on an error status, the SDK reading the error body.
- * Cleared once send returns, so it never cuts a successful body short (that
- * is withDeadlines' job).
+ * wait for headers, the SDK's retry backoff, and, on an error status, the SDK
+ * reading the error body. The deadline rejects on its own rather than waiting
+ * for the SDK to notice the abort, so a retry sleep can't hold the visitor
+ * past it, and it rejects with its own reason instead of the SDK's generic
+ * AbortError. Cleared once send settles, so it never cuts a successful body
+ * short (that is withDeadlines' job).
  */
 async function sendWithin<T>(ms: number, send: (abortSignal: AbortSignal) => Promise<T>): Promise<T> {
   const abort = new AbortController();
-  const timer = setTimeout(
-    () => abort.abort(new Error(`S3 did not answer within ${ms} ms`)),
-    ms,
-  );
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const reason = new Error(`S3 did not answer within ${ms} ms`);
+      // Reject first so the race settles on this reason, not the SDK's.
+      reject(reason);
+      abort.abort(reason);
+      // A response that lands after the deadline has nobody to read it; drop
+      // its body so the socket goes back to the pool.
+      sent.then(
+        (late) => (late as { Body?: { destroy?: () => void } } | undefined)?.Body?.destroy?.(),
+        () => {},
+      );
+    }, ms);
+  });
+  const sent = send(abort.signal);
   try {
-    return await send(abort.signal);
+    return await Promise.race([sent, deadline]);
   } finally {
     clearTimeout(timer);
   }

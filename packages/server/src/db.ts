@@ -206,9 +206,24 @@ function clearInvalidSlugs(db: DatabaseSync): { id: string; slug: string }[] {
   return bad;
 }
 
-function clearReservedSlugs(db: DatabaseSync): void {
-  const clear = db.prepare(`UPDATE sites SET slug = NULL WHERE slug = ? COLLATE NOCASE`);
-  for (const label of RESERVED_HOST_LABELS) clear.run(label);
+/** Clear slugs that are now reserved host labels; returns them. */
+function clearReservedSlugs(db: DatabaseSync): { id: string; slug: string }[] {
+  const rows = db
+    .prepare(`SELECT id, slug FROM sites WHERE slug IS NOT NULL ORDER BY created_at, id`)
+    .all() as { id: string; slug: string }[];
+  const reserved = rows.filter((r) => RESERVED_HOST_LABELS.has(r.slug.toLowerCase()));
+  const clear = db.prepare(`UPDATE sites SET slug = NULL WHERE id = ?`);
+  for (const row of reserved) clear.run(row.id);
+  return reserved;
+}
+
+/** An operator needs to know which sites lost their vanity URL in an upgrade. */
+function warnCleared(cleared: { id: string; slug: string }[], why: string): void {
+  if (cleared.length === 0) return;
+  console.warn(
+    `cleared ${cleared.length} slug(s) that ${why}: ` +
+      cleared.map((c) => `${c.slug} (site ${c.id})`).join(", "),
+  );
 }
 
 export function pruneRateLimits(db: DatabaseSync, now = Date.now()): number {
@@ -301,7 +316,7 @@ export function upgrade(db: DatabaseSync): void {
     version = 1;
   }
   if (version < 2) {
-    clearReservedSlugs(db);
+    warnCleared(clearReservedSlugs(db), "are reserved host labels");
     db.exec("PRAGMA user_version = 2;");
     version = 2;
   }
@@ -402,14 +417,8 @@ export function upgrade(db: DatabaseSync): void {
     // settled case. A slug that is not a label even lowercased (a dot, an
     // underscore, too long) can never be served from a site host.
     // Labels reserved since step 2 are released the same way.
-    clearReservedSlugs(db);
-    const cleared = clearInvalidSlugs(db);
-    if (cleared.length > 0) {
-      console.warn(
-        `cleared ${cleared.length} slug(s) that are not hostname labels: ` +
-          cleared.map((c) => `${c.slug} (site ${c.id})`).join(", "),
-      );
-    }
+    warnCleared(clearReservedSlugs(db), "are reserved host labels");
+    warnCleared(clearInvalidSlugs(db), "are not hostname labels");
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
     version = SCHEMA_VERSION;
   }
@@ -1133,9 +1142,11 @@ export function markSiteDeleting(
     .prepare(
       `UPDATE sites SET deleting_at = COALESCE(deleting_at, ?)
        WHERE id = ?
-         AND (?3 IS NULL OR deleting_at IS NOT NULL OR (expires_at IS NOT NULL AND expires_at <= ?3))`,
+         AND (? IS NULL OR deleting_at IS NOT NULL OR (expires_at IS NOT NULL AND expires_at <= ?))`,
     )
-    .run(now, id, expiredBy ?? null);
+    // Plain placeholders only: Node 22's node:sqlite can't bind `?` mixed
+    // with numbered `?3`, so the cutoff is passed twice.
+    .run(now, id, expiredBy ?? null, expiredBy ?? null);
   return (result.changes ?? 0) > 0;
 }
 

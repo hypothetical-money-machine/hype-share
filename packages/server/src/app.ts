@@ -84,7 +84,7 @@ import {
   type Account,
 } from "./auth.js";
 import { claimRedirectPage, escapeHtml, setAuthPageHeaders } from "./auth-pages.js";
-import { siteScheme, siteUrl } from "./site-url.js";
+import { siteHost, siteScheme, siteUrl } from "./site-url.js";
 import { registerViewerRoutes } from "./viewer.js";
 import {
   authorizeOrgSite,
@@ -1901,7 +1901,7 @@ async function serveSitePath(
 function siteUrlShape(config: Config): string {
   return config.siteHostSuffix === null
     ? "/s/:id/"
-    : `${siteScheme(config)}://:id.${config.siteHostSuffix}/`;
+    : `${siteScheme(config)}://${siteHost(config, ":id")}/`;
 }
 
 function toSiteResponse(config: Config, db: DatabaseSync, row: SiteRow): SiteResponse {

@@ -53,8 +53,27 @@ services:
       retries: 5
       start_period: 20s
 
+  # Volumes made by the old minio/minio image are owned by root, and the
+  # non-root image below can't open them. This hands the volume to uid 65532
+  # once, then exits; it does nothing on a volume that is already right.
+  minio-volume:
+    image: cgr.dev/chainguard/minio@sha256:68aab277f9748c7c3eb85f178744adba1655c8e33a86987b22d2879ca507c332
+    user: "0:0"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - '[ "$$(stat -c %u /data)" = 65532 ] || chown -R 65532:65532 /data'
+    volumes:
+      - shareplan-minio-data:/data
+    restart: "no"
+
   minio:
-    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    # MinIO stopped publishing minio/minio and minio/mc; Chainguard's free
+    # builds are pinned by digest. The image runs as uid 65532.
+    image: cgr.dev/chainguard/minio@sha256:68aab277f9748c7c3eb85f178744adba1655c8e33a86987b22d2879ca507c332
+    depends_on:
+      minio-volume:
+        condition: service_completed_successfully
     command: server /data
     restart: unless-stopped
     environment:

@@ -3,14 +3,37 @@ name: Docker
 on:
   push:
     branches: [main]
+  # Every pull request, so stacked PRs are checked before they reach main.
   pull_request:
-    branches: [main]
 
 permissions:
   contents: read
 
 jobs:
   build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # The oldest Node that `engines` allows, and the one the image runs.
+        node-version: ["22.13.0", "24"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm run typecheck
+      - run: npm test
+      - if: matrix.node-version == '24'
+        run: docker build --tag hype-shareplan:ci .
+      - if: matrix.node-version == '24'
+        run: |
+          docker run --rm --entrypoint node hype-shareplan:ci \
+            --version
+
+  e2e:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -19,9 +42,5 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
-      - run: npm run build
-      - run: npm test
-      - run: docker build --tag hype-shareplan:ci .
-      - run: |
-          docker run --rm --entrypoint node hype-shareplan:ci \
-            --version
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
