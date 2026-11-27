@@ -162,6 +162,13 @@ describe("ensureIndexHtml", () => {
     expect(out.some((f) => f.path === "photo.png")).toBe(true);
   });
 
+  it("percent-encodes the wrapped file's name in the page's link", () => {
+    const out = ensureIndexHtml([{ path: "a b#1?.png", body: Buffer.from([1]) }]);
+    const html = out.find((f) => f.path === "index.html")!.body.toString("utf8");
+    expect(html).toContain('src="a%20b%231%3F.png"');
+    expect(html).toContain("<title>a b#1?.png</title>");
+  });
+
   it("requires index for multi-file bundles", () => {
     expect(() =>
       ensureIndexHtml([

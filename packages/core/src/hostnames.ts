@@ -22,7 +22,11 @@ export function siteLabelFromHost(host: string, suffix: string): string | null {
   return isHostLabel(label) ? label : null;
 }
 
-/** Labels that must stay free so they can never be claimed as a site slug. */
+/**
+ * Labels that must stay free so they can never be claimed as a site slug:
+ * infrastructure names, and the account and sign-in words a phishing page on
+ * the service's own domain would want.
+ */
 export const RESERVED_HOST_LABELS = new Set([
   "www",
   "api",
@@ -31,4 +35,20 @@ export const RESERVED_HOST_LABELS = new Set([
   "mail",
   "static",
   "cdn",
+  "account",
+  "accounts",
+  "auth",
+  "billing",
+  "claim",
+  "help",
+  "login",
+  "logout",
+  "oauth",
+  "owner",
+  "secure",
+  "signin",
+  "signup",
+  "sso",
+  "status",
+  "support",
 ]);

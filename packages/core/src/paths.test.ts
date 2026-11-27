@@ -62,4 +62,19 @@ describe("sanitizeSitePath", () => {
   it("builds s3 keys", () => {
     expect(s3ObjectKey("abc", "v1", "index.html")).toBe("sites/abc/v/v1/index.html");
   });
+
+  it("rejects characters an S3 XML body cannot carry", () => {
+    for (const shape of ["a\u0001b.html", "tab\there.css", "x\u007f.js", "x\ufffe.md", "x\ud800.html", "x\udc00y.html"]) {
+      expect(() => sanitizeSitePath(shape), JSON.stringify(shape)).toThrow(PathError);
+    }
+    // A real astral character is a surrogate pair, which is fine.
+    expect(sanitizeSitePath("emoji-\u{1F600}.png")).toBe("emoji-\u{1F600}.png");
+  });
+
+  it("rejects a segment longer than 255 bytes but not a long path of short segments", () => {
+    expect(() => sanitizeSitePath(`${"a".repeat(256)}.html`)).toThrow(/segment too long/);
+    expect(() => sanitizeSitePath(`${"\u00e9".repeat(128)}.html`)).toThrow(/segment too long/);
+    const ok = Array.from({ length: 4 }, () => "b".repeat(100)).join("/") + ".css";
+    expect(sanitizeSitePath(ok)).toBe(ok);
+  });
 });

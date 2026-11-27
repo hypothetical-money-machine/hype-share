@@ -25,9 +25,12 @@ import { getOwnerStats } from "./owner-stats.js";
 import { HOUR_MS } from "./rate-limit.js";
 import { reapExpiredSites } from "./reap.js";
 import { createFakeS3, type FakeS3 } from "./testing/fake-s3.js";
+import { gate, tick } from "./testing/gate.js";
 
 const TOKEN = "sp_test_token";
 const ADMIN = "admin-token";
+/** Claiming refuses to run on a shared origin, so claim tests use site hosts. */
+const CLAIM_SITE_HOSTS = "sites.test.local";
 const WORKOS_CONFIG = {
   apiKey: "sk_test",
   clientId: "client_test",
@@ -83,8 +86,7 @@ async function setup(
     s3: {
       region: "auto",
       bucket: "test",
-      accessKeyId: "a",
-      secretAccessKey: "b",
+      credentials: { accessKeyId: "a", secretAccessKey: "b" },
       forcePathStyle: true,
     },
     maxSiteBytes: 1_000_000,
@@ -93,6 +95,7 @@ async function setup(
     adminTokenHash: hashApiKey(ADMIN),
     ipHashPepper: "test-pepper",
     trustForwarded: false,
+    clientIpHeader: null,
     registerPerDay: 10,
     orgRegisterPerDay: 100,
     versionRetention: 2,
@@ -104,6 +107,7 @@ async function setup(
   const db = openDb(":memory:");
   const s3 = createFakeS3();
   const app = await buildApp({ config, db, s3: s3.client, logger: false, workos });
+  apiOrigins.set(app, new URL(config.publicBaseUrl).origin);
   const { key } = createOpsKey(db, { name: "test", token: TOKEN });
 
   const harness: Harness = { app, db, s3, config, keyId: key.id };
@@ -164,11 +168,22 @@ function createFakeWorkOS(method: string | undefined = "MagicAuth"): FakeWorkOS 
 const auth = (token = TOKEN) => ({ authorization: `Bearer ${token}` });
 const adminHeaders = { "x-admin-token": ADMIN };
 
-/** Narrows fastify's chainable inject() overloads to the promise form. */
+const apiOrigins = new WeakMap<FastifyInstance, string>();
+
+/**
+ * Narrows fastify's chainable inject() overloads to the promise form. A claim
+ * POST comes from the confirmation page, so like a browser it carries the API
+ * origin unless the test sets its own.
+ */
 function inject(
   app: FastifyInstance,
   opts: InjectOptions,
 ): Promise<LightMyRequestResponse> {
+  if (opts.method === "POST" && typeof opts.url === "string" && opts.url.startsWith("/claim/")) {
+    const headers = { ...(opts.headers ?? {}) };
+    if (!("origin" in headers)) headers.origin = apiOrigins.get(app) ?? "http://test.local";
+    return app.inject({ ...opts, headers });
+  }
   return app.inject(opts);
 }
 
@@ -1108,7 +1123,7 @@ describe("org admin", () => {
 
   it("lists members with claim state, keys, and site counts", async () => {
     const workos = createFakeWorkOS("MagicAuth");
-    const { app } = await setup({ workos: WORKOS_CONFIG }, workos.client);
+    const { app } = await setup({ workos: WORKOS_CONFIG, siteHostSuffix: CLAIM_SITE_HOSTS }, workos.client);
     const { org, joinToken } = await createOrg(app);
     const lead = await mintAdmin(app, org.id);
     const alice = await joinAsMember(app, joinToken, "alice-claude");
@@ -1423,7 +1438,7 @@ describe("GET /api/v1/me", () => {
 describe("claiming an org member", () => {
   it("raises the own tier and keeps the org", async () => {
     const workos = createFakeWorkOS("MagicAuth");
-    const { app, db } = await setup({ workos: WORKOS_CONFIG }, workos.client);
+    const { app, db } = await setup({ workos: WORKOS_CONFIG, siteHostSuffix: CLAIM_SITE_HOSTS }, workos.client);
     const { org, joinToken } = await createOrg(app);
     const member = await joinAsMember(app, joinToken);
     await completeClaimFlow(app, member.claimUrl);
@@ -1440,7 +1455,7 @@ describe("claiming an org member", () => {
 
   it("reports the effective tier on the claim page", async () => {
     const workos = createFakeWorkOS("MagicAuth");
-    const { app, db } = await setup({ workos: WORKOS_CONFIG }, workos.client);
+    const { app, db } = await setup({ workos: WORKOS_CONFIG, siteHostSuffix: CLAIM_SITE_HOSTS }, workos.client);
     const { joinToken } = await createOrg(app);
     const member = await joinAsMember(app, joinToken);
 
@@ -2453,5 +2468,75 @@ describe("docs", () => {
     expect(res.statusCode).toBe(200);
     expect(res.body).toContain("orgToken");
     expect(res.body).toContain("--org-token");
+  });
+});
+
+describe("review hardening", () => {
+  it("lets free-- org members publish on a server with no pepper", async () => {
+    const { app } = await setup({ ipHashPepper: null });
+    const { joinToken } = await createOrg(app, { name: "Team" });
+    const member = await joinAsMember(app, joinToken);
+    expect(member.effectiveTier).toBe("free--");
+    expect((await publish(app, helloSite(), member.token)).statusCode).toBe(201);
+  });
+
+  it("stops counting a site whose delete has started", async () => {
+    const { app, s3 } = await setup();
+    const { org, joinToken } = await createOrg(app);
+    const member = await joinAsMember(app, joinToken);
+    const site = (await publish(app, { ...helloSite(), ttl: null }, member.token)).json<{ id: string }>();
+    s3.hooks.deleteError = () => true;
+    const del = await inject(app, {
+      method: "DELETE",
+      url: `/api/v1/sites/${site.id}`,
+      headers: auth(member.token),
+    });
+    expect(del.statusCode).toBe(204);
+    const shown = (await admin(app, "GET", `/api/v1/admin/orgs/${org.id}`)).json<{
+      siteCount: number;
+      permanentSites: number;
+      members: { sites: number }[];
+    }>();
+    expect(shown).toMatchObject({ siteCount: 0, permanentSites: 0 });
+    expect(shown.members.map((m) => m.sites)).toEqual([0]);
+  });
+
+  it("refuses a publish pool on an org that would hold no tier", async () => {
+    const { app } = await setup();
+    const { org } = await createOrg(app, { name: "Plain" });
+    const res = await admin(app, "PUT", `/api/v1/admin/orgs/${org.id}`, { publishPerHour: 50 });
+    expect(res.statusCode).toBe(400);
+    const both = await admin(app, "PUT", `/api/v1/admin/orgs/${org.id}`, {
+      compTier: "free",
+      publishPerHour: 50,
+    });
+    expect(both.statusCode).toBe(200);
+    const cleared = await admin(app, "PUT", `/api/v1/admin/orgs/${org.id}`, {
+      compTier: null,
+      publishPerHour: 50,
+    });
+    expect(cleared.statusCode).toBe(400);
+  });
+
+  it("applies an org downgrade that lands while a publish is uploading", async () => {
+    const { app, s3 } = await setup();
+    const { org, joinToken } = await createOrg(app);
+    const member = await joinAsMember(app, joinToken);
+    const held = gate();
+    s3.hooks.beforePut = () => held.wait;
+    const pending = publish(
+      app,
+      { ...helloSite(), ttl: null, slug: "team-plan", visibility: "public" },
+      member.token,
+    );
+    await tick();
+    const lowered = await admin(app, "PUT", `/api/v1/admin/orgs/${org.id}`, { compTier: null });
+    expect(lowered.statusCode).toBe(200);
+    held.open();
+    const res = await pending;
+    expect(res.statusCode).toBe(201);
+    const site = res.json<{ slug: string | null; visibility: string; expiresAt: string | null }>();
+    expect(site).toMatchObject({ slug: null, visibility: "unlisted" });
+    expect(site.expiresAt).not.toBeNull();
   });
 });

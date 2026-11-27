@@ -448,6 +448,14 @@ export function registerOrgRoutes(app: FastifyInstance, deps: OrgRouteDeps): voi
       await assertLinkable(deps, req.log, body.workosOrganizationId, id);
       patch.workos_organization_id = body.workosOrganizationId;
     }
+    // Same rule as create: a pool only applies when the org lifts members, so
+    // setting one on an org that will hold no tier would be silently ignored.
+    if (body.publishPerHour !== undefined && body.publishPerHour !== null) {
+      const org = requireOrg(db, id);
+      if (orgTier({ ...org, ...patch }) === null) {
+        throw new HttpError(400, "validation_error", "publishPerHour needs a tier");
+      }
+    }
     const result = updateOrg(db, id, patch, Date.now());
     if (result === null) throw new HttpError(404, "not_found", "organization not found");
     return reply.send({ org: orgAdminView(db, result.org), clamped: result.clamped });

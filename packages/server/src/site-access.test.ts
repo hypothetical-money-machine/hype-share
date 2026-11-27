@@ -5,6 +5,7 @@ import { loadConfig, type Config } from "./config.js";
 import {
   createApiKeyRecord, createOrg, createUser, deleteSite, hashApiKey, openDb, setUserOrg,
   updateOrg, upgrade,
+  SCHEMA_VERSION,
 } from "./db.js";
 import { reapExpiredSites } from "./reap.js";
 import { ORG_HTML_CSP, ORG_SVG_CSP } from "./site-access.js";
@@ -756,7 +757,7 @@ describe("site session lifecycle", () => {
     h.db.exec("DROP TABLE site_sessions");
     upgrade(h.db);
     upgrade(h.db);
-    expect(h.db.prepare("PRAGMA user_version").get()).toEqual({ user_version: 3 });
+    expect(h.db.prepare("PRAGMA user_version").get()).toEqual({ user_version: SCHEMA_VERSION });
     const { siteCookie } = await signIn(h, h.siteA.url);
     expect((await h.get(h.siteA.url, { cookie: siteCookie })).statusCode).toBe(200);
   });

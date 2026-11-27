@@ -16,11 +16,18 @@ describe("parseTtl", () => {
   it("returns null for empty", () => {
     expect(parseTtl(null)).toBeNull();
     expect(parseTtl(undefined)).toBeNull();
-    expect(parseTtl("")).toBeNull();
   });
 
   it("rejects values that cannot become a Date", () => {
     expect(() => parseTtl(1e20)).toThrow(/ttl/);
     expect(() => parseTtl("1e20")).toThrow(/invalid ttl/);
+  });
+
+  it("does not read a blank or sub-millisecond ttl as no expiry or zero", () => {
+    expect(() => parseTtl("")).toThrow(/invalid ttl/);
+    expect(() => parseTtl("   ")).toThrow(/invalid ttl/);
+    expect(() => parseTtl(0.0001)).toThrow(/ttl/);
+    expect(() => parseTtl("0.5ms")).toThrow(/invalid ttl/);
+    expect(parseTtl("1ms")).toBe(1);
   });
 });

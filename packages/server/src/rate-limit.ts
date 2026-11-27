@@ -9,10 +9,27 @@ export const RATE_LIMIT_WINDOWS = {
   claim: HOUR_MS,
   viewer_start: HOUR_MS,
   owner_login: HOUR_MS,
+  admin_auth: HOUR_MS,
   org_join: HOUR_MS,
 } as const;
 
 export type RateLimitAction = keyof typeof RATE_LIMIT_WINDOWS;
+
+/** True if the bucket is already at its limit, without consuming anything. */
+export function rateExhausted(
+  db: DatabaseSync,
+  bucket: string,
+  action: RateLimitAction,
+  limit: number,
+  now = Date.now(),
+): boolean {
+  const windowMs = RATE_LIMIT_WINDOWS[action];
+  const windowStart = Math.floor(now / windowMs) * windowMs;
+  const row = db
+    .prepare(`SELECT count FROM rate_limits WHERE bucket = ? AND action = ? AND window_start = ?`)
+    .get(bucket, action, windowStart) as { count: number } | undefined;
+  return (row?.count ?? 0) >= limit;
+}
 
 /** True if the caller is still inside the limit after consuming one. */
 export function consumeRate(

@@ -41,6 +41,7 @@ describe("consumeRate", () => {
       claim: HOUR_MS,
       viewer_start: HOUR_MS,
       owner_login: HOUR_MS,
+      admin_auth: HOUR_MS,
       org_join: HOUR_MS,
     });
     const insert = db.prepare(
@@ -53,10 +54,11 @@ describe("consumeRate", () => {
       insert.run(`current-${action}`, action, current);
     }
 
-    expect(pruneRateLimits(db, now)).toBe(6);
+    expect(pruneRateLimits(db, now)).toBe(7);
     expect(
       db.prepare(`SELECT action FROM rate_limits ORDER BY action`).all(),
     ).toEqual([
+      { action: "admin_auth" },
       { action: "claim" },
       { action: "org_join" },
       { action: "owner_login" },

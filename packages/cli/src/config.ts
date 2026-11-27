@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 
@@ -39,6 +39,9 @@ export function saveCliConfig(cfg: CliConfig): void {
   mkdirSync(path.dirname(p), { recursive: true });
   const persisted: CliConfig = { url: cfg.url, token: cfg.token };
   writeFileSync(p, JSON.stringify(persisted, null, 2) + "\n", { mode: 0o600 });
+  // `mode` applies only when the file is created; an existing file keeps
+  // whatever permissions it had, so tighten them on every save.
+  chmodSync(p, 0o600);
 }
 
 export function requireConfig(): CliConfig {

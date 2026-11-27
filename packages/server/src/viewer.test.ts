@@ -5,6 +5,7 @@ import { loadConfig, type Config } from "./config.js";
 import {
   createApiKeyRecord, createOrg, createUser, deleteOrg, getSite, hashApiKey, insertSite,
   openDb, setUserOrg, updateOrg, upgrade,
+  SCHEMA_VERSION,
 } from "./db.js";
 import { hashIp } from "./ip.js";
 import { reapExpiredSites } from "./reap.js";
@@ -466,7 +467,7 @@ describe("viewer database lifecycle", () => {
     const h = await setup(); const before = getSite(h.db, "orgsite");
     h.db.exec("DROP TABLE viewer_auth_flows; DROP TABLE viewer_sessions");
     upgrade(h.db); upgrade(h.db);
-    expect(h.db.prepare("PRAGMA user_version").get()).toEqual({ user_version: 3 });
+    expect(h.db.prepare("PRAGMA user_version").get()).toEqual({ user_version: SCHEMA_VERSION });
     expect(getSite(h.db, "orgsite")).toEqual(before);
     await signIn(h); expect(sessions(h)).toHaveLength(1);
   });

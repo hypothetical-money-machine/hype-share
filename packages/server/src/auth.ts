@@ -52,12 +52,20 @@ export interface Account {
 
 export function requireAccount(db: DatabaseSync, req: FastifyRequest): Account {
   const key = requireApiKey(db, req);
-  const user = getUser(db, key.user_id);
+  return { key, ...resolveUser(db, key.user_id) };
+}
+
+/** A user with their org and effective tier, read now; 401 if the user is gone. */
+export function resolveUser(
+  db: DatabaseSync,
+  userId: string,
+): { user: UserRow; org: OrgRow | null; tier: Tier } {
+  const user = getUser(db, userId);
   if (!user) {
     throw new AuthError(401, "unauthorized", "invalid API key");
   }
   const org = user.org_id === null ? null : getOrg(db, user.org_id);
-  return { key, user, org, tier: effectiveTier(user.tier, orgTier(org)) };
+  return { user, org, tier: effectiveTier(user.tier, orgTier(org)) };
 }
 
 /** Org-admin routes. The org comes from the caller's own row, never from the URL. */
@@ -82,14 +90,26 @@ export function requireAdmin(
   if (!adminTokenHash) {
     throw new AuthError(503, "admin_disabled", "admin token not configured");
   }
+  if (adminTokenCheck(adminTokenHash, req) !== "valid") {
+    throw new AuthError(401, "unauthorized", "invalid admin token");
+  }
+}
+
+/**
+ * How the request's admin token compares: "valid", "invalid" (one was sent
+ * and it is wrong: a guess), or "missing". Bearer or X-Admin-Token.
+ */
+export function adminTokenCheck(
+  adminTokenHash: string,
+  req: FastifyRequest,
+): "valid" | "invalid" | "missing" {
   const token = extractBearer(req);
   const header = req.headers["x-admin-token"];
   const fromHeader = typeof header === "string" ? header : null;
+  if (token === null && fromHeader === null) return "missing";
   const bearerOk = hashedTokenEquals(token, adminTokenHash);
   const headerOk = hashedTokenEquals(fromHeader, adminTokenHash);
-  if (!bearerOk && !headerOk) {
-    throw new AuthError(401, "unauthorized", "invalid admin token");
-  }
+  return bearerOk || headerOk ? "valid" : "invalid";
 }
 
 function hashedTokenEquals(presented: string | null, expectedHash: string): boolean {

@@ -22,24 +22,42 @@ function encodeFile(sitePath: string, buf: Buffer): SiteFileInput {
   return { path: sitePath, contentBase64: buf.toString("base64") };
 }
 
-export function collectDirectory(dir: string): SiteFileInput[] {
+export interface CollectOptions {
+  /** Told about each entry left out, so the caller can say so on stderr. */
+  onSkip?: (relPath: string, reason: "hidden" | "symlink" | "special") => void;
+}
+
+/**
+ * Every regular file under `dir`. Hidden entries (".DS_Store", ".vscode",
+ * ".claude", ".env") are left out: they are editor and tool state, never page
+ * assets, and the server's allowlist would reject most of them, failing the
+ * whole publish. Symlinks are left out too, rather than followed out of the
+ * directory; both are reported through `onSkip`.
+ */
+export function collectDirectory(dir: string, opts: CollectOptions = {}): SiteFileInput[] {
   const root = path.resolve(dir);
   const files: SiteFileInput[] = [];
 
   function walk(current: string, relBase: string): void {
     const entries = readdirSync(current, { withFileTypes: true });
     for (const ent of entries) {
-      if (ent.name === "." || ent.name === ".." || ent.name === ".git" || ent.name === "node_modules") {
+      if (ent.name === "node_modules") continue;
+      const rel = relBase ? `${relBase}/${ent.name}` : ent.name;
+      const posixRel = rel.split(path.sep).join("/");
+      if (ent.name.startsWith(".")) {
+        // .git is always noise; anything else hidden is worth a mention.
+        if (ent.name !== ".git") opts.onSkip?.(posixRel, "hidden");
         continue;
       }
       const abs = path.join(current, ent.name);
-      const rel = relBase ? `${relBase}/${ent.name}` : ent.name;
-      if (ent.isDirectory()) {
+      if (ent.isSymbolicLink()) {
+        opts.onSkip?.(posixRel, "symlink");
+      } else if (ent.isDirectory()) {
         walk(abs, rel);
       } else if (ent.isFile()) {
-        const buf = readFileSync(abs);
-        const posixRel = rel.split(path.sep).join("/");
-        files.push(encodeFile(posixRel, buf));
+        files.push(encodeFile(posixRel, readFileSync(abs)));
+      } else {
+        opts.onSkip?.(posixRel, "special");
       }
     }
   }

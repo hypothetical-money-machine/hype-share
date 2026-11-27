@@ -210,6 +210,31 @@ export function resolveTierExpiry(
   return clampToMax(policy, expires, now);
 }
 
+/**
+ * How far touch extends a site on a tier with no maximum TTL (paid, ops) when
+ * no default applies: there is no maximum to reset to, and leaving the expiry
+ * alone would make touch a no-op for those sites.
+ */
+export const NO_MAX_TOUCH_TTL = "1y";
+
+/**
+ * Touch: a ping means keep this, not shrink this. A permanent site stays
+ * permanent where the tier allows it; otherwise reset to the tier maximum, or
+ * on tiers without one extend to the default (or a year), never shortening.
+ */
+export function touchExpiry(
+  policy: TierPolicy,
+  existing: number | null,
+  now: number,
+): number | null {
+  if (existing === null && policy.allowNullTtl) return null;
+  if (policy.maxTtl === null) {
+    const extended = expiresAtFromTierTtl(policy.defaultTtl ?? NO_MAX_TOUCH_TTL, now)!;
+    return existing === null ? extended : Math.max(existing, extended);
+  }
+  return resolveTierExpiry(policy, policy.maxTtl, now, "explicit");
+}
+
 function clampToMax(
   policy: TierPolicy,
   expires: number | null,

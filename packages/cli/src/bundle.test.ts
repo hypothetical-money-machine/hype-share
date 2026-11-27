@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { SiteFileInput } from "@shareplan/core";
@@ -123,6 +123,26 @@ describe("collectDirectory", () => {
     const files = collectDirectory(dir);
     expect(files.map((f) => f.path).sort()).toEqual(["assets/img/logo.png", "index.html"]);
     expect(decode(pick(files, "assets/img/logo.png"))).toEqual(PNG_HEADER);
+  });
+
+  it("leaves out hidden entries and symlinks, and reports them", () => {
+    const dir = tempDir();
+    write(dir, "index.html", "<h1>hi</h1>");
+    write(dir, ".DS_Store", Buffer.from([0, 0, 0, 1]));
+    write(dir, path.join(".vscode", "settings.json"), "{}");
+    write(dir, path.join("assets", ".env"), "SECRET=1");
+    const outside = write(tempDir(), "secret.txt", "outside the site");
+    symlinkSync(outside, path.join(dir, "linked.txt"));
+
+    const skipped: string[] = [];
+    const files = collectDirectory(dir, { onSkip: (rel, reason) => skipped.push(`${rel}:${reason}`) });
+    expect(files.map((f) => f.path)).toEqual(["index.html"]);
+    expect(skipped.sort()).toEqual([
+      ".DS_Store:hidden",
+      ".vscode:hidden",
+      "assets/.env:hidden",
+      "linked.txt:symlink",
+    ]);
   });
 
   it("throws when the directory has no files", () => {

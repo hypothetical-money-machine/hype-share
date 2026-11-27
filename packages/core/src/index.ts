@@ -1,5 +1,6 @@
 export * from "./ids.js";
 export * from "./hostnames.js";
+export * from "./html.js";
 export * from "./paths.js";
 export * from "./mime.js";
 export * from "./ttl.js";

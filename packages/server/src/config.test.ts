@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   assertPublicBaseUrlIsApiHost,
+  describeConfigGaps,
   loadConfig,
   normalizeSiteHostSuffix,
   normalizeWorkOSConfig,
@@ -137,5 +138,85 @@ describe("loadConfig", () => {
     expect(() => loadConfig({ ...base, SHAREPLAN_ORG_REGISTER_PER_DAY: "x" })).toThrow(
       /must be a number/,
     );
+  });
+
+  it("leaves S3 credentials to the SDK chain unless both SHAREPLAN_S3 keys are set", () => {
+    const aws = { ...base, AWS_ACCESS_KEY_ID: "ASIAEXAMPLE", AWS_SECRET_ACCESS_KEY: "s" };
+    expect(loadConfig(aws).s3.credentials).toBeUndefined();
+    expect(
+      loadConfig({ ...base, SHAREPLAN_S3_ACCESS_KEY: "k", SHAREPLAN_S3_SECRET_KEY: "s" }).s3
+        .credentials,
+    ).toEqual({ accessKeyId: "k", secretAccessKey: "s" });
+    expect(() => loadConfig({ ...base, SHAREPLAN_S3_ACCESS_KEY: "k" })).toThrow(/set together/);
+  });
+
+  it("fails at startup on an unparseable default ttl", () => {
+    expect(loadConfig({ ...base, SHAREPLAN_DEFAULT_TTL: "30d" }).defaultTtl).toBe("30d");
+    expect(() => loadConfig({ ...base, SHAREPLAN_DEFAULT_TTL: "30 days" })).toThrow(
+      /SHAREPLAN_DEFAULT_TTL/,
+    );
+  });
+
+  it("keeps the sweep interval inside what setInterval honours", () => {
+    expect(loadConfig({ ...base, SHAREPLAN_REAP_INTERVAL_SEC: "3000000" }).reapIntervalMs).toBe(
+      2_147_483_647,
+    );
+    expect(loadConfig({ ...base, SHAREPLAN_REAP_INTERVAL_SEC: "60" }).reapIntervalMs).toBe(60_000);
+  });
+
+  it("reads the client ip header name", () => {
+    expect(loadConfig(base).clientIpHeader).toBeNull();
+    const trusted = { ...base, SHAREPLAN_TRUST_FORWARDED: "true" };
+    expect(
+      loadConfig({ ...trusted, SHAREPLAN_CLIENT_IP_HEADER: " CF-Connecting-IP " }).clientIpHeader,
+    ).toBe("cf-connecting-ip");
+    expect(() => loadConfig({ ...trusted, SHAREPLAN_CLIENT_IP_HEADER: "x y" })).toThrow(
+      /SHAREPLAN_CLIENT_IP_HEADER/,
+    );
+    expect(() => loadConfig({ ...base, SHAREPLAN_CLIENT_IP_HEADER: "cf-connecting-ip" })).toThrow(
+      /needs SHAREPLAN_TRUST_FORWARDED/,
+    );
+  });
+
+  it("refuses numbers it would only misuse", () => {
+    expect(() => loadConfig({ ...base, SHAREPLAN_MAX_SITE_BYTES: "0" })).toThrow(/MAX_SITE_BYTES/);
+    expect(() => loadConfig({ ...base, SHAREPLAN_MAX_SITE_BYTES: "-5" })).toThrow(/MAX_SITE_BYTES/);
+    expect(() => loadConfig({ ...base, SHAREPLAN_MAX_FILE_COUNT: "2.5" })).toThrow(/MAX_FILE_COUNT/);
+    expect(() => loadConfig({ ...base, SHAREPLAN_PORT: "99999" })).toThrow(/SHAREPLAN_PORT/);
+    expect(() => loadConfig({ ...base, SHAREPLAN_PORT: "87.5" })).toThrow(/SHAREPLAN_PORT/);
+    expect(loadConfig({ ...base, SHAREPLAN_PORT: "8080" }).port).toBe(8080);
+  });
+
+  it("wants the public base URL as a bare origin", () => {
+    for (const url of ["https://share.example.com/app", "https://u:p@share.example.com", "https://share.example.com?x=1", "ftp://share.example.com"]) {
+      expect(() => loadConfig({ ...base, SHAREPLAN_PUBLIC_BASE_URL: url }), url).toThrow(/bare http/);
+    }
+    expect(loadConfig({ ...base, SHAREPLAN_PUBLIC_BASE_URL: "https://share.example.com/" }).publicBaseUrl).toBe(
+      "https://share.example.com",
+    );
+  });
+
+  it("refuses a short admin token", () => {
+    expect(() => loadConfig({ ...base, SHAREPLAN_ADMIN_TOKEN: "x" })).toThrow(/at least 16/);
+    expect(loadConfig({ ...base, SHAREPLAN_ADMIN_TOKEN: "a-long-random-secret" }).adminTokenHash).not.toBeNull();
+  });
+
+  it("takes the AWS region when no custom endpoint is set", () => {
+    expect(loadConfig({ ...base, AWS_REGION: "us-west-2" }).s3.region).toBe("us-west-2");
+    expect(loadConfig({ ...base, AWS_DEFAULT_REGION: "eu-west-1" }).s3.region).toBe("eu-west-1");
+    expect(
+      loadConfig({ ...base, AWS_REGION: "us-west-2", SHAREPLAN_S3_ENDPOINT: "http://minio:9000" }).s3.region,
+    ).toBe("auto");
+    expect(loadConfig({ ...base, AWS_REGION: "us-west-2", SHAREPLAN_S3_REGION: "ca-central-1" }).s3.region).toBe(
+      "ca-central-1",
+    );
+  });
+
+  it("names the features a config leaves off", () => {
+    const gaps = describeConfigGaps(loadConfig({ ...base, SHAREPLAN_HOST: "0.0.0.0" }));
+    expect(gaps.join("\n")).toMatch(/SITE_HOST_SUFFIX is unset/);
+    expect(gaps.join("\n")).toMatch(/ADMIN_TOKEN is unset/);
+    expect(gaps.join("\n")).toMatch(/IP_HASH_PEPPER is unset/);
+    expect(gaps.join("\n")).toMatch(/0\.0\.0\.0/);
   });
 });

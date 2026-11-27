@@ -24,13 +24,32 @@ export function hashIp(ip: string, pepper: string): string {
   return createHmac("sha256", pepper).update(normalized, "utf8").digest("hex");
 }
 
+declare module "fastify" {
+  interface FastifyRequest {
+    /** Set from SHAREPLAN_CLIENT_IP_HEADER when that is configured and trusted. */
+    clientIp: string;
+  }
+}
+
 /**
- * Fastify's `req.ip`. When `trustForwarded` is on, `trustProxy` is 1 hop so
- * this is the address the immediate proxy added, not the leftmost
- * client-supplied `X-Forwarded-For` entry.
+ * The client address for rate limits and audit fields. With
+ * SHAREPLAN_CLIENT_IP_HEADER configured (and SHAREPLAN_TRUST_FORWARDED on),
+ * that header's address; otherwise Fastify's `req.ip`. When `trustForwarded`
+ * is on, `trustProxy` is 1 hop, so `req.ip` is the address the immediate proxy
+ * added, not the leftmost client-supplied `X-Forwarded-For` entry. Behind
+ * Cloudflare plus a local proxy that hop is a Cloudflare edge, shared by every
+ * client on it, which is why the header exists.
  */
 export function requestIp(req: FastifyRequest): string {
-  return req.ip || "0.0.0.0";
+  return req.clientIp || req.ip || "0.0.0.0";
+}
+
+/** The header's address if it holds exactly one valid IP, else null. */
+export function clientIpFromHeader(req: FastifyRequest, header: string): string | null {
+  const raw = req.headers[header];
+  if (typeof raw !== "string") return null;
+  const value = raw.trim();
+  return isIP(value) === 0 ? null : value;
 }
 
 function expandIPv6(ip: string): string[] {
